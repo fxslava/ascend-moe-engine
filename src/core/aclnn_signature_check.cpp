@@ -74,6 +74,15 @@
 #define DSV4_HAS_MOE_INIT_ROUTING_V4 1
 #endif
 
+// The vendored arch35 operators have no toolkit header to check against --
+// the authoritative declaration is the vendored copy this repository builds
+// libcust_opapi.so from (third_party/ops_transformer), reached here through
+// the per-file include directories set in the root CMakeLists.
+#include "aclnn_mhc_pre.h"
+#include "aclnn_mhc_sinkhorn.h"
+#include "aclnn_mhc_post.h"
+#include "aclnn_quant_lightning_indexer.h"
+
 namespace ascend_moe {
 namespace {
 
@@ -129,6 +138,19 @@ DSV4_ASSERT_SIGNATURE(aclnnMoeInitRoutingV4GetWorkspaceSize, MoeInitRoutingV4Pla
 DSV4_ASSERT_SIGNATURE(aclnnRmsNorm, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnGroupedMatmulV5, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnFusedInferAttentionScoreV5, AclnnLaunchFn);
+
+// Vendored arch35 operators: the header this asserts against is compiled into
+// libcust_opapi.so by the same build, so a drift between the engine's
+// transcribed typedefs and the vendored operator signatures fails HERE
+// instead of misreading registers through the dlsym'd call.
+DSV4_ASSERT_SIGNATURE(aclnnMhcPreGetWorkspaceSize, MhcPrePlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhornGetWorkspaceSize, MhcSinkhornPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnMhcPostGetWorkspaceSize, MhcPostPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexerGetWorkspaceSize, QuantLightningIndexerPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnMhcPre, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhorn, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnMhcPost, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexer, AclnnLaunchFn);
 
 #undef DSV4_ASSERT_SIGNATURE
 

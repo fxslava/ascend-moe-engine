@@ -43,9 +43,12 @@
 #include "moe/core/model_config.hpp"
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/memory/expert_layout.hpp"
+#include "moe/ops/aclnn_dsv4_vendor_ops.h"
 #include "moe/pipeline/lattice_moe_block.hpp"
 #include "moe/pipeline/pipeline.hpp"
 #include "moe/core/weight_source.hpp"
+
+#include "mock_acl_tensor.hpp"
 
 namespace ascend_moe {
 namespace {
@@ -581,6 +584,101 @@ void TestStaticArena() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. The vendored mHC operator geometry in the static arena
+// ---------------------------------------------------------------------------
+
+// The DSV4 mHC chain reserves descriptor storage and plans its operators
+// against arena addresses, exactly as the decode loop will: n_hc = 4 streams
+// over the 4096-wide hidden state, TND layout, phi [24, 16384] FP32. The four
+// vendored workspaces then have to fit under the arena's shared
+// NoteWorkspace high-water mark.
+void TestVendorMhcArena() {
+  Section("vendored mHC operators: arena reservations and the workspace high-water mark");
+  constexpr int64_t kMhcStreams = 4;  // n_hc: the DSV4 hyper-connection stream count
+  constexpr int64_t kTokensArena = 4;
+  constexpr int64_t kMixRowsArena = kMhcStreams * kMhcStreams + 2 * kMhcStreams;  // 24
+  SimulatedDeviceOps device(1ull << 30);
+  StaticMemoryArena arena(device);
+
+  const ArenaHandle mhc_state = arena.Reserve("mhc.state",
+      static_cast<size_t>(kTokensArena) * kMhcStreams * kHiddenSize * 2 +          // x [T,4,4096] BF16
+      static_cast<size_t>(kTokensArena) * kHiddenSize * 2 +                        // hIn/hOut [T,4096] BF16
+      static_cast<size_t>(kTokensArena) * kHiddenSize * 2, 4096);                  // out [T,4,4096] BF16
+  const ArenaHandle mhc_phi = arena.Reserve("mhc.phi",
+      static_cast<size_t>(kMixRowsArena) * kMhcStreams * kHiddenSize * 4, 4096);   // phi [24,16384] FP32
+  const ArenaHandle mhc_small = arena.Reserve("mhc.routing",
+      static_cast<size_t>(kTokensArena) * kMhcStreams * kMhcStreams * 4 +          // hRes [T,4,4] FP32
+      static_cast<size_t>(kTokensArena) * kMhcStreams * 4 +                        // hPost [T,4] FP32
+      3 * 4 + kMixRowsArena * 4);                                                  // alpha [3] + bias [24]
+  Check(mhc_state != mhc_phi && mhc_phi != mhc_small, "the mHC descriptors hold three distinct arena handles");
+
+  arena.Commit();
+  const auto make = [&](ArenaHandle handle, size_t offset, const std::vector<int64_t>& shape, aclDataType dtype) {
+    void* base = static_cast<char*>(arena.Address(handle)) + offset;
+    return aclCreateTensor(shape.data(), shape.size(), dtype, nullptr, 0, ACL_FORMAT_ND, shape.data(), shape.size(),
+                           base);
+  };
+  const size_t token_bytes = static_cast<size_t>(kTokensArena);
+  aclTensor* x = make(mhc_state, 0, {kTokensArena, kMhcStreams, kHiddenSize}, ACL_BF16);
+  aclTensor* h_in = make(mhc_state, token_bytes * kMhcStreams * kHiddenSize * 2, {kTokensArena, kHiddenSize},
+                         ACL_BF16);
+  aclTensor* post_out = make(mhc_state, token_bytes * kMhcStreams * kHiddenSize * 2 + token_bytes * kHiddenSize * 2,
+                             {kTokensArena, kMhcStreams, kHiddenSize}, ACL_BF16);
+  aclTensor* phi = make(mhc_phi, 0, {kMixRowsArena, kMhcStreams * kHiddenSize}, ACL_FLOAT32);
+  aclTensor* h_res = make(mhc_small, 0, {kTokensArena, kMhcStreams, kMhcStreams}, ACL_FLOAT32);
+  aclTensor* h_post = make(mhc_small, token_bytes * kMhcStreams * kMhcStreams * 4, {kTokensArena, kMhcStreams},
+                           ACL_FLOAT32);
+  aclTensor* alpha = make(mhc_small, token_bytes * kMhcStreams * kMhcStreams * 4 + token_bytes * kMhcStreams * 4,
+                          {3}, ACL_FLOAT32);
+  aclTensor* bias = make(mhc_small,
+                         token_bytes * kMhcStreams * kMhcStreams * 4 + token_bytes * kMhcStreams * 4 + 12,
+                         {kMixRowsArena}, ACL_FLOAT32);
+
+  // Plan the chain over the arena addresses; every workspace must sit under
+  // the shared high-water mark the arena commits.
+  OpTable ops;
+  uint64_t ws_pre = 0;
+  uint64_t ws_sinkhorn = 0;
+  uint64_t ws_post = 0;
+  {
+    aclOpExecutor* executor = nullptr;
+    ws_pre = PlanAclnnOp<MhcPrePlanFn>(ops, OpId::kMhcPre, &executor, x, phi, alpha, bias, nullptr, 1e-6, 1e-6, h_in,
+                                       h_post, h_res, nullptr, nullptr, nullptr);
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_sinkhorn = PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, &executor, h_res, 1e-6f, 20, h_res, nullptr,
+                                                 nullptr);
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_post = PlanAclnnOp<MhcPostPlanFn>(ops, OpId::kMhcPost, &executor, x, h_res, h_in, h_post, post_out);
+    aclDestroyAclOpExecutor(executor);
+  }
+  std::printf("  workspaces: mhc_pre=%" PRIu64 " mhc_sinkhorn=%" PRIu64 " mhc_post=%" PRIu64 "\n", ws_pre, ws_sinkhorn,
+              ws_post);
+  const uint64_t peak = ws_pre > ws_sinkhorn ? (ws_pre > ws_post ? ws_pre : ws_post)
+                                             : (ws_sinkhorn > ws_post ? ws_sinkhorn : ws_post);
+  Check(peak > 0, "the vendored mHC chain plans non-empty workspaces over arena addresses");
+
+  arena.NoteWorkspace(ws_pre);
+  arena.NoteWorkspace(ws_sinkhorn);
+  arena.NoteWorkspace(ws_post);
+  arena.CommitWorkspace();
+  Check(arena.workspace_bytes() == peak,
+        "the shared workspace is exactly the mHC chain's high-water mark over all three operators");
+  arena.AssertWorkspaceFits(ws_pre, "mhc_pre");
+  arena.AssertWorkspaceFits(ws_sinkhorn, "mhc_sinkhorn");
+  arena.AssertWorkspaceFits(ws_post, "mhc_post");
+  Check(true, "every vendored workspace fits within the committed NoteWorkspace reservation");
+  CheckRefuses([&] { arena.AssertWorkspaceFits(peak + 1, "vendor re-plan"); },
+               "a vendored re-plan exceeding the reserved workspace");
+
+  for (aclTensor* tensor : {x, h_in, post_out, phi, h_res, h_post, alpha, bias}) {
+    aclDestroyTensor(tensor);
+  }
+  arena.Seal();
+}
+
+// ---------------------------------------------------------------------------
 // 5. Backbone sizing and the operator table
 // ---------------------------------------------------------------------------
 
@@ -692,6 +790,7 @@ int RunMain() {
     TestSwapRoundTrip();
     TestHierarchyRefusals();
     TestStaticArena();
+    TestVendorMhcArena();
     TestBackboneSizing();
     TestModelConfigContract();
     TestMoeBlockSlotContract();

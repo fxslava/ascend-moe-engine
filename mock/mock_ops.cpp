@@ -68,8 +68,38 @@ constexpr uint64_t kWorkspaceRouting = 64u << 10;
 constexpr uint64_t kWorkspaceAttention = 1u << 20;
 constexpr uint64_t kWorkspaceAttentionMax = 8u << 20;
 constexpr uint64_t kWorkspaceGmmBase = 256u << 10;
+constexpr uint64_t kWorkspaceMhcBase = 64u << 10;
+constexpr uint64_t kWorkspaceIndexerBase = 128u << 10;
+
+// DeepSeek-V4 Flash mHC geometry: four hyper-connection streams over the
+// 4096-wide hidden state (kHidden above), TND token layout.
+constexpr int64_t kNhcStreams = 4;
 
 uint64_t Align4k(uint64_t bytes) { return (bytes + 4095) & ~4095ull; }
+
+// Row-major contiguity of a mock tensor's view, the property l0op::ViewCopy
+// and l0op::Contiguous branch on in the real aclnn layer.
+bool IsContiguous(const MockAclTensor* tensor) {
+  if (tensor->strides.size() != tensor->shape.size() || tensor->shape.empty()) {
+    return false;
+  }
+  int64_t expected = 1;
+  for (size_t index = tensor->shape.size(); index-- > 0;) {
+    if (tensor->strides[index] != expected) {
+      return false;
+    }
+    expected *= tensor->shape[index];
+  }
+  return true;
+}
+
+// aclnnMhcSinkhorn's ViewCopy(output, output) repeatability condition: the
+// aclnn layer always ends in a copy stage onto the caller's output view, and
+// a non-contiguous view means that stage is a real gather/scatter whose
+// address cannot be swapped with aclSetTensorAddr alone. The mock records the
+// condition instead of failing it -- planning still succeeds -- so the test
+// suite can assert the guard fired.
+int g_sinkhorn_viewcopy_warnings = 0;
 
 // Captures tensors into a fresh executor in IR order. Null tensor arguments
 // still occupy their slot (ACLNN numbers optional tensors that were bound as
@@ -943,6 +973,247 @@ aclnnStatus aclnnGroupedMatmulFinalizeRoutingV3GetWorkspaceSize(
   return 0;
 }
 
+// -- vendored ops-transformer arch35 operators ---------------------------------
+//
+// Contracts transcribed from the vendored trees' aclnn_*.cpp checks
+// (third_party/ops_transformer) at the DSV4 geometry: n_hc = 4 streams over a
+// 4096-wide hidden state, TND layout, FP32 mHC state, BF16 activations.
+
+// aclnnMhcPre: fold [T, 4, 4096] states through phi [24, 16384].
+aclnnStatus aclnnMhcPreGetWorkspaceSize(const aclTensor* x, const aclTensor* phi, const aclTensor* alpha,
+                                        const aclTensor* bias, const aclTensor* gamma_optional, double norm_eps,
+                                        double hc_eps, aclTensor* h_in, aclTensor* h_post, aclTensor* h_res,
+                                        aclTensor* inv_rms_optional, aclTensor* h_mix_optional,
+                                        aclTensor* h_pre_optional, uint64_t* workspace_size,
+                                        aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* mp = AsMockTensor(phi);
+  const MockAclTensor* ma = AsMockTensor(alpha);
+  const MockAclTensor* mb = AsMockTensor(bias);
+  const MockAclTensor* mg = gamma_optional == nullptr ? nullptr : AsMockTensor(gamma_optional);
+  const MockAclTensor* min = AsMockTensor(h_in);
+  const MockAclTensor* mpost = AsMockTensor(h_post);
+  const MockAclTensor* mres = AsMockTensor(h_res);
+  MOCK_REQUIRE(mx != nullptr && mp != nullptr && ma != nullptr && mb != nullptr && min != nullptr &&
+                   mpost != nullptr && mres != nullptr,
+               "MhcPre: bad tensor handle");
+  MOCK_REQUIRE(mx->shape.size() == 3 && mx->dim(1) == kNhcStreams && mx->dim(2) == kHidden,
+               "MhcPre: x must be [T, 4, 4096] (TND stacked mHC states), got " + ShapeOf(mx));
+  MOCK_REQUIRE(mx->dtype == ACL_BF16 || mx->dtype == ACL_FLOAT16, "MhcPre: x must be BF16/FP16");
+  const int64_t tokens = mx->dim(0);
+  const int64_t mix_rows = kNhcStreams * kNhcStreams + 2 * kNhcStreams;  // n^2 + 2n = 24
+  MOCK_REQUIRE(mp->shape.size() == 2 && mp->dim(0) == mix_rows &&
+                   mp->dim(1) == kNhcStreams * kHidden,
+               "MhcPre: phi must be [n^2+2n, nD] = [24, 16384] FP32, got " + ShapeOf(mp));
+  MOCK_REQUIRE(mp->dtype == ACL_FLOAT32, "MhcPre: phi must be FP32");
+  MOCK_REQUIRE(ma->elements() == 3 && ma->dtype == ACL_FLOAT32, "MhcPre: alpha must be [3] FP32");
+  MOCK_REQUIRE(mb->elements() == mix_rows && mb->dtype == ACL_FLOAT32, "MhcPre: bias must be [24] FP32");
+  MOCK_REQUIRE(mg == nullptr || (mg->shape.size() == 2 && mg->dim(0) == kNhcStreams && mg->dim(1) == kHidden &&
+                                  mg->dtype == ACL_FLOAT32),
+               "MhcPre: gammaOptional must be [4, 4096] FP32 or null");
+  MOCK_REQUIRE(norm_eps > 0.0 && hc_eps > 0.0, "MhcPre: normEps and hcEps must be positive");
+  MOCK_REQUIRE(min->shape.size() == 2 && min->dim(0) == tokens && min->dim(1) == kHidden &&
+                   min->dtype == mx->dtype,
+               "MhcPre: hIn must be [T, 4096] in the dtype of x");
+  MOCK_REQUIRE(mpost->shape.size() == 2 && mpost->dim(0) == tokens && mpost->dim(1) == kNhcStreams &&
+                   mpost->dtype == ACL_FLOAT32,
+               "MhcPre: hPost must be [T, 4] FP32");
+  MOCK_REQUIRE(mres->shape.size() == 3 && mres->dim(0) == tokens && mres->dim(1) == kNhcStreams &&
+                   mres->dim(2) == kNhcStreams && mres->dtype == ACL_FLOAT32,
+               "MhcPre: hRes must be [T, 4, 4] FP32");
+  const MockAclTensor* mrms = inv_rms_optional == nullptr ? nullptr : AsMockTensor(inv_rms_optional);
+  const MockAclTensor* mmix = h_mix_optional == nullptr ? nullptr : AsMockTensor(h_mix_optional);
+  const MockAclTensor* mpre = h_pre_optional == nullptr ? nullptr : AsMockTensor(h_pre_optional);
+  MOCK_REQUIRE(mrms == nullptr || (mrms->elements() == tokens && mrms->dtype == ACL_FLOAT32),
+               "MhcPre: invRmsOptional must be [T] FP32 or null");
+  MOCK_REQUIRE(mmix == nullptr || (mmix->shape.size() == 2 && mmix->dim(0) == tokens &&
+                                   mmix->dim(1) == mix_rows && mmix->dtype == ACL_FLOAT32),
+               "MhcPre: hMixOptional must be [T, 24] FP32 or null");
+  MOCK_REQUIRE(mpre == nullptr || (mpre->shape.size() == 2 && mpre->dim(0) == tokens &&
+                                   mpre->dim(1) == kNhcStreams && mpre->dtype == ACL_FLOAT32),
+               "MhcPre: hPreOptional must be [T, 4] FP32 or null");
+  *workspace_size = Align4k(static_cast<uint64_t>(tokens) * static_cast<uint64_t>(kNhcStreams) *
+                            static_cast<uint64_t>(kHidden) * 4) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnMhcPre",
+                          {x, phi, alpha, bias, gamma_optional, h_in, h_post, h_res, inv_rms_optional,
+                           h_mix_optional, h_pre_optional});
+  return 0;
+}
+
+// aclnnMhcSinkhorn: doubly-stochastic normalization of [T, n, n].
+aclnnStatus aclnnMhcSinkhornGetWorkspaceSize(const aclTensor* x, float eps, int64_t num_iters, aclTensor* output,
+                                             aclTensor* norm_out, aclTensor* sum_out, uint64_t* workspace_size,
+                                             aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* my = AsMockTensor(output);
+  MOCK_REQUIRE(mx != nullptr && my != nullptr, "MhcSinkhorn: bad tensor handle");
+  MOCK_REQUIRE(mx->shape.size() == 3, "MhcSinkhorn: x must be [T, n, n] (TND), got " + ShapeOf(mx));
+  const int64_t n0 = mx->dim(1);
+  const int64_t n1 = mx->dim(2);
+  MOCK_REQUIRE(n0 == n1 && (n0 == 4 || n0 == 6 || n0 == 8),
+               "MhcSinkhorn: n must be square and one of {4, 6, 8}, got " + ShapeOf(mx));
+  MOCK_REQUIRE(mx->dtype == ACL_FLOAT32, "MhcSinkhorn: x must be FP32");
+  MOCK_REQUIRE(eps > 0.0f, "MhcSinkhorn: eps must be positive");
+  MOCK_REQUIRE(num_iters >= 1 && num_iters <= 100,
+               "MhcSinkhorn: numIters must be in [1, 100], got " + std::to_string(num_iters));
+  MOCK_REQUIRE(my->same_shape_as(*mx) && my->dtype == ACL_FLOAT32, "MhcSinkhorn: output must match x [T, n, n] FP32");
+  // The optional norm/sum pair binds together: either both are present or the
+  // operator runs with outFlag 0.
+  const MockAclTensor* mnorm = norm_out == nullptr ? nullptr : AsMockTensor(norm_out);
+  const MockAclTensor* msum = sum_out == nullptr ? nullptr : AsMockTensor(sum_out);
+  MOCK_REQUIRE((mnorm == nullptr) == (msum == nullptr),
+               "MhcSinkhorn: normOut and sumOut must be bound together (outFlag is 0 or 1)");
+  if (mnorm != nullptr) {
+    MOCK_REQUIRE(mnorm->dtype == ACL_FLOAT32 && msum->dtype == ACL_FLOAT32,
+                 "MhcSinkhorn: normOut/sumOut must be FP32");
+  }
+  // The repeatability guard: the aclnn layer ends in ViewCopy(kernelOut,
+  // output), and a non-contiguous output view means that copy stage is a real
+  // gather/scatter -- aclSetTensorAddr alone cannot retarget it. Recorded,
+  // not refused: planning succeeds, the condition is reported.
+  if (!IsContiguous(my)) {
+    ++g_sinkhorn_viewcopy_warnings;
+  }
+  *workspace_size = Align4k(static_cast<uint64_t>(mx->dim(0)) * static_cast<uint64_t>(n0) *
+                            static_cast<uint64_t>(n1) * 4) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnMhcSinkhorn", {x, output, norm_out, sum_out});
+  return 0;
+}
+
+// aclnnMhcPost: x_next = (hRes)^T @ x + hOut * hPost.
+aclnnStatus aclnnMhcPostGetWorkspaceSize(const aclTensor* x, const aclTensor* h_res, const aclTensor* h_out,
+                                         const aclTensor* h_post, aclTensor* out, uint64_t* workspace_size,
+                                         aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* mr = AsMockTensor(h_res);
+  const MockAclTensor* mo = AsMockTensor(h_out);
+  const MockAclTensor* mp = AsMockTensor(h_post);
+  const MockAclTensor* my = AsMockTensor(out);
+  MOCK_REQUIRE(mx != nullptr && mr != nullptr && mo != nullptr && mp != nullptr && my != nullptr,
+               "MhcPost: bad tensor handle");
+  MOCK_REQUIRE(mx->shape.size() == 3 && mx->dim(1) == kNhcStreams && mx->dim(2) == kHidden,
+               "MhcPost: x must be [T, 4, 4096] (TND), got " + ShapeOf(mx));
+  MOCK_REQUIRE(mx->dtype == ACL_BF16 || mx->dtype == ACL_FLOAT16, "MhcPost: x must be BF16/FP16");
+  const int64_t tokens = mx->dim(0);
+  MOCK_REQUIRE(mr->shape.size() == 3 && mr->dim(0) == tokens && mr->dim(1) == kNhcStreams &&
+                   mr->dim(2) == kNhcStreams && mr->dtype == ACL_FLOAT32,
+               "MhcPost: hRes must be [T, 4, 4] FP32");
+  MOCK_REQUIRE(mo->shape.size() == 2 && mo->dim(0) == tokens && mo->dim(1) == kHidden && mo->dtype == mx->dtype,
+               "MhcPost: hOut must be [T, 4096] in the dtype of x");
+  MOCK_REQUIRE(mp->shape.size() == 2 && mp->dim(0) == tokens && mp->dim(1) == kNhcStreams &&
+                   mp->dtype == ACL_FLOAT32,
+               "MhcPost: hPost must be [T, 4] FP32");
+  MOCK_REQUIRE(my->same_shape_as(*mx) && my->dtype == mx->dtype, "MhcPost: out must match x [T, 4, 4096]");
+  *workspace_size = Align4k(static_cast<uint64_t>(tokens) * static_cast<uint64_t>(kHidden) * 2) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnMhcPost", {x, h_res, h_out, h_post, out});
+  return 0;
+}
+
+// aclnnQuantLightningIndexer: sparse top-k selection + query/key quantization.
+aclnnStatus aclnnQuantLightningIndexerGetWorkspaceSize(
+    const aclTensor* query, const aclTensor* key, const aclTensor* weights, const aclTensor* query_dequant_scale,
+    const aclTensor* key_dequant_scale, const aclTensor* actual_seq_lengths_query_optional,
+    const aclTensor* actual_seq_lengths_key_optional, const aclTensor* block_table_optional, int64_t query_quant_mode,
+    int64_t key_quant_mode, char* layout_query_optional, char* layout_key_optional, int64_t sparse_count,
+    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, const aclTensor* out, uint64_t* workspace_size,
+    aclOpExecutor** executor) {
+  const MockAclTensor* mq = AsMockTensor(query);
+  const MockAclTensor* mk = AsMockTensor(key);
+  const MockAclTensor* mw = AsMockTensor(weights);
+  const MockAclTensor* mqs = AsMockTensor(query_dequant_scale);
+  const MockAclTensor* mks = AsMockTensor(key_dequant_scale);
+  const MockAclTensor* my = AsMockTensor(out);
+  MOCK_REQUIRE(mq != nullptr && mk != nullptr && mw != nullptr && mqs != nullptr && mks != nullptr &&
+                   my != nullptr,
+               "QuantLightningIndexer: bad tensor handle");
+  const char* layout_query = layout_query_optional != nullptr ? layout_query_optional : "BSND";
+  const char* layout_key = layout_key_optional != nullptr ? layout_key_optional : "BSND";
+  // TND query: [T, N1, D] with D = 128 and N1 in the 950PR set; BSND adds a
+  // leading [B, S] pair over the same N1/D geometry.
+  MOCK_REQUIRE(mq->shape.size() == 3 || mq->shape.size() == 4,
+               "QuantLightningIndexer: query must be TND [T,N1,D] or BSND [B,S,N1,D]");
+  const bool query_tnd = mq->shape.size() == 3;
+  const size_t n1_index = query_tnd ? 1 : 2;
+  const int64_t heads = mq->dim(n1_index);
+  const int64_t head_dim = mq->dim(n1_index + 1);
+  MOCK_REQUIRE(head_dim == 128, "QuantLightningIndexer: the indexer head dim is 128, got " +
+                                    std::to_string(head_dim));
+  MOCK_REQUIRE(heads == 16 || heads == 24 || heads == 32 || heads == 64,
+               "QuantLightningIndexer: N1 must be one of {16, 24, 32, 64} on 950PR, got " + std::to_string(heads));
+  MOCK_REQUIRE(mq->dtype == ACL_FLOAT8_E4M3FN, "QuantLightningIndexer: query must be FP8 E4M3 (950PR path)");
+  MOCK_REQUIRE(IsContiguous(mq) && IsContiguous(mk),
+               "QuantLightningIndexer: query and key do not support non-contiguous views");
+  const int64_t tokens = query_tnd ? mq->dim(0) : mq->dim(0) * mq->dim(1);
+  // Key: N2 = 1, D = 128; PA_BSND pages it as [block_count, block_size, 1, 128].
+  MOCK_REQUIRE(mk->dtype == mq->dtype, "QuantLightningIndexer: key dtype must equal query dtype");
+  const bool key_paged = std::string(layout_key) == "PA_BSND";
+  if (key_paged) {
+    MOCK_REQUIRE(mk->shape.size() == 4, "QuantLightningIndexer: PA_BSND key must be [block_count, block_size, 1, 128]");
+    MOCK_REQUIRE(mk->dim(2) == 1 && mk->dim(3) == 128,
+                 "QuantLightningIndexer: PA_BSND key must carry N2=1 and D=128");
+    MOCK_REQUIRE(mk->dim(1) % 16 == 0 && mk->dim(1) <= 1024,
+                 "QuantLightningIndexer: block_size must be a multiple of 16 and at most 1024");
+  } else {
+    MOCK_REQUIRE(mk->shape.size() == 3 || mk->shape.size() == 4,
+                 "QuantLightningIndexer: key must be TND [T,N2,D] or BSND [B,S,N2,D]");
+    const size_t n2_index = mk->shape.size() == 3 ? 1 : 2;
+    MOCK_REQUIRE(mk->dim(n2_index) == 1, "QuantLightningIndexer: N2 is 1");
+    MOCK_REQUIRE(mk->dim(n2_index + 1) == 128, "QuantLightningIndexer: key head dim is 128");
+  }
+  // The BF16-weights path carries FP32 dequant scales (950PR FP8 tuple).
+  MOCK_REQUIRE(mw->shape.size() == (query_tnd ? 2 : 3) && mw->dim(mw->shape.size() - 1) == heads &&
+                   (mw->dtype == ACL_BF16 || mw->dtype == ACL_FLOAT16),
+               "QuantLightningIndexer: weights must be [T,N1]/[B,S,N1] BF16/FP16");
+  MOCK_REQUIRE(mqs->shape == mw->shape && mqs->dtype == ACL_FLOAT32,
+               "QuantLightningIndexer: queryDequantScale must match weights shape in FP32");
+  if (key_paged) {
+    MOCK_REQUIRE(mks->shape.size() == 3 && mks->dim(0) == mk->dim(0) && mks->dim(1) == mk->dim(1) &&
+                     mks->dim(2) == 1 && mks->dtype == ACL_FLOAT32,
+                 "QuantLightningIndexer: PA keyDequantScale must be [block_count, block_size, 1] FP32");
+  } else {
+    MOCK_REQUIRE(mks->dtype == ACL_FLOAT32, "QuantLightningIndexer: keyDequantScale must be FP32");
+  }
+  // Scalar attributes: per-token-head quantization, top-k window and mask.
+  MOCK_REQUIRE(query_quant_mode == 0 && key_quant_mode == 0,
+               "QuantLightningIndexer: quant modes must be 0 (per-token-head)");
+  MOCK_REQUIRE(sparse_count >= 1 && sparse_count <= 2048,
+               "QuantLightningIndexer: sparseCount must be in [1, 2048]");
+  MOCK_REQUIRE(sparse_mode == 0 || sparse_mode == 3, "QuantLightningIndexer: sparseMode must be 0 or 3");
+  (void)pre_tokens;
+  (void)next_tokens;
+  // TND query needs the cumulative query lengths; paged keys need the key
+  // lengths and the block table.
+  const MockAclTensor* maslq =
+      actual_seq_lengths_query_optional == nullptr ? nullptr : AsMockTensor(actual_seq_lengths_query_optional);
+  const MockAclTensor* maslk =
+      actual_seq_lengths_key_optional == nullptr ? nullptr : AsMockTensor(actual_seq_lengths_key_optional);
+  const MockAclTensor* mblocks =
+      block_table_optional == nullptr ? nullptr : AsMockTensor(block_table_optional);
+  if (std::string(layout_query) == "TND" || query_tnd) {
+    MOCK_REQUIRE(maslq != nullptr && maslq->dtype == ACL_INT32,
+                 "QuantLightningIndexer: TND query requires INT32 actualSeqLengthsQuery (cumulative)");
+  }
+  if (key_paged) {
+    MOCK_REQUIRE(maslk != nullptr && maslk->dtype == ACL_INT32,
+                 "QuantLightningIndexer: PA_BSND key requires INT32 actualSeqLengthsKey");
+    MOCK_REQUIRE(mblocks != nullptr && mblocks->dtype == ACL_INT32 && mblocks->shape.size() == 2,
+                 "QuantLightningIndexer: PA_BSND key requires a 2-D INT32 blockTable");
+  }
+  // Output: INT32 sparse indices with N2 = 1 on the head axis.
+  MOCK_REQUIRE(my->dtype == ACL_INT32, "QuantLightningIndexer: out must be INT32");
+  MOCK_REQUIRE(my->shape.size() == (query_tnd ? 3 : 4), "QuantLightningIndexer: out must be [T,1,k] or [B,S,1,k]");
+  MOCK_REQUIRE(my->dim(my->shape.size() - 2) == 1, "QuantLightningIndexer: out carries N2=1");
+  MOCK_REQUIRE(my->dim(my->shape.size() - 1) == sparse_count,
+               "QuantLightningIndexer: out's last axis is the retained top-k count");
+  *workspace_size = Align4k(static_cast<uint64_t>(tokens) * static_cast<uint64_t>(heads) * 8) +
+                    kWorkspaceIndexerBase;
+  *executor = NewExecutor("aclnnQuantLightningIndexer",
+                          {query, key, weights, query_dequant_scale, key_dequant_scale,
+                           actual_seq_lengths_query_optional, actual_seq_lengths_key_optional,
+                           block_table_optional, out});
+  return 0;
+}
+
 // -- execution: every launch is a validated no-op -----------------------------
 
 #define MOCK_NOOP_LAUNCH(name)                                                             \
@@ -979,6 +1250,10 @@ MOCK_NOOP_LAUNCH(aclnnSwigluMxQuant)
 MOCK_NOOP_LAUNCH(aclnnMoeTokenUnpermute)
 MOCK_NOOP_LAUNCH(aclnnGroupedMatmulSwigluQuantV2)
 MOCK_NOOP_LAUNCH(aclnnGroupedMatmulFinalizeRoutingV3)
+MOCK_NOOP_LAUNCH(aclnnMhcPre)
+MOCK_NOOP_LAUNCH(aclnnMhcSinkhorn)
+MOCK_NOOP_LAUNCH(aclnnMhcPost)
+MOCK_NOOP_LAUNCH(aclnnQuantLightningIndexer)
 
 #undef MOCK_NOOP_LAUNCH
 
@@ -1005,6 +1280,11 @@ aclnnStatus MockValidateGmmForTest(const aclTensorList* weight, const aclTensorL
                                    int64_t split_item, int64_t group_type) {
   return ValidateGmm(weight, scale_optional, split_item, group_type);
 }
+
+// How many plans saw aclnnMhcSinkhorn's ViewCopy(output, output) stage run
+// against a non-contiguous output view -- the condition that breaks plain
+// aclSetTensorAddr repeatability for this operator.
+int MockSinkhornViewCopyWarnings() { return g_sinkhorn_viewcopy_warnings; }
 
 }  // namespace mock
 }  // namespace ascend_moe

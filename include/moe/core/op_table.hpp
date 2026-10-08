@@ -92,6 +92,14 @@ enum class OpId {
   kMoeTokenUnpermute,
   kGroupedMatmulSwigluQuantV2,
   kGroupedMatmulFinalizeRoutingV3,
+  // Vendored arch35 (Ascend 950PR) operators from third_party/ops_transformer:
+  // the mHC residual chain and the sparse-attention indexer front end. They
+  // resolve from libcust_opapi.so (CANN builds) or libopapi_mock.so (mock
+  // builds), never from the toolkit's own libopapi.
+  kMhcPre,
+  kMhcSinkhorn,
+  kMhcPost,
+  kQuantLightningIndexer,
   kOpCount,
 };
 
@@ -862,6 +870,136 @@ using GroupedMatmulFinalizeRoutingV3PlanFn =
             float shared_input_weight, int64_t shared_input_offset, bool transpose_x1, bool transpose_x2,
             int64_t group_list_type, const aclIntArray* tuning_config_optional, aclTensor* out,
             uint64_t* workspace_size, aclOpExecutor** executor);
+
+// ---------------------------------------------------------------------------
+// Vendored ops-transformer arch35 operators (third_party/ops_transformer).
+// Prototypes: include/moe/ops/aclnn_dsv4_vendor_ops.h, transcribed from the
+// vendored op_host/op_api/aclnn_<op>.h headers.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief aclnnMhcPre: plan phase (vendored arch35 custom op).
+ * @details Fold the stacked mHC states x [T,N,D] through the mixing weights
+ * phi [N^2+2N, ND] into hIn [T,D] plus the routing state hPost [T,N] and the
+ * residual mapping hRes [T,N,N].
+ * @note Engine geometry: N=4, D=4096, TND layout, BF16 x/hIn, FP32 state.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Stacked mHC states, [T,N,D], BF16/FP16.
+ * @param[in] phi Mixing weights, [N^2+2N, N*D], FP32.
+ * @param[in] alpha Gain triple [3], FP32.
+ * @param[in] bias Mixing bias [N^2+2N], FP32.
+ * @param[in] gamma_optional Per-stream normalizer [N,D], FP32; null allowed.
+ * @param[in] norm_eps RMS normalization epsilon.
+ * @param[in] hc_eps Hyper-connection stability epsilon.
+ * @param[out] h_in Layer input [T,D], dtype of x.
+ * @param[out] h_post Post-mapping state [T,N], FP32.
+ * @param[out] h_res Residual mapping matrix [T,N,N], FP32.
+ * @param[out] inv_rms_optional Reciprocal RMS [T], FP32; null allowed.
+ * @param[out] h_mix_optional Pre-norm mixing state [T,N^2+2N], FP32; null allowed.
+ * @param[out] h_pre_optional Pre-mapping state [T,N], FP32; null allowed.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using MhcPrePlanFn = int (*)(const aclTensor* x, const aclTensor* phi, const aclTensor* alpha, const aclTensor* bias,
+                             const aclTensor* gamma_optional, double norm_eps, double hc_eps, aclTensor* h_in,
+                             aclTensor* h_post, aclTensor* h_res, aclTensor* inv_rms_optional,
+                             aclTensor* h_mix_optional, aclTensor* h_pre_optional, uint64_t* workspace_size,
+                             aclOpExecutor** executor);
+
+/**
+ * @brief aclnnMhcSinkhorn: plan phase (vendored arch35 custom op).
+ * @details Row/column-normalize hRes [T,N,N] into a doubly-stochastic matrix.
+ * @note N in {4, 6, 8}; 1 <= num_iters <= 100; FP32 only. When either optional
+ * output is null the op runs with outFlag 0. The aclnn layer ends in
+ * ViewCopy(kernelOut, output): a non-contiguous output view inserts a copy
+ * stage the repeatable-executor address swap must account for.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Square matrices to normalize, [T,N,N], FP32.
+ * @param[in] eps Sinkhorn division guard.
+ * @param[in] num_iters Iteration count in [1, 100].
+ * @param[out] output Doubly-stochastic matrices, same shape/dtype as x.
+ * @param[out] norm_out Optional norm state, FP32; bound together with sum_out.
+ * @param[out] sum_out Optional row-sum state, FP32; bound together with norm_out.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using MhcSinkhornPlanFn = int (*)(const aclTensor* x, float eps, int64_t num_iters, aclTensor* output,
+                                  aclTensor* norm_out, aclTensor* sum_out, uint64_t* workspace_size,
+                                  aclOpExecutor** executor);
+
+/**
+ * @brief aclnnMhcPost: plan phase (vendored arch35 custom op).
+ * @details x_next = (hRes)^T @ x + hOut * hPost after the attention/MLP layer.
+ * @note Engine geometry: x/hOut/out [T,4,4096]/[T,4096] BF16, hRes [T,4,4] and
+ * hPost [T,4] FP32, TND layout.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Layer input state, [T,N,D], BF16/FP16.
+ * @param[in] h_res Doubly-stochastic mapping, [T,N,N], FP32.
+ * @param[in] h_out Layer output, [T,D], dtype of x.
+ * @param[in] h_post Post-mapping state, [T,N], FP32.
+ * @param[out] out Next layer input, same shape/dtype as x.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using MhcPostPlanFn = int (*)(const aclTensor* x, const aclTensor* h_res, const aclTensor* h_out,
+                              const aclTensor* h_post, aclTensor* out, uint64_t* workspace_size,
+                              aclOpExecutor** executor);
+
+/**
+ * @brief aclnnQuantLightningIndexer: plan phase (vendored arch35 custom op).
+ * @details Sparse-flash front end: top-k token selection over quantized
+ * query/key correlation scores, emitting INT32 sparse indices.
+ * @note Engine geometry: D=128, N1 in {16,24,32,64} (950PR), FP8 E4M3 or
+ * HiFloat8 query/key with BF16 weights + FP32 dequant scales; PA_BSND key
+ * layout with a paged block table. quant modes are 0 (per-token-head).
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] query Index query, [B,S1,N1,D] or [T1,N1,D].
+ * @param[in] key Index key, layout per layout_key_optional, N2=1, D=128.
+ * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], BF16/FP16.
+ * @param[in] query_dequant_scale Query dequant scales, [B,S1,N1] or [T,N1].
+ * @param[in] key_dequant_scale Key dequant scales, layout of key without D.
+ * @param[in] actual_seq_lengths_query_optional Per-batch cumulative query
+ * lengths, INT32; required for TND.
+ * @param[in] actual_seq_lengths_key_optional Per-batch cumulative key lengths,
+ * INT32; required for TND / PA_BSND.
+ * @param[in] block_table_optional Paged-KV block mapping, INT32 [B, blocks].
+ * @param[in] query_quant_mode Quantization mode; 0 = per-token-head.
+ * @param[in] key_quant_mode Quantization mode; 0 = per-token-head.
+ * @param[in] layout_query_optional Host layout string, "BSND" or "TND".
+ * @param[in] layout_key_optional Host layout string, "BSND", "TND", "PA_BSND".
+ * @param[in] sparse_count Top-k blocks retained, in [1, 2048].
+ * @param[in] sparse_mode 0 dense mask, 3 right-down causal.
+ * @param[in] pre_tokens Sparse window; INT64_MAX = unrestricted.
+ * @param[in] next_tokens Sparse window; INT64_MAX = unrestricted.
+ * @param[out] out Selected sparse indices, INT32, [B,S1,N2,k] or [T,N2,k].
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using QuantLightningIndexerPlanFn = int (*)(const aclTensor* query, const aclTensor* key, const aclTensor* weights,
+                                            const aclTensor* query_dequant_scale, const aclTensor* key_dequant_scale,
+                                            const aclTensor* actual_seq_lengths_query_optional,
+                                            const aclTensor* actual_seq_lengths_key_optional,
+                                            const aclTensor* block_table_optional, int64_t query_quant_mode,
+                                            int64_t key_quant_mode, char* layout_query_optional,
+                                            char* layout_key_optional, int64_t sparse_count, int64_t sparse_mode,
+                                            int64_t pre_tokens, int64_t next_tokens, const aclTensor* out,
+                                            uint64_t* workspace_size, aclOpExecutor** executor);
 
 /**
  * @brief Shared second-phase ABI for every imported ACLNN operator.

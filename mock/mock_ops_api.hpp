@@ -69,6 +69,10 @@ aclnnStatus MockValidateRoutingForTest(const aclTensor* expert_idx, int64_t expe
                                        const aclTensor* group_list_out);
 aclnnStatus MockValidateGmmForTest(const aclTensorList* weight, const aclTensorList* scale_optional,
                                    int64_t split_item, int64_t group_type);
+// Plans since the last read that saw aclnnMhcSinkhorn's trailing
+// ViewCopy(output, output) stage against a non-contiguous output view -- the
+// repeatability hazard the engine must route around for this operator.
+int MockSinkhornViewCopyWarnings();
 
 }  // namespace mock
 }  // namespace ascend_moe

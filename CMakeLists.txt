@@ -35,9 +35,12 @@
 #   mock/       the symbolic libopapi_mock backend (headers + implementation)
 #   tests/      every test binary: contract smoke, mock suite, device probes
 #   python/     torch-free tokenizer + benchmark harness
+#   third_party/ vendored arch35 operator sources (ops-transformer)
 #
 # TARGETS
 #   ascend_moe_engine            libascend_moe_engine.so -- the engine itself
+#   cust_opapi                   (CANN mode) libcust_opapi.so, the vendored
+#                                mHC + lightning-indexer operator entry points
 #   moe_runner                   the inference binary (apps/moe_runner.cpp)
 #   mock_contract_smoke          (mock mode) the device-free contract test
 #   mock_pipeline_e2e            (mock mode) the symbolic pipeline suite
@@ -267,10 +270,43 @@ else()
 
   target_sources(ascend_moe_engine PRIVATE src/core/aclnn_signature_check.cpp)
 
-  set_target_properties(ascend_moe_engine PROPERTIES
-    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
-    INSTALL_RPATH "${MOE_CANN_LIB_DIR}"
+  # The signature check includes the vendored operators' own aclnn_*.h (the
+  # headers libcust_opapi.so is compiled from) and needs their include roots;
+  # scoped to that one translation unit so the vendor tree stays out of the
+  # engine's public include path.
+  set(_moe_vendor_check_includes
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_pre/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_sinkhorn/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_post/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/attention/quant_lightning_indexer/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/common/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/common/include/external"
+      "${ASCEND_HOME_PATH}/include/aclnn")
+  set_source_files_properties(src/core/aclnn_signature_check.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${_moe_vendor_check_includes}"
   )
+
+  # The build root joins the rpath: libcust_opapi.so (the vendored arch35
+  # operators added below) is a DT_NEEDED of this library and lives there, and
+  # with new-dtags the loader resolves a library's own dependencies through
+  # its RUNPATH, not the executable's.
+  set_target_properties(ascend_moe_engine PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR};${CMAKE_BINARY_DIR}"
+    INSTALL_RPATH "${MOE_CANN_LIB_DIR};$ORIGIN"
+  )
+endif()
+
+# -----------------------------------------------------------------------------
+# Vendored arch35 (Ascend 950PR) operators from ops-transformer
+# -----------------------------------------------------------------------------
+# mhc_pre / mhc_sinkhorn / mhc_post / quant_lightning_indexer. In a CANN build
+# this produces libcust_opapi.so in the build root and link-loads it into the
+# engine, so OpTable's dlsym(RTLD_DEFAULT, ...) resolves the four vendored
+# entry-point pairs. In a mock build the directory contributes nothing: the
+# stubs live in mock/mock_ops.cpp inside libopapi_mock.so.
+add_subdirectory(third_party/ops_transformer)
+if(TARGET cust_opapi)
+  target_link_libraries(ascend_moe_engine PUBLIC cust_opapi)
 endif()
 
 # -----------------------------------------------------------------------------
