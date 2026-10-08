@@ -93,12 +93,17 @@ bool IsContiguous(const MockAclTensor* tensor) {
   return true;
 }
 
-// aclnnMhcSinkhorn's ViewCopy(output, output) repeatability condition: the
-// aclnn layer always ends in a copy stage onto the caller's output view, and
-// a non-contiguous view means that stage is a real gather/scatter whose
-// address cannot be swapped with aclSetTensorAddr alone. The mock records the
-// condition instead of failing it -- planning still succeeds -- so the test
-// suite can assert the guard fired.
+// aclnnMhcSinkhorn's ViewCopy(output, output) repeatability hazard: the aclnn
+// layer runs Contiguous(output) -> MhcSinkhorn writes into and returns that
+// same tensor -> ViewCopy(kernelOut, output). For a CONTIGUOUS output
+// Contiguous is the identity, so the final call copies a tensor onto its own
+// address, and the operator-library manual (4.31) makes an executor with a
+// same-address ViewCopy non-reusable. A NON-contiguous output view is the
+// documented workaround: Contiguous then allocates a distinct executor-owned
+// temp, src != dst, and repeatability is restored at the cost of one extra
+// copy launch. The mock counts the hazardous (contiguous, self-copy) plans
+// instead of failing them -- planning still succeeds -- so the test suite can
+// assert the guard fired and the workaround path is distinguishable.
 int g_sinkhorn_viewcopy_warnings = 0;
 
 // Captures tensors into a fresh executor in IR order. Null tensor arguments
@@ -1067,11 +1072,12 @@ aclnnStatus aclnnMhcSinkhornGetWorkspaceSize(const aclTensor* x, float eps, int6
     MOCK_REQUIRE(mnorm->dtype == ACL_FLOAT32 && msum->dtype == ACL_FLOAT32,
                  "MhcSinkhorn: normOut/sumOut must be FP32");
   }
-  // The repeatability guard: the aclnn layer ends in ViewCopy(kernelOut,
-  // output), and a non-contiguous output view means that copy stage is a real
-  // gather/scatter -- aclSetTensorAddr alone cannot retarget it. Recorded,
-  // not refused: planning succeeds, the condition is reported.
-  if (!IsContiguous(my)) {
+  // The repeatability guard (see g_sinkhorn_viewcopy_warnings above): a
+  // contiguous output is the hazardous case -- Contiguous is the identity and
+  // the trailing ViewCopy becomes the manual-4.31 same-address self-copy that
+  // makes the executor non-reusable. Recorded, not refused: planning still
+  // succeeds, and the non-contiguous workaround stays usable.
+  if (IsContiguous(my)) {
     ++g_sinkhorn_viewcopy_warnings;
   }
   *workspace_size = Align4k(static_cast<uint64_t>(mx->dim(0)) * static_cast<uint64_t>(n0) *

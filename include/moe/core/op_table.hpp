@@ -914,9 +914,13 @@ using MhcPrePlanFn = int (*)(const aclTensor* x, const aclTensor* phi, const acl
  * @brief aclnnMhcSinkhorn: plan phase (vendored arch35 custom op).
  * @details Row/column-normalize hRes [T,N,N] into a doubly-stochastic matrix.
  * @note N in {4, 6, 8}; 1 <= num_iters <= 100; FP32 only. When either optional
- * output is null the op runs with outFlag 0. The aclnn layer ends in
- * ViewCopy(kernelOut, output): a non-contiguous output view inserts a copy
- * stage the repeatable-executor address swap must account for.
+ * output is null the op runs with outFlag 0. Repeatability hazard (manual
+ * 4.31): the aclnn layer runs Contiguous(output), MhcSinkhorn writes into and
+ * returns that tensor, then ViewCopy(kernelOut, output) -- for a contiguous
+ * output that is a same-address self-copy and the executor may NOT be reused.
+ * Handing a non-contiguous output view is the workaround: Contiguous then
+ * allocates a distinct temp (src != dst) at the cost of one extra copy
+ * launch; the planned aclnnMhcPreSinkhorn fusion removes the hazard entirely.
  * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
  * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
  * @param[in] x Square matrices to normalize, [T,N,N], FP32.

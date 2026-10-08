@@ -70,8 +70,10 @@ aclnnStatus MockValidateRoutingForTest(const aclTensor* expert_idx, int64_t expe
 aclnnStatus MockValidateGmmForTest(const aclTensorList* weight, const aclTensorList* scale_optional,
                                    int64_t split_item, int64_t group_type);
 // Plans since the last read that saw aclnnMhcSinkhorn's trailing
-// ViewCopy(output, output) stage against a non-contiguous output view -- the
-// repeatability hazard the engine must route around for this operator.
+// ViewCopy(output, output) stage run as a same-address self-copy -- i.e. a
+// CONTIGUOUS output view, the manual-4.31 condition that makes the executor
+// non-reusable. A non-contiguous output (the workaround: Contiguous then
+// allocates a distinct temp, src != dst) is not counted.
 int MockSinkhornViewCopyWarnings();
 
 }  // namespace mock

@@ -29,9 +29,10 @@
 //     executor adopts (aclSetAclOpExecutorRepeatable succeeds), the launch
 //     is a validated no-op, and re-planning returns the same workspace size.
 //   * aclSetTensorAddr swaps a slot address inside the captured IR order.
-//   * The mhc_sinkhorn ViewCopy(output, output) guard: a non-contiguous
-//     output view is planned successfully but the hazard is counted, which is
-//     the repeatability condition the engine must route around.
+//   * The mhc_sinkhorn ViewCopy(output, output) guard: a contiguous output
+//     plans successfully but the same-address self-copy hazard is counted
+//     (manual 4.31: such an executor is non-reusable), while the
+//     non-contiguous output workaround path stays clean.
 //
 // What is NOT verified here: the arch35 kernel numerics and the real
 // GetWorkspaceSize numbers -- those need a 950PR with the vendored opp
@@ -214,7 +215,12 @@ void TestMhcChain() {
         "aclSetTensorAddr(0, x) hits the captured IR slot exactly (no slot-map mismatch)");
   pre_slot.Reset();
 
-  // -- mhc_sinkhorn: [T,4,4] -> doubly-stochastic, contiguous output --------
+  // -- mhc_sinkhorn: [T,4,4] -> doubly-stochastic --------------------------------
+  // The CONTIGUOUS output is the hazard: Contiguous(output) is the identity,
+  // MhcSinkhorn writes into and returns that same tensor, and the trailing
+  // ViewCopy becomes the manual-4.31 same-address self-copy that makes the
+  // executor non-reusable. The mock still plans and launches it -- the guard
+  // counts the condition for the assertions below.
   aclTensor* sink_in = MakeTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
   aclTensor* sink_out = MakeTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
   const int warnings_before = mock::MockSinkhornViewCopyWarnings();
@@ -223,19 +229,20 @@ void TestMhcChain() {
   StaticOpSlot sink_slot;
   sink_slot.Adopt(OpId::kMhcSinkhorn, "vendor/mhc_sinkhorn", ws, executor);
   sink_slot.Launch(ops, workspace, stream);
-  Check(mock::MockSinkhornViewCopyWarnings() == warnings_before,
-        "a contiguous mhc_sinkhorn output raises no ViewCopy hazard");
+  Check(mock::MockSinkhornViewCopyWarnings() == warnings_before + 1,
+        "a contiguous mhc_sinkhorn output plans and launches but is counted as the ViewCopy(output, output) "
+        "self-copy hazard (executor non-reusable per manual 4.31)");
   sink_slot.Reset();
 
-  // The hazard: a strided output view plans fine, but the trailing
-  // ViewCopy(output, output) stage is a gather/scatter the address swap
-  // cannot express -- the guard counts it instead of failing the plan.
+  // The workaround: a strided output view forces Contiguous to allocate a
+  // distinct executor-owned temp, so the final ViewCopy runs src != dst and
+  // repeatability is restored -- no hazard counted on this path.
   aclTensor* strided_out = MakeStridedTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32,
                                              next(kTokens * kNhc * kNhc * 16));
   ws = PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, &executor, sink_in, 1e-6f, 20, strided_out, nullptr,
                                       nullptr);
   Check(mock::MockSinkhornViewCopyWarnings() == warnings_before + 1,
-        "a non-contiguous mhc_sinkhorn output is planned but counted as a ViewCopy repeatability hazard");
+        "a non-contiguous mhc_sinkhorn output (the workaround) raises no further hazard");
   aclDestroyAclOpExecutor(executor);
 
   // numIters bounds come from the vendored aclnn layer's own checks.
