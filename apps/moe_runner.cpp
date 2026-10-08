@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -535,11 +536,15 @@ int Run(int argc, char** argv) {
 }  // namespace
 }  // namespace ascend_moe
 
-int main(int argc, char** argv) {
+int RunMain(int argc, char** argv) {
   try {
     return ascend_moe::Run(argc, argv);
   } catch (const std::exception& error) {
     std::fprintf(stderr, "dsv4_runner: %s\n", error.what());
     return 1;
   }
+}
+
+int main(int argc, char** argv) {
+  return ascend_moe::GuardedMain([&] { return RunMain(argc, argv); });
 }

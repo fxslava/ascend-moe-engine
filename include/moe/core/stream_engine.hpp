@@ -37,6 +37,8 @@ class IStreamEngine {
   virtual ~IStreamEngine() = default;
 
   virtual DeviceStream CreateStream() = 0;
+  // Teardown contract: drain queued work before destroying the stream. Physical
+  // backends must use a finite wait and a cancellation/force-destroy fallback.
   virtual void DestroyStream(DeviceStream stream) = 0;
   virtual DeviceEvent CreateEvent() = 0;
   virtual void DestroyEvent(DeviceEvent event) = 0;

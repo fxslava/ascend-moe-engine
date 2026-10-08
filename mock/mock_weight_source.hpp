@@ -1,5 +1,6 @@
 #pragma once
 
+#include "moe/core/config.hpp"
 #include "moe/core/error.hpp"
 #include "moe/core/weight_source.hpp"
 

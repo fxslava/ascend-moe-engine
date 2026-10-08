@@ -1,5 +1,5 @@
 if(ENABLE_MOCK_RUNTIME)
-  set(_tests mock_contract_smoke mock_pipeline_e2e mock_safetensors_index_probe)
+  set(_tests mock_contract_smoke mock_pipeline_e2e mock_safetensors_index_probe mock_failure_teardown)
   set(_test_label mock)
 else()
   set(_tests npu_backend_probe npu_weights_ingest_probe npu_e2e_single_token)

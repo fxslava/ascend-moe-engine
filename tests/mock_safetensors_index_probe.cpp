@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 // Host-only metadata contract: ordinary JSON allocations, zero tensor storage.
 // Fixtures are generated inline; no checkpoint download or shard is required.
 #include "moe/core/checkpoint_keys.hpp"
@@ -306,7 +307,7 @@ void ProbeLocalIndex() {
 }
 }  // namespace
 
-int main() {
+int RunMain() {
   try {
     TestHeaders();
     TestMappingAndTopology();
@@ -322,4 +323,8 @@ int main() {
     std::cerr << "[ FAIL ] " << error.what() << '\n';
     return 1;
   }
+}
+
+int main() {
+  return ascend_moe::GuardedMain([&] { return RunMain(); });
 }

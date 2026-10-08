@@ -20,12 +20,32 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "moe/core/config.hpp"
 #include "moe/core/error.hpp"
 
 namespace ascend_moe {
+
+// Reset a device only after the last backend context owning it has gone away.
+struct AclDeviceLease {
+  explicit AclDeviceLease(int32_t id) : id(id) { DSV4_ACL_CHECK(aclrtSetDevice(id)); }
+  ~AclDeviceLease() { ReportAclCleanup("aclrtResetDevice", aclrtResetDevice(id)); }
+  int32_t id;
+};
+
 namespace {
+
+std::shared_ptr<AclDeviceLease> AcquireDevice(int32_t id) {
+  static std::mutex mutex;
+  static std::map<int32_t, std::weak_ptr<AclDeviceLease>> leases;
+  const std::lock_guard<std::mutex> lock(mutex);
+  auto& weak = leases[id];
+  if (auto lease = weak.lock()) return lease;
+  auto lease = std::make_shared<AclDeviceLease>(id);
+  weak = lease;
+  return lease;
+}
 
 aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
   switch (kind) {
@@ -74,52 +94,70 @@ const char* MemcpyKindName(MemcpyKind kind) {
 // ---------------------------------------------------------------------------
 
 AclDeviceOps::AclDeviceOps(int32_t device_id) : device_id_(device_id) {
-  // aclInit is per process; a second call answers ACL_ERROR_REPEAT_INITIALIZE,
-  // which is not a failure for this constructor.
-  const aclError init_status = aclInit(nullptr);
-  if (init_status != ACL_SUCCESS && init_status != ACL_ERROR_REPEAT_INITIALIZE) {
-    throw AclError("aclInit", __FILE__, __LINE__, init_status);
+  EnsureAclRuntime();
+  device_lease_ = AcquireDevice(device_id_);
+  try {
+    aclrtContext context = nullptr;
+    DSV4_ACL_CHECK(aclrtCreateContext(&context, device_id_));
+    context_.reset(context);
+    DSV4_ACL_CHECK(aclrtSetCurrentContext(context));
+    const char* soc = aclrtGetSocName();
+    soc_name_ = soc != nullptr ? soc : "unknown";
+  } catch (...) {
+    context_.reset();
+    device_lease_.reset();
+    throw;
   }
-  DSV4_ACL_CHECK(aclrtSetDevice(device_id_));
-  aclrtContext context = nullptr;
-  DSV4_ACL_CHECK(aclrtCreateContext(&context, device_id_));
-  context_ = context;
-  DSV4_ACL_CHECK(aclrtSetCurrentContext(context));
-  const char* soc = aclrtGetSocName();
-  soc_name_ = soc != nullptr ? soc : "unknown";
+}
+
+void AclDeviceOps::Quiesce() noexcept {
+  if (context_.get()) ReportAclCleanup("aclrtSetCurrentContext", aclrtSetCurrentContext(context_.get()));
+  for (auto& entry : streams_owned_) entry.second->Drain();
 }
 
 AclDeviceOps::~AclDeviceOps() {
-  if (context_ != nullptr) {
-    aclrtDestroyContext(static_cast<aclrtContext>(context_));
-    context_ = nullptr;
-  }
-  aclrtResetDevice(device_id_);
+  Quiesce();
+  streams_owned_.clear();
+  events_owned_.clear();
+  device_owned_.clear();
+  host_owned_.clear();
+  context_.reset();
+  device_lease_.reset();
 }
 
 void* AclDeviceOps::DeviceMalloc(size_t bytes) {
   void* pointer = nullptr;
   DSV4_ACL_CHECK(aclrtMalloc(&pointer, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+  DeviceMemoryGuard pending(pointer);
+  auto owner = std::make_unique<DeviceMemoryGuard>(pointer);
+  pending.release();
+  device_owned_.emplace(pointer, std::move(owner));
   ++counters_.device_allocations;
   return pointer;
 }
 
 void AclDeviceOps::DeviceFree(void* pointer) {
   if (pointer != nullptr) {
-    aclrtFree(pointer);
+    Quiesce();
+    device_owned_.erase(pointer);
   }
 }
 
 void* AclDeviceOps::HostPinnedMalloc(size_t bytes) {
   void* pointer = nullptr;
   DSV4_ACL_CHECK(aclrtMallocHost(&pointer, bytes));
+  HostMemoryGuard pending(pointer);
+  auto owner = std::make_unique<HostMemoryGuard>(pointer);
+  pending.release();
+  host_owned_.emplace(pointer, std::move(owner));
   ++counters_.host_pinned_allocations;
   return pointer;
 }
 
 void AclDeviceOps::HostPinnedFree(void* pointer) {
   if (pointer != nullptr) {
-    aclrtFreeHost(pointer);
+    Quiesce();
+    host_owned_.erase(pointer);
   }
 }
 
@@ -130,12 +168,16 @@ void AclDeviceOps::DeviceMemset(void* pointer, size_t capacity, int value, size_
 DeviceStream AclDeviceOps::CreateStream() {
   aclrtStream stream = nullptr;
   DSV4_ACL_CHECK(aclrtCreateStream(&stream));
+  std::unique_ptr<AclStreamGuard> owner;
+  try { owner = std::make_unique<AclStreamGuard>(stream); }
+  catch (...) { aclrtDestroyStream(stream); throw; }
+  streams_owned_.emplace(stream, std::move(owner));
   return static_cast<DeviceStream>(stream);
 }
 
 void AclDeviceOps::DestroyStream(DeviceStream stream) {
   if (stream != nullptr) {
-    aclrtDestroyStream(static_cast<aclrtStream>(stream));
+    streams_owned_.erase(stream);
   }
 }
 
@@ -144,12 +186,17 @@ DeviceEvent AclDeviceOps::CreateEvent() {
   // ACL_EVENT_SYNC is the cross-stream dependency flavour: no timestamp, which
   // is what makes it cheap enough to gate every transit chunk.
   DSV4_ACL_CHECK(aclrtCreateEventExWithFlag(&event, ACL_EVENT_SYNC));
+  AclEventGuard pending(event);
+  auto owner = std::make_unique<AclEventGuard>(event);
+  pending.release();
+  events_owned_.emplace(event, std::move(owner));
   return static_cast<DeviceEvent>(event);
 }
 
 void AclDeviceOps::DestroyEvent(DeviceEvent event) {
   if (event != nullptr) {
-    aclrtDestroyEvent(static_cast<aclrtEvent>(event));
+    Quiesce();
+    events_owned_.erase(event);
   }
 }
 
@@ -164,7 +211,7 @@ void AclDeviceOps::StreamWaitEvent(DeviceStream stream, DeviceEvent event) {
 }
 
 void AclDeviceOps::SynchronizeStream(DeviceStream stream) {
-  DSV4_ACL_CHECK(aclrtSynchronizeStream(static_cast<aclrtStream>(stream)));
+  DSV4_ACL_CHECK(aclrtSynchronizeStreamWithTimeout(static_cast<aclrtStream>(stream), 30000));
   ++counters_.stream_synchronizations;
 }
 

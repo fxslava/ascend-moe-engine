@@ -24,12 +24,16 @@
 
 #pragma once
 
+#include <acl/acl.h>
+
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 
 namespace ascend_moe {
+
+void CheckForInterrupt();
 
 class Dsv4Error : public std::runtime_error {
  public:
@@ -47,29 +51,29 @@ class AclError : public Dsv4Error {
   static std::string Format(const char* call, const char* file, int line, int64_t status) {
     std::ostringstream out;
     out << call << " failed with status " << status << " at " << file << ":" << line;
+    if (const char* recent = aclGetRecentErrMsg()) out << "\nCANN: " << recent;
     return out.str();
   }
 
   int64_t status_ = 0;
 };
 
-#define DSV4_ACL_CHECK(expr)                                                   \
-  do {                                                                         \
-    const auto dsv4_status_ = (expr);                                          \
-    if (dsv4_status_ != 0) {                                                   \
-      throw ::ascend_moe::AclError(#expr, __FILE__, __LINE__,           \
-                                          static_cast<int64_t>(dsv4_status_)); \
-    }                                                                          \
+#define DSV4_ACL_CHECK(expr)                                                                       \
+  do {                                                                                             \
+    ::ascend_moe::CheckForInterrupt();                                                             \
+    const auto dsv4_status_ = (expr);                                                              \
+    if (dsv4_status_ != 0) {                                                                       \
+      throw ::ascend_moe::AclError(#expr, __FILE__, __LINE__, static_cast<int64_t>(dsv4_status_)); \
+    }                                                                                              \
   } while (false)
 
-#define DSV4_REQUIRE(condition, message)                                       \
-  do {                                                                         \
-    if (!(condition)) {                                                        \
-      std::ostringstream dsv4_msg_;                                            \
-      dsv4_msg_ << message << " [" << #condition << " at " << __FILE__ << ":"   \
-                << __LINE__ << "]";                                            \
-      throw ::ascend_moe::Dsv4Error(dsv4_msg_.str());                   \
-    }                                                                          \
+#define DSV4_REQUIRE(condition, message)                                                          \
+  do {                                                                                            \
+    if (!(condition)) {                                                                           \
+      std::ostringstream dsv4_msg_;                                                               \
+      dsv4_msg_ << message << " [" << #condition << " at " << __FILE__ << ":" << __LINE__ << "]"; \
+      throw ::ascend_moe::Dsv4Error(dsv4_msg_.str());                                             \
+    }                                                                                             \
   } while (false)
 
 }  // namespace ascend_moe

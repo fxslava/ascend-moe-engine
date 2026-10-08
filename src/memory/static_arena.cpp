@@ -20,6 +20,7 @@
 #include <aclnn/acl_meta.h>
 
 #include <algorithm>
+#include <memory>
 #include <iomanip>
 #include <sstream>
 
@@ -142,7 +143,9 @@ aclTensor* StaticMemoryArena::CreateTensorInternal(const char* label, const std:
   aclTensor* tensor = aclCreateTensor(dims.data(), dims.size(), static_cast<aclDataType>(dtype), strides.data(), 0,
                                       static_cast<aclFormat>(kAclFormatNd), storage.data(), storage.size(), data);
   DSV4_REQUIRE(tensor != nullptr, label << ": aclCreateTensor returned null");
+  std::unique_ptr<aclTensor, decltype(&aclDestroyTensor)> pending(tensor, &aclDestroyTensor);
   owned_tensors_.push_back(tensor);
+  pending.release();
 
   DescriptorRecord record;
   record.label = label;
@@ -169,11 +172,40 @@ aclTensor* StaticMemoryArena::CreateFp4Tensor(const char* label, const std::vect
 aclTensorList* StaticMemoryArena::CreateTensorList(const char* label, const std::vector<aclTensor*>& tensors) {
   RefuseIfSealed("CreateTensorList");
   DSV4_REQUIRE(!tensors.empty(), label << ": an empty tensor list has no meaning to any aclnn op");
-  std::vector<const aclTensor*> handles(tensors.begin(), tensors.end());
-  aclTensorList* list = aclCreateTensorList(handles.data(), handles.size());
+  // Manual 4.16: a tensor list owns its tensor handles. Each list needs its
+  // own descriptor copies (FIA key/value lists even share one storage buffer).
+  using TensorOwner = std::unique_ptr<aclTensor, decltype(&aclDestroyTensor)>;
+  std::vector<TensorOwner> copies;
+  std::vector<aclTensor*> raw_copies;
+  for (const auto* tensor : tensors) {
+    int64_t* raw = nullptr;
+    uint64_t ndim = 0, nstride = 0, nstorage = 0;
+    DSV4_ACL_CHECK(aclGetViewShape(tensor, &raw, &ndim));
+    std::unique_ptr<int64_t[]> dims(raw);
+    DSV4_ACL_CHECK(aclGetViewStrides(tensor, &raw, &nstride));
+    std::unique_ptr<int64_t[]> strides(raw);
+    DSV4_ACL_CHECK(aclGetStorageShape(tensor, &raw, &nstorage));
+    std::unique_ptr<int64_t[]> storage(raw);
+    aclDataType dtype{};
+    aclFormat format{};
+    void* address = nullptr;
+    int64_t offset = 0;
+    DSV4_ACL_CHECK(aclGetDataType(tensor, &dtype));
+    DSV4_ACL_CHECK(aclGetFormat(tensor, &format));
+    DSV4_ACL_CHECK(aclGetRawTensorAddr(tensor, &address));
+    DSV4_ACL_CHECK(aclGetViewOffset(tensor, &offset));
+    TensorOwner copy(aclCreateTensor(dims.get(), ndim, dtype, strides.get(), offset,
+                                    format, storage.get(), nstorage, address), &aclDestroyTensor);
+    DSV4_REQUIRE(copy, label << ": tensor-list descriptor copy failed");
+    raw_copies.push_back(copy.get());
+    copies.push_back(std::move(copy));
+  }
+  aclTensorList* list = aclCreateTensorList(raw_copies.data(), raw_copies.size());
   DSV4_REQUIRE(list != nullptr, label << ": aclCreateTensorList returned null");
+  for (auto& copy : copies) copy.release();
+  std::unique_ptr<aclTensorList, decltype(&aclDestroyTensorList)> pending(list, &aclDestroyTensorList);
   owned_lists_.push_back(list);
-
+  pending.release();
   DescriptorRecord record;
   record.label = label;
   record.kind = DescriptorRecord::Kind::kTensorList;
@@ -189,7 +221,9 @@ aclIntArray* StaticMemoryArena::CreateIntArray(const char* label, const std::vec
   const std::vector<int64_t>& kept = descriptor_shapes_.back();
   aclIntArray* array = aclCreateIntArray(kept.data(), kept.size());
   DSV4_REQUIRE(array != nullptr, label << ": aclCreateIntArray returned null");
+  std::unique_ptr<aclIntArray, decltype(&aclDestroyIntArray)> pending(array, &aclDestroyIntArray);
   owned_int_arrays_.push_back(array);
+  pending.release();
 
   DescriptorRecord record;
   record.label = label;
@@ -219,7 +253,9 @@ aclScalar* StaticMemoryArena::CreateScalar(const char* label, int32_t dtype, con
   aclScalar* scalar = aclCreateScalar(const_cast<void*>(static_cast<const void*>(bytes.data())),
                                       static_cast<aclDataType>(dtype));
   DSV4_REQUIRE(scalar != nullptr, label << ": aclCreateScalar returned null");
+  std::unique_ptr<aclScalar, decltype(&aclDestroyScalar)> pending(scalar, &aclDestroyScalar);
   owned_scalars_.push_back(scalar);
+  pending.release();
 
   DescriptorRecord record;
   record.label = label;

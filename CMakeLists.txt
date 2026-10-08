@@ -99,18 +99,21 @@ option(DSV4_WERROR "Treat compiler warnings as errors" OFF)
 # The engine library
 # -----------------------------------------------------------------------------
 set(MOE_ENGINE_SOURCES
-  src/device_ops.cpp
-  src/expert_layout.cpp
-  src/model_config.cpp
-  src/weight_source.cpp
-  src/inference_stats.cpp
-  src/exclusive_staging.cpp
-  src/op_table.cpp
-  src/static_arena.cpp
-  src/static_arena_manager.cpp
-  src/moe_router_engine.cpp
-  src/standard_aclnn_moe_block.cpp
-  src/pipeline.cpp
+  src/core/acl_guard.cpp
+  src/core/matmul_contract.cpp
+  src/memory/weight_transpose.cpp
+  src/core/device_ops.cpp
+  src/memory/expert_layout.cpp
+  src/core/model_config.cpp
+  src/core/weight_source.cpp
+  src/diagnostics/inference_stats.cpp
+  src/memory/exclusive_staging.cpp
+  src/core/op_table.cpp
+  src/memory/static_arena.cpp
+  src/memory/static_arena_manager.cpp
+  src/pipeline/moe_router_engine.cpp
+  src/pipeline/standard_aclnn_moe_block.cpp
+  src/pipeline/pipeline.cpp
 )
 
 add_library(ascend_moe_engine SHARED ${MOE_ENGINE_SOURCES})
@@ -140,6 +143,7 @@ if(ENABLE_MOCK_RUNTIME)
 
   add_library(opapi_mock SHARED
     "${MOE_MOCK_DIR}/mock_allocator.cpp"
+    "${MOE_MOCK_DIR}/runtime_faults.cpp"
     "${MOE_MOCK_DIR}/mock_descriptor.cpp"
     "${MOE_MOCK_DIR}/mock_ops.cpp"
   )
@@ -261,7 +265,7 @@ else()
     target_link_options(ascend_moe_engine PUBLIC "LINKER:-rpath-link,${_dir}")
   endforeach()
 
-  target_sources(ascend_moe_engine PRIVATE src/aclnn_signature_check.cpp)
+  target_sources(ascend_moe_engine PRIVATE src/core/aclnn_signature_check.cpp)
 
   set_target_properties(ascend_moe_engine PROPERTIES
     BUILD_RPATH "${MOE_CANN_LIB_DIR}"

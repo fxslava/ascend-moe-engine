@@ -73,36 +73,22 @@ Dsv4Pipeline::Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, 
   if (moe_block_ == nullptr) {
     moe_block_ = std::make_unique<StandardAclnnMoeBlock>(ops_, router_, experts_, config_);
   }
-  compute_stream_ = streams_.CreateStream();
-  compute_done_ = streams_.CreateEvent();
+  compute_stream_ = resources_.CreateStream();
+  compute_done_ = resources_.CreateEvent();
   // Primed for the same reason the staging engine primes its events: the first
   // layer's ScoreAndSelect waits on it before anything has recorded it.
   streams_.RecordEvent(compute_done_, compute_stream_);
   streams_.SynchronizeStream(compute_stream_);
 
-  token_mailbox_ = static_cast<int64_t*>(allocator_.HostPinnedMalloc(Int64Bytes(1)));
-  slot_mailbox_ = static_cast<int32_t*>(allocator_.HostPinnedMalloc(Int32Bytes(1)));
+  token_mailbox_ = static_cast<int64_t*>(resources_.HostPinnedMalloc(Int64Bytes(1)));
+  slot_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(1)));
   *token_mailbox_ = 0;
   *slot_mailbox_ = 0;
 }
 
 Dsv4Pipeline::~Dsv4Pipeline() {
-  // The stages own repeatable executors. They are released by the member
-  // destruction that follows this body: `stages_` is declared after
-  // `arena_manager_`, so reverse-order destruction destroys the executors
-  // BEFORE the arena frees the memory their descriptors point at.
-  if (token_mailbox_ != nullptr) {
-    allocator_.HostPinnedFree(token_mailbox_);
-  }
-  if (slot_mailbox_ != nullptr) {
-    allocator_.HostPinnedFree(slot_mailbox_);
-  }
-  if (compute_done_ != nullptr) {
-    streams_.DestroyEvent(compute_done_);
-  }
-  if (compute_stream_ != nullptr) {
-    streams_.DestroyStream(compute_stream_);
-  }
+  resources_.Reset();
+  router_.ResetStages();
 }
 
 size_t Dsv4Pipeline::BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size, int64_t max_context_len) {
@@ -176,8 +162,8 @@ void Dsv4Pipeline::PlanStages() {
   // see stages_ in the header); planning only fills slots in place.
   auto add = [&](const char* name, OpId op) -> PipelineStage& { return stages_.Add(name, op); };
   auto adopt = [&](PipelineStage& entry, uint64_t workspace, aclOpExecutor* executor) {
-    arena.NoteWorkspace(workspace);
     entry.slot.Adopt(entry.op, entry.name, workspace, executor);
+    arena.NoteWorkspace(workspace);
   };
 
   aclOpExecutor* executor = nullptr;
@@ -258,27 +244,8 @@ void Dsv4Pipeline::PlanStages() {
         kFiaLayout, 1, kFiaSparseModeBand, kFiaInnerPreciseHighPrecision, config_.block_size,
         kFiaAntiquantModeNone, false, kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone,
         kFiaPseTypeNone, t.attn_out, t.softmax_lse);
-    arena.NoteWorkspace(workspace);
-    // FIA V5 also exports an upper bound over every shape it may be given. When
-    // the toolkit has it, reserve that too: a re-plan can legitimately return
-    // more than the first plan did as the context grows, and the
-    // AssertWorkspaceFits guard would otherwise fire mid-run.
-    if (ops_.available(OpId::kFiaV5GetMaxWorkspace)) {
-      aclOpExecutor* bound_executor = nullptr;
-      const uint64_t upper_bound = PlanAclnnOp<FusedInferAttentionScoreV5PlanFn>(
-          ops_, OpId::kFiaV5GetMaxWorkspace, &bound_executor, t.q_latent, t.key_list, t.value_list, nullptr,
-          nullptr, t.actual_seq_q, t.actual_seq_kv, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-          t.block_table, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, t.q_rope,
-          t.key_rope_cache_view, nullptr, nullptr, nullptr, nullptr, nullptr, heads_, scale, kFiaPreTokensAll,
-          kFiaNextTokensCausal, kFiaLayout, 1, kFiaSparseModeBand, kFiaInnerPreciseHighPrecision,
-          config_.block_size, kFiaAntiquantModeNone, false, kFiaAntiquantModeNone, kFiaAntiquantModeNone,
-          kFiaQueryQuantModeNone, kFiaPseTypeNone, t.attn_out, t.softmax_lse);
-      arena.NoteWorkspace(upper_bound);
-      if (bound_executor != nullptr) {
-        aclDestroyAclOpExecutor(bound_executor);
-      }
-    }
-    entry.slot.Adopt(entry.op, entry.name, workspace, executor);
+    // Only call the public, signature-checked planner. Geometry stays fixed after Build.
+    adopt(entry, workspace, executor);
   }
   // 10. quantize the latent attention output for the folded o_proj.
   {
@@ -655,3 +622,4 @@ std::string Dsv4Pipeline::DescribeSlotIndexMap() const {
 }
 
 }  // namespace ascend_moe
+

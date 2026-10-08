@@ -61,6 +61,7 @@
 // needs page-locked source memory -- not the steady-state swap.
 
 #pragma once
+#include "moe/core/resource_scope.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -238,6 +239,7 @@ class ExclusiveExpertManager {
 
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
+  ResourceScope resources_{allocator_, streams_};
   ExpertSlotLayout layout_;
   Options options_;
 

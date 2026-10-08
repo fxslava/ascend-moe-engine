@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -36,6 +37,7 @@
 // false; 1 otherwise. A device-less host exits 0 before operator lookup.
 
 #include <acl/acl.h>
+#include "moe/core/device_ops.hpp"
 #include "npu_test_support.hpp"
 
 #include <dlfcn.h>
@@ -98,6 +100,7 @@ void ProbeOperatorSymbols() {
 }
 
 bool ProbeDevice() {
+  ascend_moe::AclDeviceOps device(0);
   Section("device: aclInit -> device count -> SoC -> HBM info");
 
   // aclInit is per process; ACL_ERROR_REPEAT_INITIALIZE means somebody (the
@@ -149,7 +152,7 @@ bool ProbeDevice() {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int RunMain(int argc, char** argv) {
   std::printf("npu_backend_probe -- ACL device + operator-symbol diagnostics (no npu-smi)\n");
   const bool require_device = argc > 1 && std::strcmp(argv[1], "--require-device") == 0;
   if (!PhysicalNpuPresent()) return require_device ? 1 : 0;
@@ -169,4 +172,8 @@ int main(int argc, char** argv) {
                 symbol_failures ? "FAIL" : "PASS");
   }
   return symbol_failures ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+  return ascend_moe::GuardedMain([&] { return RunMain(argc, argv); });
 }

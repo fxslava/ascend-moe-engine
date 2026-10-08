@@ -9,3 +9,8 @@ stats.json
 test_diag.json
 results.json
 moe_prof_out/
+
+# Local reference material and scratch artifacts (not part of the source tree)
+*.pdf
+tmp/
+src/moe-engine.txt

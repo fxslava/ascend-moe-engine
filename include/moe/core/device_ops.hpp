@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include "moe/core/acl_guard.hpp"
+#include <map>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -41,6 +43,8 @@
 #include "moe/core/stream_engine.hpp"
 
 namespace ascend_moe {
+
+struct AclDeviceLease;
 
 // ---------------------------------------------------------------------------
 // Physical backend: aclrtMalloc / aclrtMallocHost / aclrtMemcpyAsync
@@ -85,7 +89,14 @@ class AclDeviceOps final : public IDeviceAllocator, public IStreamEngine {
   void AccountCopy(MemcpyKind kind, size_t count);
 
   int32_t device_id_ = 0;
-  void* context_ = nullptr;
+  std::shared_ptr<AclDeviceLease> device_lease_;
+  AclContextGuard context_;
+  // The backend retains ownership even if a client constructor fails.
+  std::map<void*, std::unique_ptr<AclStreamGuard>> streams_owned_;
+  std::map<void*, std::unique_ptr<AclEventGuard>> events_owned_;
+  std::map<void*, std::unique_ptr<DeviceMemoryGuard>> device_owned_;
+  std::map<void*, std::unique_ptr<HostMemoryGuard>> host_owned_;
+  void Quiesce() noexcept;
   std::string soc_name_;
   DmaCounters counters_;
 };

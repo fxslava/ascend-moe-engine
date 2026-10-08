@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -679,7 +680,7 @@ void TestMoeBlockSlotContract() {
 }  // namespace
 }  // namespace ascend_moe
 
-int main() {
+int RunMain() {
   using namespace ascend_moe;
   std::printf("mock_contract_smoke -- device-free verification of the DSV4 runner's contracts\n");
   try {
@@ -704,4 +705,8 @@ int main() {
       "\nNot covered here (needs a 950PR): real GetWorkspaceSize values, whether every\n"
       "operator has an ascend950 kernel binary, and the aclSetTensorAddr index map.\n");
   return g_failures == 0 ? 0 : 1;
+}
+
+int main() {
+  return ascend_moe::GuardedMain([&] { return RunMain(); });
 }

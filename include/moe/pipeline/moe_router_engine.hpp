@@ -36,6 +36,7 @@
 // layer, so it cannot have a single owner here).
 
 #pragma once
+#include "moe/core/resource_scope.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -45,7 +46,7 @@
 #include "moe/core/device_types.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/stream_engine.hpp"
-#include "moe/pipeline/static_arena_manager.hpp"
+#include "moe/memory/static_arena_manager.hpp"
 
 namespace ascend_moe {
 
@@ -53,6 +54,7 @@ class MoeRouterEngine {
  public:
   MoeRouterEngine(IDeviceAllocator& allocator, IStreamEngine& streams);
   ~MoeRouterEngine();
+  void ResetStages() noexcept { for (auto& entry : stages_) entry.slot.Reset(); }
 
   MoeRouterEngine(const MoeRouterEngine&) = delete;
   MoeRouterEngine& operator=(const MoeRouterEngine&) = delete;
@@ -93,6 +95,7 @@ class MoeRouterEngine {
 
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
+  ResourceScope resources_{allocator_, streams_};
   // Born at full capacity: StaticOpSlot is not movable.
   std::vector<PipelineStage> stages_ = std::vector<PipelineStage>(kMaxRouterStages);
   size_t stage_count_ = 0;

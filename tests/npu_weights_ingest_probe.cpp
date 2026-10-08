@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -162,7 +163,7 @@ bool ReadShardHeader(const std::string& path, std::vector<char>* header_json, ui
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int RunMain(int argc, char** argv) {
   if (!PhysicalNpuPresent()) return 0;
   std::printf("npu_weights_ingest_probe -- shard header + one pinned->HBM DMA, real bytes\n");
 
@@ -314,4 +315,8 @@ int main(int argc, char** argv) {
 
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+  return ascend_moe::GuardedMain([&] { return RunMain(argc, argv); });
 }

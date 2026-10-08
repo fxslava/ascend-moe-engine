@@ -64,58 +64,16 @@ ExclusiveExpertManager::ExclusiveExpertManager(IDeviceAllocator& allocator, IStr
   slot_last_touch_.assign(static_cast<size_t>(options_.device_slots), 0ull);
   claim_scratch_.assign(static_cast<size_t>(options_.device_slots), 0u);
 
-  h2d_stream_ = streams_.CreateStream();
-  d2h_stream_ = streams_.CreateStream();
-  stage_stream_ = streams_.CreateStream();
-  h2d_batch_done_ = streams_.CreateEvent();
-  d2h_batch_done_ = streams_.CreateEvent();
+  h2d_stream_ = resources_.CreateStream();
+  d2h_stream_ = resources_.CreateStream();
+  stage_stream_ = resources_.CreateStream();
+  h2d_batch_done_ = resources_.CreateEvent();
+  d2h_batch_done_ = resources_.CreateEvent();
   PrimeEvents();
 }
 
 ExclusiveExpertManager::~ExclusiveExpertManager() {
-  // Best effort: a throwing destructor would mask the original failure.
-  try {
-    Synchronize();
-  } catch (...) {
-  }
-  for (TransitHalf& half : transit_) {
-    if (half.device_scratch != nullptr) {
-      allocator_.DeviceFree(half.device_scratch);
-    }
-    if (half.parked != nullptr) {
-      streams_.DestroyEvent(half.parked);
-    }
-    if (half.promoted != nullptr) {
-      streams_.DestroyEvent(half.promoted);
-    }
-    if (half.landed != nullptr) {
-      streams_.DestroyEvent(half.landed);
-    }
-  }
-  if (host_transit_scratch_ != nullptr) {
-    allocator_.HostPinnedFree(host_transit_scratch_);
-  }
-  if (h2d_batch_done_ != nullptr) {
-    streams_.DestroyEvent(h2d_batch_done_);
-  }
-  if (d2h_batch_done_ != nullptr) {
-    streams_.DestroyEvent(d2h_batch_done_);
-  }
-  if (h2d_stream_ != nullptr) {
-    streams_.DestroyStream(h2d_stream_);
-  }
-  if (d2h_stream_ != nullptr) {
-    streams_.DestroyStream(d2h_stream_);
-  }
-  if (stage_stream_ != nullptr) {
-    streams_.DestroyStream(stage_stream_);
-  }
-  for (void* block : host_blocks_) {
-    allocator_.HostPinnedFree(block);
-  }
-  if (device_arena_ != nullptr) {
-    allocator_.DeviceFree(device_arena_);
-  }
+  resources_.Reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +122,7 @@ size_t ExclusiveExpertManager::QueryHostAvailableBytes() {
 
 void ExclusiveExpertManager::AllocateDeviceArena() {
   device_arena_bytes_ = static_cast<size_t>(options_.device_slots) * layout_.slot_num_bytes();
-  device_arena_ = allocator_.DeviceMalloc(device_arena_bytes_);
+  device_arena_ = resources_.DeviceMalloc(device_arena_bytes_);
   // Zeroed so a slot nothing has written reads as zeros rather than as whatever
   // the previous tenant of that HBM page left, which would be a silent wrong
   // answer instead of an obvious one.
@@ -198,19 +156,19 @@ void ExclusiveExpertManager::AllocateHostArena() {
                                            static_cast<int64_t>(host_slots_per_block_)));
   for (int64_t first = 0; first < host_slot_count_; first += static_cast<int64_t>(host_slots_per_block_)) {
     const size_t slots_here = std::min<size_t>(host_slots_per_block_, static_cast<size_t>(host_slot_count_ - first));
-    host_blocks_.push_back(allocator_.HostPinnedMalloc(slots_here * slot_bytes));
+    host_blocks_.push_back(resources_.HostPinnedMalloc(slots_here * slot_bytes));
   }
 }
 
 void ExclusiveExpertManager::AllocateTransit() {
   for (TransitHalf& half : transit_) {
-    half.device_scratch = allocator_.DeviceMalloc(transit_chunk_bytes_);
+    half.device_scratch = resources_.DeviceMalloc(transit_chunk_bytes_);
     allocator_.DeviceMemset(half.device_scratch, transit_chunk_bytes_, 0, transit_chunk_bytes_);
-    half.parked = streams_.CreateEvent();
-    half.promoted = streams_.CreateEvent();
-    half.landed = streams_.CreateEvent();
+    half.parked = resources_.CreateEvent();
+    half.promoted = resources_.CreateEvent();
+    half.landed = resources_.CreateEvent();
   }
-  host_transit_scratch_ = allocator_.HostPinnedMalloc(transit_chunk_bytes_);
+  host_transit_scratch_ = resources_.HostPinnedMalloc(transit_chunk_bytes_);
   std::memset(host_transit_scratch_, 0, transit_chunk_bytes_);
 }
 

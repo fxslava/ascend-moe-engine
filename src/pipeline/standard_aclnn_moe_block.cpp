@@ -103,6 +103,13 @@ void StandardAclnnMoeBlock::PlanStages(StaticOpSlotTable& op_table, StaticArenaM
         kGmmGroupTypeM, kGmmGroupListTypeCumsum, kGmmActTypeNone, nullptr, t.gemm2_out_list, nullptr, nullptr);
     adopt(entry, workspace, executor);
   }
+  ops_.RequireAll({OpId::kCast, OpId::kMatmul});
+  {
+    PipelineStage& entry = op_table.Add("combine_cast", OpId::kCast);
+    const uint64_t workspace = PlanAclnnOp<CastPlanFn>(ops_, entry.op, &executor,
+        t.expanded_weights_row, ACL_BF16, t.combine_weights);
+    adopt(entry, workspace, executor);
+  }
   // Routing combine. For a single-token step the six expanded rows are the
   // same token, so the weighted sum IS a [1, 6] x [6, hidden] matmul over
   // the permuted routing weights the dispatch emitted. Exact, and both ops
@@ -112,7 +119,7 @@ void StandardAclnnMoeBlock::PlanStages(StaticOpSlotTable& op_table, StaticArenaM
   {
     PipelineStage& entry = op_table.Add("expert_combine", OpId::kMatmul);
     const uint64_t workspace =
-        PlanAclnnOp<MatmulPlanFn>(ops_, entry.op, &executor, t.expanded_weights_row, t.gemm2_out, t.routed_out,
+        PlanAclnnOp<MatmulPlanFn>(ops_, entry.op, &executor, t.combine_weights, t.gemm2_out, t.routed_out,
                                   kCubeMathTypeKeepDtype);
     adopt(entry, workspace, executor);
   }
@@ -144,6 +151,7 @@ void StandardAclnnMoeBlock::ExecuteMoe(const MoeDispatchContext& ctx, IStreamEng
     Launch(table_->stage("expert_swiglu"), ctx.compute_stream);
   }
   Launch(table_->stage("expert_gemm2"), ctx.compute_stream);
+  Launch(table_->stage("combine_cast"), ctx.compute_stream);
   Launch(table_->stage("expert_combine"), ctx.compute_stream);
 }
 

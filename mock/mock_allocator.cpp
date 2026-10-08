@@ -15,6 +15,7 @@
  */
 
 #include "mock_allocator.hpp"
+#include "runtime_faults.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -241,6 +242,7 @@ void MockResetAllocatorForTest() {
 extern "C" {
 
 aclError aclInit(const char*) {
+  if (int error = RecordRuntimeCall("aclInit")) return error;
   const std::lock_guard<std::mutex> lock(g_mutex);
   if (g_acl_initialized) {
     return ACL_ERROR_REPEAT_INITIALIZE;
@@ -249,9 +251,26 @@ aclError aclInit(const char*) {
   return ACL_SUCCESS;
 }
 
-aclError aclFinalize(void) { return ACL_SUCCESS; }
+aclError aclFinalize(void) {
+  if (int error = RecordRuntimeCall("aclFinalize")) return error;
+  return ACL_SUCCESS; }
+int aclnnInit(const char*) {
+  if (int error = RecordRuntimeCall("aclnnInit")) return error;
+  return 0; }
+int aclnnFinalize() {
+  if (int error = RecordRuntimeCall("aclnnFinalize")) return error;
+  return 0; }
+const char* aclGetRecentErrMsg(void) { return RuntimeRecentError(); }
+aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) {
+  if (int error = RecordRuntimeCall("aclrtSynchronizeStreamWithTimeout")) return error;
+  return aclrtSynchronizeStream(stream); }
+aclError aclrtDestroyStreamForce(aclrtStream stream) {
+  if (int error = RecordRuntimeCall("aclrtDestroyStreamForce")) return error;
+  return aclrtDestroyStream(stream); }
 
-aclError aclrtSetDevice(int32_t) { return ACL_SUCCESS; }
+aclError aclrtSetDevice(int32_t) {
+  if (int error = RecordRuntimeCall("aclrtSetDevice")) return error;
+  return ACL_SUCCESS; }
 
 aclError aclrtGetDeviceCount(uint32_t* device_count) {
   if (device_count == nullptr) {
@@ -261,8 +280,11 @@ aclError aclrtGetDeviceCount(uint32_t* device_count) {
   return ACL_SUCCESS;
 }
 
-aclError aclrtResetDevice(int32_t) { return ACL_SUCCESS; }
+aclError aclrtResetDevice(int32_t) {
+  if (int error = RecordRuntimeCall("aclrtResetDevice")) return error;
+  return ACL_SUCCESS; }
 aclError aclrtCreateContext(aclrtContext* context, int32_t) {
+  if (int error = RecordRuntimeCall("aclrtCreateContext")) return error;
   if (context == nullptr) {
     return ACL_ERROR_INVALID_PARAM;
   }
@@ -270,12 +292,17 @@ aclError aclrtCreateContext(aclrtContext* context, int32_t) {
   *context = reinterpret_cast<aclrtContext>(++g_next_handle);
   return ACL_SUCCESS;
 }
-aclError aclrtDestroyContext(aclrtContext) { return ACL_SUCCESS; }
-aclError aclrtSetCurrentContext(aclrtContext) { return ACL_SUCCESS; }
+aclError aclrtDestroyContext(aclrtContext) {
+  if (int error = RecordRuntimeCall("aclrtDestroyContext")) return error;
+  return ACL_SUCCESS; }
+aclError aclrtSetCurrentContext(aclrtContext) {
+  if (int error = RecordRuntimeCall("aclrtSetCurrentContext")) return error;
+  return ACL_SUCCESS; }
 
 const char* aclrtGetSocName(void) { return "Ascend950PR-Mock"; }
 
 aclError aclrtMalloc(void** device_ptr, size_t size, aclrtMemMallocPolicy) {
+  if (int error = RecordRuntimeCall("aclrtMalloc")) return error;
   if (device_ptr == nullptr) {
     return ACL_ERROR_INVALID_PARAM;
   }
@@ -288,6 +315,7 @@ aclError aclrtMalloc(void** device_ptr, size_t size, aclrtMemMallocPolicy) {
 }
 
 aclError aclrtFree(void* device_ptr) {
+  if (int error = RecordRuntimeCall("aclrtFree")) return error;
   if (device_ptr == nullptr) {
     return ACL_SUCCESS;
   }
@@ -295,6 +323,7 @@ aclError aclrtFree(void* device_ptr) {
 }
 
 aclError aclrtMallocHost(void** host_ptr, size_t size) {
+  if (int error = RecordRuntimeCall("aclrtMallocHost")) return error;
   if (host_ptr == nullptr) {
     return ACL_ERROR_INVALID_PARAM;
   }
@@ -303,7 +332,9 @@ aclError aclrtMallocHost(void** host_ptr, size_t size) {
   return base != 0 ? ACL_SUCCESS : ACL_ERROR_RT_FAILURE;
 }
 
-aclError aclrtFreeHost(void* host_ptr) { return aclrtFree(host_ptr); }
+aclError aclrtFreeHost(void* host_ptr) {
+  if (int error = RecordRuntimeCall("aclrtFreeHost")) return error;
+  return aclrtFree(host_ptr); }
 
 aclError aclrtMemcpy(void* destination, size_t destination_capacity, const void* source, size_t count,
                      aclrtMemcpyKind kind) {
@@ -352,6 +383,7 @@ aclError aclrtMemset(void* destination, size_t destination_capacity, int32_t val
 }
 
 aclError aclrtCreateStream(aclrtStream* stream) {
+  if (int error = RecordRuntimeCall("aclrtCreateStream")) return error;
   if (stream == nullptr) {
     return ACL_ERROR_INVALID_PARAM;
   }
@@ -359,7 +391,9 @@ aclError aclrtCreateStream(aclrtStream* stream) {
   *stream = reinterpret_cast<aclrtStream>(++g_next_handle);
   return ACL_SUCCESS;
 }
-aclError aclrtDestroyStream(aclrtStream) { return ACL_SUCCESS; }
+aclError aclrtDestroyStream(aclrtStream) {
+  if (int error = RecordRuntimeCall("aclrtDestroyStream")) return error;
+  return ACL_SUCCESS; }
 
 aclError aclrtCreateEventExWithFlag(aclrtEvent* event, uint32_t) {
   if (event == nullptr) {
@@ -397,3 +431,4 @@ aclError aclrtGetMemInfo(aclrtMemAttr, size_t* free_bytes, size_t* total_bytes) 
 
 }  // namespace mock
 }  // namespace ascend_moe
+

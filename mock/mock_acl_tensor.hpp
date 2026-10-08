@@ -44,6 +44,8 @@ struct MockAclTensor {
   void* device_addr = nullptr;  // symbolic until aclSetTensorAddr validates it
   std::vector<int64_t> shape;
   std::vector<int64_t> strides;
+  std::vector<int64_t> storage_shape;
+  int64_t storage_offset = 0;
   aclDataType dtype = ACL_FLOAT32;
   aclFormat format = ACL_FORMAT_ND;
   size_t total_bytes = 0;  // product(shape) * element size (FP4: 2 per byte)

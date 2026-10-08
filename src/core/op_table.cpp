@@ -49,6 +49,7 @@ const OpDeclaration kDeclarations[] = {
      "RMSNorm fused with FP8 + E8M0 block-32 activation quant", true, false},
     {OpId::kDynamicMxQuant, "aclnnDynamicMxQuant",
      "FP8 + E8M0 block-32 activation quant without a fused norm", true, false},
+    {OpId::kCast, "aclnnCast", "explicit BF16/FP32 routing conversions", true, false},
     {OpId::kMatmul, "aclnnMatmul", "router logits, the routing combine and the LM head", true, false},
     {OpId::kQuantMatmulV5, "aclnnQuantMatmulV5", "FP8 dense projections (block-128 weight scales)", true, false},
     {OpId::kApplyRotaryPosEmbV2, "aclnnApplyRotaryPosEmbV2", "partial RoPE on the q/k rope slices", true, false},
@@ -187,6 +188,7 @@ void OpTable::RequireAll(const std::vector<OpId>& ids) const {
 }
 
 AclnnLaunchFn OpTable::launch_fn(OpId id) const {
+  DSV4_REQUIRE(id != OpId::kFiaV5GetMaxWorkspace, "FIA maximum workspace helper has no public launch ABI");
   RequireAvailable(id);
   return reinterpret_cast<AclnnLaunchFn>(op(id).launch);
 }
@@ -213,19 +215,17 @@ std::string OpTable::DescribeInventory() const {
 // StaticOpSlot
 // ---------------------------------------------------------------------------
 
-StaticOpSlot::~StaticOpSlot() {
-  if (executor_ != nullptr) {
-    aclDestroyAclOpExecutor(executor_);
-    executor_ = nullptr;
-  }
-}
+StaticOpSlot::~StaticOpSlot() = default;
 
 void StaticOpSlot::Adopt(OpId id, const char* label, uint64_t workspace_size, aclOpExecutor* executor) {
+  DSV4_REQUIRE(executor == nullptr || executor != executor_, label << ": executor is already owned by this slot");
+  OpExecutorGuard pending(executor);
   DSV4_REQUIRE(executor != nullptr, label << ": cannot adopt a null executor");
   DSV4_REQUIRE(executor_ == nullptr, label << ": this slot already holds a planned executor");
   id_ = id;
   label_ = label;
   workspace_size_ = workspace_size;
+  executor_guard_.reset(pending.release());
   executor_ = executor;
   // Without this, the launch consumes the executor and the next step would have
   // to re-plan -- which is exactly the per-step host work the brief forbids.
@@ -233,12 +233,16 @@ void StaticOpSlot::Adopt(OpId id, const char* label, uint64_t workspace_size, ac
 }
 
 void StaticOpSlot::SetAddress(size_t index, aclTensor* tensor, void* address) const {
+  DSV4_REQUIRE(address && reinterpret_cast<uintptr_t>(address) % 32 == 0,
+               label_ << ": replacement device address must be 32-byte aligned (manual 4.38)");
   DSV4_REQUIRE(executor_ != nullptr, label_ << ": SetAddress before the stage was planned");
   DSV4_ACL_CHECK(aclSetTensorAddr(executor_, index, tensor, address));
 }
 
 void StaticOpSlot::SetTensorListAddress(size_t ir_index, size_t relative_index, aclTensorList* tensors,
                                         void* address) const {
+  DSV4_REQUIRE(address && reinterpret_cast<uintptr_t>(address) % 32 == 0,
+               label_ << ": replacement tensor-list address must be 32-byte aligned");
   DSV4_REQUIRE(executor_ != nullptr, label_ << ": SetTensorListAddress before the stage was planned");
   DSV4_ACL_CHECK(aclSetDynamicTensorAddr(executor_, ir_index, relative_index, tensors, address));
 }
@@ -247,6 +251,7 @@ void StaticOpSlot::Launch(const OpTable& table, void* workspace, void* stream) c
   DSV4_REQUIRE(executor_ != nullptr, label_ << ": Launch before the stage was planned");
   DSV4_REQUIRE(workspace != nullptr || workspace_size_ == 0,
                label_ << ": needs " << workspace_size_ << " workspace bytes but was given none");
+  CheckForInterrupt();
   AclnnLaunchFn launch = table.launch_fn(id_);
   const int status = launch(workspace_size_ == 0 ? nullptr : workspace, workspace_size_, executor_, stream);
   if (status != 0) {

@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -325,22 +326,11 @@ void TestOperatorContracts() {
     }
   }
 
-  for (aclTensor* tensor : weights) {
-    aclDestroyTensor(tensor);
-  }
-  for (aclTensor* tensor : scales) {
-    aclDestroyTensor(tensor);
-  }
+  // Manual 4.16: list destruction also destroys its tensor handles.
   aclDestroyTensorList(weight_list);
   aclDestroyTensorList(scale_list);
   aclDestroyTensorList(fp8_weights);
-  for (aclTensor* tensor : fp8_weights_raw) {
-    aclDestroyTensor(tensor);
-  }
   aclDestroyTensorList(fp32_scales);
-  for (aclTensor* tensor : fp32_scale_raw) {
-    aclDestroyTensor(tensor);
-  }
   aclDestroyTensor(scores);
   aclDestroyTensor(scores_out);
   aclDestroyTensor(bias);
@@ -736,7 +726,7 @@ void TestDiagnosticsJson() {
 }  // namespace
 }  // namespace ascend_moe
 
-int main() {
+int RunMain() {
   using namespace ascend_moe;
   std::printf("mock_pipeline_e2e -- zero-NPU, zero-allocation contract suite over libopapi_mock\n");
   try {
@@ -758,4 +748,8 @@ int main() {
               stats.memcpy_checks, stats.setaddr_checks, stats.rejected_operations, stats.slot_map_mismatches);
   std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
+}
+
+int main() {
+  return ascend_moe::GuardedMain([&] { return RunMain(); });
 }

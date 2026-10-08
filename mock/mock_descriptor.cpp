@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "mock_acl_tensor.hpp"
+#include "runtime_faults.hpp"
 #include "mock_allocator.hpp"
 
 namespace ascend_moe {
@@ -164,11 +165,54 @@ aclTensor* aclCreateTensor(const int64_t* view_dims, uint64_t view_dims_num, acl
   }
   auto* tensor = new MockAclTensor();
   tensor->shape.assign(view_dims, view_dims + view_dims_num);
+  if (view_strides) tensor->strides.assign(view_strides, view_strides + view_dims_num);
+  else {
+    tensor->strides.resize(view_dims_num, 1);
+    for (size_t i = view_dims_num; i-- > 1;) tensor->strides[i - 1] = tensor->strides[i] * view_dims[i];
+  }
+  if (storage_dims) tensor->storage_shape.assign(storage_dims, storage_dims + storage_dims_num);
+  else tensor->storage_shape = tensor->shape;
+  tensor->storage_offset = storage_offset;
   tensor->dtype = dtype;
   tensor->format = format;
   tensor->total_bytes = TensorStorageBytes(tensor->shape, dtype);
   tensor->device_addr = device_data;
   return reinterpret_cast<aclTensor*>(tensor);
+}
+
+aclnnStatus aclGetViewShape(const aclTensor* tensor, int64_t** data, uint64_t* size) {
+  auto* t = AsMockTensor(tensor);
+  if (!t || !data || !size) return 161001;
+  *size = t->shape.size(); *data = new int64_t[*size];
+  std::copy(t->shape.begin(), t->shape.end(), *data); return 0;
+}
+aclnnStatus aclGetStorageShape(const aclTensor* tensor, int64_t** data, uint64_t* size) {
+  auto* t = AsMockTensor(tensor);
+  if (!t || !data || !size) return 161001;
+  *size = t->storage_shape.size(); *data = new int64_t[*size];
+  std::copy(t->storage_shape.begin(), t->storage_shape.end(), *data); return 0;
+}
+aclnnStatus aclGetViewStrides(const aclTensor* tensor, int64_t** data, uint64_t* size) {
+  auto* t = AsMockTensor(tensor);
+  if (!t || !data || !size) return 161001;
+  *size = t->strides.size(); *data = new int64_t[*size];
+  std::copy(t->strides.begin(), t->strides.end(), *data); return 0;
+}
+aclnnStatus aclGetDataType(const aclTensor* tensor, aclDataType* value) {
+  auto* t = AsMockTensor(tensor); if (!t || !value) return 161001;
+  *value = t->dtype; return 0;
+}
+aclnnStatus aclGetFormat(const aclTensor* tensor, aclFormat* value) {
+  auto* t = AsMockTensor(tensor); if (!t || !value) return 161001;
+  *value = t->format; return 0;
+}
+aclnnStatus aclGetRawTensorAddr(const aclTensor* tensor, void** value) {
+  auto* t = AsMockTensor(tensor); if (!t || !value) return 161001;
+  *value = t->device_addr; return 0;
+}
+aclnnStatus aclGetViewOffset(const aclTensor* tensor, int64_t* value) {
+  auto* t = AsMockTensor(tensor); if (!t || !value) return 161001;
+  *value = t->storage_offset; return 0;
 }
 
 aclnnStatus aclDestroyTensor(const aclTensor* tensor) {
@@ -197,6 +241,7 @@ aclnnStatus aclDestroyTensorList(const aclTensorList* tensor_list) {
   if (list == nullptr) {
     return 100001;
   }
+  for (auto* tensor : list->items) aclDestroyTensor(tensor);
   delete list;
   return 0;
 }
@@ -300,9 +345,12 @@ aclnnStatus aclSetDynamicTensorAddr(aclOpExecutor* executor, uint64_t ir_index, 
   return 0;
 }
 
-aclnnStatus aclSetAclOpExecutorRepeatable(aclOpExecutor*) { return 0; }
+aclnnStatus aclSetAclOpExecutorRepeatable(aclOpExecutor*) {
+  if (int error = RecordRuntimeCall("aclSetAclOpExecutorRepeatable")) return error;
+  return 0; }
 
 aclnnStatus aclDestroyAclOpExecutor(aclOpExecutor* executor) {
+  RecordRuntimeCall("aclDestroyAclOpExecutor");
   MockAclOpExecutor* exec = AsMockExecutor(executor);
   if (exec == nullptr) {
     return 100001;
@@ -312,3 +360,4 @@ aclnnStatus aclDestroyAclOpExecutor(aclOpExecutor* executor) {
 }
 
 }  // extern "C"
+

@@ -19,15 +19,17 @@
 // stage scheduling evolve independently (SRP); the pipeline orchestrates, it
 // does not allocate.
 
-#include "moe/pipeline/static_arena_manager.hpp"
+#include "moe/memory/static_arena_manager.hpp"
 
 #include <aclnn/acl_meta.h>
 
+#include "moe/memory/weight_transpose.hpp"
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
 #include "moe/core/error.hpp"
+#include "moe/core/resource_scope.hpp"
 
 namespace ascend_moe {
 namespace {
@@ -193,15 +195,12 @@ StaticArenaManager::StaticArenaManager(IDeviceAllocator& allocator, IStreamEngin
   DSV4_REQUIRE(config_.max_context_len >= config_.block_size,
                "max context " << config_.max_context_len << " is below one block of " << config_.block_size);
   num_blocks_ = DivideUp(config_.max_context_len, config_.block_size);
-  tensors_ = new ArenaTensors();
-  backbone_ = new BackboneWeights();
+  tensors_ = std::make_unique<ArenaTensors>();
+  backbone_ = std::make_unique<BackboneWeights>();
   backbone_->layers.resize(static_cast<size_t>(kNumLayers));
 }
 
-StaticArenaManager::~StaticArenaManager() {
-  delete tensors_;
-  delete backbone_;
-}
+StaticArenaManager::~StaticArenaManager() = default;
 
 size_t StaticArenaManager::BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size,
                                                int64_t max_context_len) {
@@ -267,6 +266,8 @@ void StaticArenaManager::ReserveActivations() {
   arena_.Reserve("act.softmax_lse", Fp32Bytes(kTokensPerStep * heads_));
   arena_.Reserve("act.proj_out", Bf16Bytes(kTokensPerStep * kHiddenSize));
 
+  arena_.Reserve("moe.router_matmul", Bf16Bytes(kTokensPerStep * kNumRoutedExperts));
+  arena_.Reserve("moe.combine_weights", Bf16Bytes(kTokensPerStep * kNumExpertsPerTok));
   arena_.Reserve("moe.router_logits", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
   arena_.Reserve("moe.router_softplus", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
   arena_.Reserve("moe.router_scores", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
@@ -355,7 +356,8 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
   // is what the transfer path can validate end to end (the exclusive
   // hierarchy's transit scratch takes the same stance). Init-only work, freed
   // before this function returns.
-  uint8_t* staging = static_cast<uint8_t*>(allocator_.HostPinnedMalloc(kTransferChunkBytes));
+  ResourceScope staging_scope(allocator_, streams_);
+  uint8_t* staging = static_cast<uint8_t*>(staging_scope.HostPinnedMalloc(kTransferChunkBytes));
   DSV4_REQUIRE(staging != nullptr, "the backbone staging buffer could not be pinned");
 
   auto ingest = [&](ArenaHandle handle, const std::string& name, bool required) -> bool {
@@ -377,6 +379,15 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
                  "tensor '" << resolved << "' (requested '" << name << "') holds " << available
                              << " bytes, the arena reserved " << bytes);
     uint8_t* destination = arena_.AddressAs<uint8_t>(handle);
+    // Dense BF16 weights are stored [N,K] in checkpoints; aclnnMatmul has no
+    // transpose flag. Materialize [K,N] once before creating the descriptors.
+    const bool head = name == "lm_head.weight";
+    const bool router = name.find(".mlp.gate.weight") != std::string::npos;
+    if (head || router) {
+      IngestTransposedBf16(source, resolved, destination, head ? kVocabSize : kNumRoutedExperts,
+                           kHiddenSize, allocator_, streams_);
+      return true;
+    }
     for (size_t offset = 0; offset < bytes; offset += kTransferChunkBytes) {
       const size_t count = std::min(kTransferChunkBytes, bytes - offset);
       source.ReadNamed(resolved, staging, kTransferChunkBytes, offset, count);
@@ -424,7 +435,7 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
   const bool sin = ingest(backbone_->rope_sin, "model.rotary_emb.sin_cached", false);
   backbone_->rope_tables_populated = cos && sin;
 
-  allocator_.HostPinnedFree(staging);
+
 }
 
 void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const ExpertSlotAddresses& experts) {
@@ -487,6 +498,8 @@ void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const 
   t.proj_out = arena_.CreateTensor("proj_out", {kTokensPerStep, kHiddenSize}, kAclBf16, address("act.proj_out"));
 
   // --- routing -----------------------------------------------------------
+  t.router_matmul = arena_.CreateTensor("router_matmul", {kTokensPerStep, kNumRoutedExperts}, kAclBf16, address("moe.router_matmul"));
+  t.combine_weights = arena_.CreateTensor("combine_weights", {kTokensPerStep, expanded_rows}, kAclBf16, address("moe.combine_weights"));
   t.router_logits = arena_.CreateTensor("router_logits", {kTokensPerStep, kNumRoutedExperts}, kAclFloat32,
                                         address("moe.router_logits"));
   t.router_softplus = arena_.CreateTensor("router_softplus", {kTokensPerStep, kNumRoutedExperts}, kAclFloat32,
@@ -598,7 +611,7 @@ void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const 
   t.w_o_scale = arena_.CreateTensor("w_o_scale", {kHiddenSize, DenseScaleCols(o_input)}, kScaleDtype,
                                     arena_.Address(first.o_scale));
   t.w_post_norm = arena_.CreateTensor("w_post_norm", {kHiddenSize}, kAclBf16, arena_.Address(first.post_norm));
-  t.w_router = arena_.CreateTensor("w_router", {kNumRoutedExperts, kHiddenSize}, kAclBf16,
+  t.w_router = arena_.CreateTensor("w_router", {kHiddenSize, kNumRoutedExperts}, kAclBf16,
                                    arena_.Address(first.router_weight));
   t.w_router_bias =
       arena_.CreateTensor("w_router_bias", {kNumRoutedExperts}, kAclFloat32, arena_.Address(first.router_bias));
@@ -613,7 +626,7 @@ void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const 
       arena_.CreateTensor("w_shared_down_scale", {kHiddenSize, DenseScaleCols(shared_inter)}, kScaleDtype,
                           arena_.Address(first.shared_down_scale));
   t.w_final_norm = arena_.CreateTensor("w_final_norm", {kHiddenSize}, kAclBf16, arena_.Address(b.final_norm));
-  t.w_lm_head = arena_.CreateTensor("w_lm_head", {kVocabSize, kHiddenSize}, kAclBf16, arena_.Address(b.lm_head));
+  t.w_lm_head = arena_.CreateTensor("w_lm_head", {kHiddenSize, kVocabSize}, kAclBf16, arena_.Address(b.lm_head));
 
   // --- the six active experts -------------------------------------------
   // Views into the exclusive manager's HBM slot pool, repointed every layer by

@@ -30,6 +30,7 @@
 // a 9.1.0 cross build still checks everything 9.1.0 ships.
 
 #include <type_traits>
+#include <aclnnop/aclnn_cast.h>
 
 #include "moe/core/op_table.hpp"
 
@@ -91,6 +92,8 @@ DSV4_ASSERT_SIGNATURE(aclnnRmsNormGetWorkspaceSize, RmsNormPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnRmsNormDynamicMxQuantGetWorkspaceSize, RmsNormDynamicMxQuantPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnDynamicMxQuantGetWorkspaceSize, DynamicMxQuantPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMatmulGetWorkspaceSize, MatmulPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnCastGetWorkspaceSize, CastPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnCast, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnQuantMatmulV5GetWorkspaceSize, QuantMatmulV5PlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnApplyRotaryPosEmbV2GetWorkspaceSize, ApplyRotaryPosEmbV2PlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnScatterPaKvCacheGetWorkspaceSize, ScatterPaKvCachePlanFn);

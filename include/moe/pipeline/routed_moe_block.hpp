@@ -57,7 +57,7 @@
 
 #include "moe/core/stream_engine.hpp"
 #include "moe/memory/exclusive_staging.hpp"
-#include "moe/pipeline/static_arena_manager.hpp"
+#include "moe/memory/static_arena_manager.hpp"
 #include "moe/pipeline/static_op_slot_table.hpp"
 
 // Forward declaration matching aclnn/acl_meta.h; the real type comes with

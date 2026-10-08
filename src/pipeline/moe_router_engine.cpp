@@ -31,23 +31,15 @@ namespace ascend_moe {
 
 MoeRouterEngine::MoeRouterEngine(IDeviceAllocator& allocator, IStreamEngine& streams)
     : allocator_(allocator), streams_(streams) {
-  readback_stream_ = streams_.CreateStream();
-  routing_mailbox_ = static_cast<int32_t*>(allocator_.HostPinnedMalloc(Int32Bytes(kNumExpertsPerTok)));
-  local_index_mailbox_ = static_cast<int32_t*>(allocator_.HostPinnedMalloc(Int32Bytes(kNumExpertsPerTok)));
+  readback_stream_ = resources_.CreateStream();
+  routing_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(kNumExpertsPerTok)));
+  local_index_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(kNumExpertsPerTok)));
   std::memset(routing_mailbox_, 0, Int32Bytes(kNumExpertsPerTok));
   std::memset(local_index_mailbox_, 0, Int32Bytes(kNumExpertsPerTok));
 }
 
 MoeRouterEngine::~MoeRouterEngine() {
-  if (routing_mailbox_ != nullptr) {
-    allocator_.HostPinnedFree(routing_mailbox_);
-  }
-  if (local_index_mailbox_ != nullptr) {
-    allocator_.HostPinnedFree(local_index_mailbox_);
-  }
-  if (readback_stream_ != nullptr) {
-    streams_.DestroyStream(readback_stream_);
-  }
+  resources_.Reset();
 }
 
 PipelineStage& MoeRouterEngine::stage(const char* name) {
@@ -82,7 +74,7 @@ void MoeRouterEngine::PlanStages(const OpTable& ops, StaticArenaManager& arena_m
   StaticMemoryArena& arena = arena_manager.arena();
 
   // Every operator the router drives must exist before anything is planned.
-  ops.RequireAll({OpId::kMatmul, OpId::kSoftplus, OpId::kSqrt, OpId::kMoeGatingTopKV2, OpId::kMoeInitRoutingV4});
+  ops.RequireAll({OpId::kCast, OpId::kMatmul, OpId::kSoftplus, OpId::kSqrt, OpId::kMoeGatingTopKV2, OpId::kMoeInitRoutingV4});
 
   auto add = [&](const char* name, OpId op) -> PipelineStage& {
     DSV4_REQUIRE(stage_count_ < kMaxRouterStages, "router stage capacity exceeded at " << name);
@@ -92,8 +84,8 @@ void MoeRouterEngine::PlanStages(const OpTable& ops, StaticArenaManager& arena_m
     return entry;
   };
   auto adopt = [&](PipelineStage& entry, uint64_t workspace, aclOpExecutor* executor) {
-    arena.NoteWorkspace(workspace);
     entry.slot.Adopt(entry.op, entry.name, workspace, executor);
+    arena.NoteWorkspace(workspace);
   };
 
   aclOpExecutor* executor = nullptr;
@@ -102,7 +94,13 @@ void MoeRouterEngine::PlanStages(const OpTable& ops, StaticArenaManager& arena_m
   {
     PipelineStage& entry = add("router", OpId::kMatmul);
     const uint64_t workspace = PlanAclnnOp<MatmulPlanFn>(ops, entry.op, &executor, t.normed, t.w_router,
-                                                         t.router_logits, kCubeMathTypeKeepDtype);
+                                                         t.router_matmul, kCubeMathTypeKeepDtype);
+    adopt(entry, workspace, executor);
+  }
+  {
+    PipelineStage& entry = add("router_cast", OpId::kCast);
+    const uint64_t workspace = PlanAclnnOp<CastPlanFn>(ops, entry.op, &executor,
+        t.router_matmul, static_cast<aclDataType>(kAclFloat32), t.router_logits);
     adopt(entry, workspace, executor);
   }
   // 2-3. the DSV4 sqrtsoftplus scoring, decomposed onto the same stream.
@@ -161,6 +159,7 @@ const int32_t* MoeRouterEngine::ScoreAndSelect(int32_t layer, StaticArenaManager
   stage("gating").slot.SetAddress(slot::kGatingBias, t.w_router_bias, arena.Address(layer_weights.router_bias));
 
   Launch(stage("router"), ops, arena_manager, compute_stream);
+  Launch(stage("router_cast"), ops, arena_manager, compute_stream);
   Launch(stage("router_softplus"), ops, arena_manager, compute_stream);
   Launch(stage("router_sqrt"), ops, arena_manager, compute_stream);
   Launch(stage("gating"), ops, arena_manager, compute_stream);

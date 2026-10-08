@@ -39,6 +39,7 @@
 
 #include "mock_acl_tensor.hpp"
 #include "mock_allocator.hpp"
+#include "runtime_faults.hpp"
 
 // The dsv4 headers are NOT included here: this library is standalone, so the
 // contract constants below are the mock's own transcription of
@@ -319,6 +320,16 @@ aclnnStatus aclnnDynamicMxQuantGetWorkspaceSize(const aclTensor* x, int64_t axis
   return 0;
 }
 
+aclnnStatus aclnnCastGetWorkspaceSize(const aclTensor* self, aclDataType dtype, aclTensor* out,
+                                     uint64_t* workspace_size, aclOpExecutor** executor) {
+  const auto* a = AsMockTensor(self);
+  const auto* b = AsMockTensor(out);
+  MOCK_REQUIRE(a && b && a->shape == b->shape && b->dtype == dtype, "Cast: shape/target dtype mismatch");
+  *workspace_size = kWorkspaceElementwise;
+  *executor = NewExecutor("aclnnCast", {self, out});
+  return 0;
+}
+
 aclnnStatus aclnnMatmulGetWorkspaceSize(const aclTensor* self, const aclTensor* mat2, aclTensor* out,
                                         int8_t cube_math_type, uint64_t* workspace_size,
                                         aclOpExecutor** executor) {
@@ -328,19 +339,15 @@ aclnnStatus aclnnMatmulGetWorkspaceSize(const aclTensor* self, const aclTensor* 
   MOCK_REQUIRE(a != nullptr && b != nullptr && o != nullptr, "Matmul: bad tensor handle");
   MOCK_REQUIRE(a->shape.size() == 2 && b->shape.size() == 2 && o->shape.size() == 2,
                "Matmul: 2-D operands expected");
-  // Two accepted orientations. `k_match` is torch semantics ([m,k] x [k,n]);
-  // `n_match` is the [N,K] row-major weight of a linear layer (as checkpoints
-  // store router / lm_head weights) consumed with an implicit transpose.
-  // The DSV4 graph uses the latter for its projection matmuls and the former
-  // for the routing combine; which orientation aclnnMatmul itself accepts is
-  // a device bring-up item, recorded rather than guessed here.
-  const bool k_match = a->dim(1) == b->dim(0);
-  const bool n_match = a->dim(1) == b->dim(1);
-  MOCK_REQUIRE(k_match || n_match, "Matmul: the reduction dimension must agree, got " +
-                                       std::to_string(a->dim(1)) + " vs [" + std::to_string(b->dim(0)) + ", " +
-                                       std::to_string(b->dim(1)) + "]");
-  MOCK_REQUIRE(o->dim(0) == a->dim(0) && o->dim(1) == (k_match ? b->dim(1) : b->dim(0)),
-               "Matmul: out must be [m, n]");
+  MOCK_REQUIRE(a->dim(1) == b->dim(0), "Matmul: expected [M,K] x [K,N]; no implicit transpose");
+  MOCK_REQUIRE(o->dim(0) == a->dim(0) && o->dim(1) == b->dim(1), "Matmul: output must be [M,N]");
+  MOCK_REQUIRE(a->dtype == b->dtype && a->dtype == o->dtype &&
+               (a->dtype == ACL_BF16 || a->dtype == ACL_FLOAT16), "Matmul: homogeneous BF16/FP16 required");
+  for (const auto* t : {a, b, o}) {
+    MOCK_REQUIRE(t->format == ACL_FORMAT_ND && t->strides == std::vector<int64_t>({t->dim(1), 1}),
+                 "Matmul: contiguous ND required");
+    MOCK_REQUIRE(reinterpret_cast<uintptr_t>(t->device_addr) % 32 == 0, "Matmul: 32-byte alignment required");
+  }
   (void)cube_math_type;
   *workspace_size = Align4k(static_cast<uint64_t>(a->dim(0)) * static_cast<uint64_t>(o->dim(1)) * 2) + (64u << 10);
   *executor = NewExecutor("aclnnMatmul", {self, mat2, out});
@@ -941,6 +948,7 @@ aclnnStatus aclnnGroupedMatmulFinalizeRoutingV3GetWorkspaceSize(
 #define MOCK_NOOP_LAUNCH(name)                                                             \
   aclnnStatus name(void* workspace, uint64_t workspace_size, aclOpExecutor* executor,      \
                    aclrtStream stream) {                                                   \
+    if (int error = RecordRuntimeCall(#name)) return error;                               \
     (void)workspace;                                                                       \
     (void)workspace_size;                                                                  \
     (void)executor;                                                                        \
@@ -952,6 +960,7 @@ MOCK_NOOP_LAUNCH(aclnnRmsNorm)
 MOCK_NOOP_LAUNCH(aclnnRmsNormDynamicMxQuant)
 MOCK_NOOP_LAUNCH(aclnnDynamicMxQuant)
 MOCK_NOOP_LAUNCH(aclnnMatmul)
+MOCK_NOOP_LAUNCH(aclnnCast)
 MOCK_NOOP_LAUNCH(aclnnQuantMatmulV5)
 MOCK_NOOP_LAUNCH(aclnnApplyRotaryPosEmbV2)
 MOCK_NOOP_LAUNCH(aclnnScatterPaKvCache)

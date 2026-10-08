@@ -80,6 +80,9 @@ class WeightByteSource {
   virtual void ReadNamed(const std::string& name, uint8_t* destination, size_t destination_capacity,
                          size_t byte_offset, size_t count) = 0;
   virtual size_t NamedByteSize(const std::string& name) const = 0;
+  // Empty metadata is allowed only for generated/symbolic sources.
+  virtual std::string NamedDtype(const std::string&) const { return {}; }
+  virtual std::vector<int64_t> NamedShape(const std::string&) const { return {}; }
 
   virtual void Close() = 0;
   bool closed() const { return closed_; }
@@ -155,6 +158,8 @@ class SafetensorsWeightSource : public WeightByteSource {
   ~SafetensorsWeightSource() override;
 
   const char* source_name() const override { return "safetensors"; }
+  std::string NamedDtype(const std::string& name) const override { return Tensor(name).dtype; }
+  std::vector<int64_t> NamedShape(const std::string& name) const override { return Tensor(name).shape; }
 
   bool Contains(int32_t layer, int32_t expert) const override;
   void ReadExpertSlotRange(uint8_t* destination, size_t destination_capacity, size_t slot_offset, size_t count,

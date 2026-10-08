@@ -61,6 +61,13 @@ aclTensor* aclCreateTensor(const int64_t* view_dims, uint64_t view_dims_num, acl
                            const int64_t* storage_dims, uint64_t storage_dims_num, void* device_data);
 
 aclnnStatus aclDestroyTensor(const aclTensor* tensor);
+aclnnStatus aclGetViewShape(const aclTensor*, int64_t**, uint64_t*);
+aclnnStatus aclGetStorageShape(const aclTensor*, int64_t**, uint64_t*);
+aclnnStatus aclGetViewStrides(const aclTensor*, int64_t**, uint64_t*);
+aclnnStatus aclGetDataType(const aclTensor*, aclDataType*);
+aclnnStatus aclGetFormat(const aclTensor*, aclFormat*);
+aclnnStatus aclGetRawTensorAddr(const aclTensor*, void**);
+aclnnStatus aclGetViewOffset(const aclTensor*, int64_t*);
 
 aclTensorList* aclCreateTensorList(const aclTensor* const* tensors, uint64_t size);
 aclnnStatus aclDestroyTensorList(const aclTensorList* tensor_list);

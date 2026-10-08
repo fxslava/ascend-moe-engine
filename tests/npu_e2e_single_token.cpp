@@ -1,3 +1,4 @@
+#include "moe/core/acl_guard.hpp"
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
  *
@@ -95,8 +96,10 @@ std::string ConfigPathFrom(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  if (!PhysicalNpuPresent()) return 0;
+int RunMain(int argc, char** argv) {
+  bool require_device = false;
+  for (int i = 1; i < argc; ++i) if (std::strcmp(argv[i], "--require-device") == 0) require_device = true;
+  if (!PhysicalNpuPresent()) return require_device ? 1 : 0;
   std::printf("npu_e2e_single_token -- one decode step through the whole engine\n");
 
   // ---- model configuration ------------------------------------------------
@@ -126,8 +129,8 @@ int main(int argc, char** argv) {
   try {
     device = new AclDeviceOps(0);
   } catch (const std::exception& error) {
-    Skip(std::string("no usable NPU device on this host: ") + error.what());
-    return 0;
+    std::fprintf(stderr, "[FAIL] detected NPU could not initialize: %s\n", error.what());
+    return 1;
   }
   std::unique_ptr<AclDeviceOps> device_guard(device);
   std::printf("  device SoC: %s\n", device->soc_name().c_str());
@@ -151,7 +154,7 @@ int main(int argc, char** argv) {
     if (!coverage_given) {
       Skip("real hardware without --coverage: full residency pins ~137 GiB of host RAM, which is a "
            "production decision. Re-run with --coverage <experts> for a bring-up subset.");
-      return 0;
+      return require_device ? 1 : 0;
     }
     config.routed_coverage = coverage;
 
@@ -217,4 +220,8 @@ int main(int argc, char** argv) {
     std::printf("  [FAIL] %s\n", error.what());
     return 1;
   }
+}
+
+int main(int argc, char** argv) {
+  return ascend_moe::GuardedMain([&] { return RunMain(argc, argv); });
 }

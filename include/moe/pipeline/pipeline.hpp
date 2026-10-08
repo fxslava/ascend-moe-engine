@@ -76,6 +76,7 @@
 //    See the comment on the `expert_combine` stage.
 
 #pragma once
+#include "moe/core/resource_scope.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -91,7 +92,7 @@
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/pipeline/moe_router_engine.hpp"
 #include "moe/pipeline/routed_moe_block.hpp"
-#include "moe/pipeline/static_arena_manager.hpp"
+#include "moe/memory/static_arena_manager.hpp"
 #include "moe/pipeline/static_op_slot_table.hpp"
 
 namespace ascend_moe {
@@ -248,6 +249,7 @@ class Dsv4Pipeline {
 
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
+  ResourceScope resources_{allocator_, streams_};
   const OpTable& ops_;
   ExclusiveExpertManager& experts_;
   RuntimeConfig config_;

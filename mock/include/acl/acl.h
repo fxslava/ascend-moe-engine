@@ -31,6 +31,9 @@ typedef void* aclrtContext;
 
 aclError aclInit(const char* config_path);
 aclError aclFinalize(void);
+const char* aclGetRecentErrMsg(void);
+aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout);
+aclError aclrtDestroyStreamForce(aclrtStream stream);
 aclError aclrtSetDevice(int32_t device_id);
 aclError aclrtResetDevice(int32_t device_id);
 aclError aclrtCreateContext(aclrtContext* context, int32_t device_id);
