@@ -36,6 +36,9 @@ aclError aclrtResetDevice(int32_t device_id);
 aclError aclrtCreateContext(aclrtContext* context, int32_t device_id);
 aclError aclrtDestroyContext(aclrtContext context);
 aclError aclrtSetCurrentContext(aclrtContext context);
+// One simulated device, always. Probes assert count > 0 on live hardware;
+// the mock answers 1 so the same assertion runs host-side.
+aclError aclrtGetDeviceCount(uint32_t* device_count);
 const char* aclrtGetSocName(void);
 
 // The symbolic allocator: fake, monotonically increasing, 4096-aligned

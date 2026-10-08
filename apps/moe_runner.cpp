@@ -22,6 +22,7 @@
 // No Python, no PyTorch: `ldd` on this binary carries libascendcl, libnnopbase
 // and the libopapi family, and nothing else from a framework.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,6 +88,8 @@ void PrintUsage() {
       "  --dry-run                 build, plan, report and exit without decoding; with no weights\n"
       "                            given, parse and validate the model configuration only\n"
       "  --report <path>           write the full report there as well as to stdout\n"
+      "  --stats-json <path>       write machine-readable run stats (TTFT, TPOT, swap bytes, launch\n"
+      "                            counters) there after a decode; consumed by python/benchmarks\n"
       "  --verbose                 print the arena ledger and operator inventory\n"
       "  --help\n",
       kDefaultModelConfigPath, static_cast<long long>(kDefaultKvLoraRank),
@@ -117,6 +120,7 @@ struct Arguments {
   RuntimeConfig config;
   std::vector<int32_t> prompt_ids;
   std::string model_config_path;  // empty = no --config flag given
+  std::string stats_json_path;    // empty = no --stats-json flag given
   bool help = false;
 };
 
@@ -184,6 +188,8 @@ Arguments ParseArguments(int argc, char** argv) {
       config.dry_run = true;
     } else if (flag == "--report") {
       config.report_path = next("--report");
+    } else if (flag == "--stats-json") {
+      arguments.stats_json_path = next("--stats-json");
     } else if (flag == "--verbose") {
       config.verbose = true;
     } else {
@@ -369,6 +375,13 @@ int Run(int argc, char** argv) {
     DSV4_REQUIRE(!arguments.prompt_ids.empty(),
                  "--prompt-ids is required to decode: this runner embeds no tokenizer, so the prompt text in "
                  "--prompt is recorded but not tokenized. Pass the ids your tokenizer produced.");
+    // Timing anchors for the benchmark harness: TTFT spans the whole prefill
+    // (prompt steps + the first readback), TPOT is the mean span of every
+    // subsequent step. This runner runs prefill AS decode steps (one token
+    // each), so TTFT over a P-token prompt is P decode steps -- the honest
+    // number for this graph shape, and the harness labels it as such.
+    const std::chrono::steady_clock::time_point decode_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point first_token_time = decode_start;
     std::vector<int32_t> generated;
     int64_t position = 0;
     // Prefill is run as a sequence of single-token steps: the decode graph is
@@ -378,11 +391,19 @@ int Run(int argc, char** argv) {
       pipeline.DecodeStep(arguments.prompt_ids[index], position++);
     }
     int32_t token = pipeline.ReadArgmaxToken();
+    first_token_time = std::chrono::steady_clock::now();
     for (int64_t index = 0; index < config.max_new_tokens && position < config.max_context_len; ++index) {
       generated.push_back(token);
       pipeline.DecodeStep(token, position++);
       token = pipeline.ReadArgmaxToken();
     }
+    const std::chrono::steady_clock::time_point decode_end = std::chrono::steady_clock::now();
+    const double ttft_seconds =
+        std::chrono::duration<double>(first_token_time - decode_start).count();
+    const double decode_span_seconds = std::chrono::duration<double>(decode_end - first_token_time).count();
+    const double total_seconds = std::chrono::duration<double>(decode_end - decode_start).count();
+    const double tpot_seconds =
+        generated.size() > 1 ? decode_span_seconds / static_cast<double>(generated.size() - 1) : 0.0;
     report << "\ngenerated " << generated.size() << " token ids:";
     for (int32_t id : generated) {
       report << " " << id;
@@ -391,6 +412,9 @@ int Run(int argc, char** argv) {
     const StepCounters& counters = pipeline.counters();
     report << "steps " << counters.steps << ", layers " << counters.layers << ", launches " << counters.launches
            << "\n";
+    report << "timing: ttft " << ttft_seconds << " s (prefill of " << arguments.prompt_ids.size()
+           << " single-token steps + first readback), tpot " << tpot_seconds << " s, total " << total_seconds
+           << " s\n";
     report << "expert residency: " << counters.expert_slot_hits << " hits, " << counters.expert_slot_misses
            << " misses\n";
     report << "host synchronizations " << counters.host_synchronizations << " (expected "
@@ -401,6 +425,39 @@ int Run(int argc, char** argv) {
                  counters.device_allocations_in_step << " device allocations happened inside a decode step");
     DSV4_REQUIRE(counters.descriptors_built_in_step == 0,
                  counters.descriptors_built_in_step << " descriptors were built inside a decode step");
+
+    if (!arguments.stats_json_path.empty()) {
+      // Machine-readable mirror of the report's counters, plus the swap
+      // engine's byte tallies: what python/benchmarks/bench_runner.py parses.
+      std::ofstream stats(arguments.stats_json_path);
+      DSV4_REQUIRE(stats.is_open(), "cannot write the stats to " << arguments.stats_json_path);
+      const ExclusiveStagingStats& swap = experts.stats();
+      stats << "{\n"
+            << "  \"generated_tokens\": " << generated.size() << ",\n"
+            << "  \"prompt_tokens\": " << arguments.prompt_ids.size() << ",\n"
+            << "  \"steps\": " << counters.steps << ",\n"
+            << "  \"layers\": " << counters.layers << ",\n"
+            << "  \"launches\": " << counters.launches << ",\n"
+            << "  \"host_synchronizations\": " << counters.host_synchronizations << ",\n"
+            << "  \"expert_slot_hits\": " << counters.expert_slot_hits << ",\n"
+            << "  \"expert_slot_misses\": " << counters.expert_slot_misses << ",\n"
+            << "  \"swap_h2d_bytes\": " << swap.host_to_device_bytes << ",\n"
+            << "  \"swap_d2h_bytes\": " << swap.device_to_host_bytes << ",\n"
+            << "  \"swap_d2d_bytes\": " << swap.device_to_device_bytes << ",\n"
+            << "  \"swap_chunks\": " << swap.swap_chunks << ",\n"
+            << "  \"startup_ingest_bytes\": " << swap.startup_bytes << ",\n"
+            << "  \"device_allocations_in_step\": " << counters.device_allocations_in_step << ",\n"
+            << "  \"descriptors_built_in_step\": " << counters.descriptors_built_in_step << ",\n"
+            << "  \"ttft_seconds\": " << ttft_seconds << ",\n"
+            << "  \"tpot_seconds\": " << tpot_seconds << ",\n"
+            << "  \"decode_span_seconds\": " << decode_span_seconds << ",\n"
+            << "  \"total_seconds\": " << total_seconds << ",\n"
+            << "  \"device_slots\": " << slots << ",\n"
+            << "  \"slot_bytes\": " << layout.slot_num_bytes() << ",\n"
+            << "  \"backbone_bytes\": " << backbone_bytes << "\n"
+            << "}\n";
+      report << "stats written to " << arguments.stats_json_path << "\n";
+    }
   }
 
   experts.Synchronize();

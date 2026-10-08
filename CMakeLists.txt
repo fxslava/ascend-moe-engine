@@ -14,44 +14,49 @@
 # limitations under the License.
 # -----------------------------------------------------------------------------
 #
-# libascend_moe_engine -- the standalone DeepSeek-V4 Flash decode engine.
+# ascend-moe-engine -- the standalone DeepSeek-V4 Flash decode engine.
 #
-# This project is fully self-contained: it never includes the repository
-# root's CMakeLists.txt and references no Python paths. Configure it on its
-# own, from this directory:
+# Fully self-contained: torch-free, python-free, no dependency on any parent
+# project. Configure this repository root directly:
 #
-#   native against a CANN toolkit:
-#     cmake -S csrc/standalone -B build/engine -DCMAKE_BUILD_TYPE=Release
-#     cmake --build build/engine -j
+#   native against a CANN toolkit (device host or container):
+#     source <toolkit>/set_env.sh
+#     cmake -S . -B build_cann -DCMAKE_BUILD_TYPE=Release
+#     cmake --build build_cann -j
 #
 #   host-only symbolic verification (no CANN, no Docker, no NPU):
-#     cmake -S csrc/standalone -B build/mock -DENABLE_MOCK_RUNTIME=ON
-#     cmake --build build/mock -j && ./build/mock/dsv4_mock_test
+#     cmake -S . -B build_mock -DENABLE_MOCK_RUNTIME=ON
+#     cmake --build build_mock -j && ctest --test-dir build_mock
+#
+# LAYOUT
+#   apps/       executables (moe_runner)
+#   include/    the engine's public headers (moe/...)
+#   src/        the engine library
+#   mock/       the symbolic libopapi_mock backend (headers + implementation)
+#   tests/      every test binary: contract smoke, mock suite, device probes
+#   python/     torch-free tokenizer + benchmark harness
 #
 # TARGETS
-#   ascend_moe_engine    libascend_moe_engine.so -- the engine itself
-#   moe_runner           the inference binary
-#   moe_contract_smoke   the device-free contract test
-#   dsv4_mock_test       (mock mode) the zero-allocation symbolic suite
-#   dsv4_verify_linkage  (CANN mode) zero undefined symbols, no Python/Torch
+#   ascend_moe_engine            libascend_moe_engine.so -- the engine itself
+#   moe_runner                   the inference binary (apps/moe_runner.cpp)
+#   moe_contract_smoke           the device-free contract test
+#   test_cann_backend_probe      device + operator-symbol probe (no npu-smi)
+#   test_weights_ingest_probe    safetensors header + pinned->HBM DMA probe
+#   test_e2e_single_token        one full decode step, one readback
+#   dsv4_mock_test               (mock mode) the zero-allocation symbolic suite
+#   dsv4_verify_linkage          (CANN mode) zero undefined symbols, no Py/Torch
 #
 # AARCH64
-# The 950PR host CPU is aarch64, and so is the production toolkit. Two ways in:
-#
-#   native on the device host:
-#     cmake -S csrc/standalone -B build/engine
-#
-#   cross from an x86_64 build container, against <repo>/cann_aarch64:
-#     cmake -S csrc/standalone -B build/engine-aarch64 \
-#       -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/aarch64-toolchain.cmake
+#   The 950PR host CPU is aarch64 and so is the production toolkit:
+#     cmake -S . -B build_engine
+#   Cross from an x86_64 container against a copy of the toolkit:
+#     cmake -S . -B build_engine-aarch64 -DCMAKE_TOOLCHAIN_FILE=<...>
 #
 # BISHENG
-# `-DDSV4_USE_BISHENG=ON` selects $ASCEND_HOME_PATH/bin/bisheng (CANN's
-# Clang-based compiler) for the host C++ too. It is OFF by default because this
-# tree contains no device code -- there is not a single Ascend C kernel here, by
-# design -- so the host toolchain is a free choice and GCC is what every CI
-# image has. The option exists so a BiSheng-only environment can build the same
-# sources without editing this file.
+#   -DDSV4_USE_BISHENG=ON selects $ASCEND_HOME_PATH/bin/bisheng for the host
+#   C++ too. OFF by default: this tree carries no Ascend C kernel, so the host
+#   toolchain is a free choice and GCC is what every CI image has. The block
+#   below therefore runs BEFORE project(), where the compiler must be picked.
 # -----------------------------------------------------------------------------
 
 cmake_minimum_required(VERSION 3.16)
@@ -62,7 +67,6 @@ option(DSV4_USE_BISHENG "Compile the host C++ with CANN's BiSheng (clang) instea
 # weight, slot or arena.
 option(ENABLE_MOCK_RUNTIME "Build against the zero-allocation symbolic mock runtime" OFF)
 
-# The compiler has to be chosen before project(), so this block runs first.
 if(DSV4_USE_BISHENG AND NOT CMAKE_CXX_COMPILER)
   set(_moe_toolkit "$ENV{ASCEND_HOME_PATH}")
   if(NOT _moe_toolkit)
@@ -78,7 +82,7 @@ if(DSV4_USE_BISHENG AND NOT CMAKE_CXX_COMPILER)
   endif()
 endif()
 
-project(ascend_moe_engine LANGUAGES CXX)
+project(ascend-moe-engine LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -141,6 +145,10 @@ if(ENABLE_MOCK_RUNTIME)
   target_compile_options(opapi_mock PRIVATE -Wall -Wextra)
   target_link_libraries(opapi_mock PUBLIC Threads::Threads)
   target_link_libraries(ascend_moe_engine PUBLIC opapi_mock)
+
+  # Tests gate their mock-only affordances (symbolic host memory, D2H
+  # seeding) on this define; the CANN build leaves it undefined.
+  target_compile_definitions(ascend_moe_engine PUBLIC ASCEND_MOCK_RUNTIME=1)
 
   # aclnn_signature_check.cpp static_asserts the hand-written prototypes
   # against the REAL CANN headers, which is meaningless against a mock and
@@ -205,9 +213,9 @@ else()
       "${CMAKE_SYSTEM_PROCESSOR}.")
   endif()
   list(GET MOE_CANN_LIB_DIRS 0 MOE_CANN_LIB_DIR)
-  message(STATUS "ascend_moe_engine: CANN ${ASCEND_HOME_PATH}, libraries ${MOE_CANN_LIB_DIR}")
+  message(STATUS "ascend-moe-engine: CANN ${ASCEND_HOME_PATH}, libraries ${MOE_CANN_LIB_DIR}")
 
-  # The libraries the brief names, plus libnnopbase (aclCreateTensor,
+  # The libraries the design names, plus libnnopbase (aclCreateTensor,
   # aclSetTensorAddr, aclSetAclOpExecutorRepeatable -- the static-arena
   # primitives) and libopapi_transformer, which is where the attention and
   # grouped-GEMM entry points actually live in the 9.2.0 split.
@@ -218,7 +226,7 @@ else()
   foreach(_name IN LISTS _moe_required_libs)
     find_library(_moe_lib_${_name} NAMES ${_name} PATHS ${MOE_CANN_LIB_DIRS} NO_DEFAULT_PATH)
     if(NOT _moe_lib_${_name})
-      message(FATAL_ERROR "ascend_moe_engine: lib${_name}.so not found in ${MOE_CANN_LIB_DIRS}")
+      message(FATAL_ERROR "ascend-moe-engine: lib${_name}.so not found in ${MOE_CANN_LIB_DIRS}")
     endif()
     list(APPEND MOE_CANN_LIBRARIES "${_moe_lib_${_name}}")
   endforeach()
@@ -227,7 +235,7 @@ else()
     if(_moe_lib_${_name})
       list(APPEND MOE_CANN_LIBRARIES "${_moe_lib_${_name}}")
     else()
-      message(STATUS "ascend_moe_engine: lib${_name}.so absent; its operators resolve from libopapi.so instead")
+      message(STATUS "ascend-moe-engine: lib${_name}.so absent; its operators resolve from libopapi.so instead")
     endif()
   endforeach()
   target_link_libraries(ascend_moe_engine PUBLIC ${MOE_CANN_LIBRARIES})
@@ -259,24 +267,40 @@ endif()
 # -----------------------------------------------------------------------------
 # Executables and tests
 # -----------------------------------------------------------------------------
-add_executable(moe_runner src/main.cpp)
+add_executable(moe_runner apps/moe_runner.cpp)
 target_link_libraries(moe_runner PRIVATE ascend_moe_engine)
 target_compile_options(moe_runner PRIVATE -Wall -Wextra)
 if(DSV4_WERROR)
   target_compile_options(moe_runner PRIVATE -Werror)
 endif()
 
-add_executable(moe_contract_smoke src/contract_smoke.cpp)
+# Every test binary, in one place. Each is a standalone diagnostic: the
+# contract smoke and the probes run device-free where they can and SKIP (exit
+# 0) where a capability is genuinely absent; dsv4_mock_test is mock-only.
+add_executable(moe_contract_smoke tests/contract_smoke.cpp)
 target_link_libraries(moe_contract_smoke PRIVATE ascend_moe_engine)
 target_compile_options(moe_contract_smoke PRIVATE -Wall -Wextra)
 if(DSV4_WERROR)
   target_compile_options(moe_contract_smoke PRIVATE -Werror)
 endif()
 
+foreach(_test
+    test_cann_backend_probe
+    test_weights_ingest_probe
+    test_e2e_single_token)
+  add_executable(${_test} tests/${_test}.cpp)
+  target_link_libraries(${_test} PRIVATE ascend_moe_engine)
+  target_compile_options(${_test} PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(${_test} PRIVATE -Werror)
+  endif()
+endforeach()
+
 # $ORIGIN rpath so the executables find libascend_moe_engine.so (and, in mock
 # mode, libopapi_mock.so) next to themselves; the dlsym(RTLD_DEFAULT, ...)
 # operator table needs the libraries loaded and their symbols exported.
-foreach(_target moe_runner moe_contract_smoke)
+foreach(_target moe_runner moe_contract_smoke test_cann_backend_probe
+                test_weights_ingest_probe test_e2e_single_token)
   set_target_properties(${_target} PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN"
@@ -284,10 +308,12 @@ foreach(_target moe_runner moe_contract_smoke)
 endforeach()
 
 enable_testing()
-add_test(NAME moe_contract_smoke COMMAND moe_contract_smoke)
+foreach(_test moe_contract_smoke test_cann_backend_probe test_weights_ingest_probe test_e2e_single_token)
+  add_test(NAME ${_test} COMMAND ${_test})
+endforeach()
 
 if(ENABLE_MOCK_RUNTIME)
-  add_executable(dsv4_mock_test "${MOE_MOCK_DIR}/dsv4_mock_test.cpp")
+  add_executable(dsv4_mock_test tests/dsv4_mock_test.cpp)
   target_link_libraries(dsv4_mock_test PRIVATE ascend_moe_engine)
   target_compile_options(dsv4_mock_test PRIVATE -Wall -Wextra)
   set_target_properties(dsv4_mock_test PROPERTIES
@@ -299,8 +325,7 @@ else()
   # -----------------------------------------------------------------------------
   # Linkage verification (physical build)
   # -----------------------------------------------------------------------------
-  # Three properties the brief asks to be verified, checked by the build rather
-  # than by hand:
+  # Three properties, checked by the build rather than by hand:
   #
   #   1. zero undefined symbols  -- `ldd -r` reports none, so every symbol this
   #      binary calls directly is satisfied by its DT_NEEDED set. (The dlsym'd

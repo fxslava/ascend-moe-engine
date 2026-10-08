@@ -17,6 +17,7 @@
 #include "mock_allocator.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -251,6 +252,15 @@ aclError aclInit(const char*) {
 aclError aclFinalize(void) { return ACL_SUCCESS; }
 
 aclError aclrtSetDevice(int32_t) { return ACL_SUCCESS; }
+
+aclError aclrtGetDeviceCount(uint32_t* device_count) {
+  if (device_count == nullptr) {
+    return ACL_ERROR_INVALID_PARAM;
+  }
+  *device_count = 1;
+  return ACL_SUCCESS;
+}
+
 aclError aclrtResetDevice(int32_t) { return ACL_SUCCESS; }
 aclError aclrtCreateContext(aclrtContext* context, int32_t) {
   if (context == nullptr) {
