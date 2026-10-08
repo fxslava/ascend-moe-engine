@@ -315,11 +315,48 @@ size_t SyntheticWeightSource::NamedByteSize(const std::string&) const {
 // SafetensorsWeightSource
 // ---------------------------------------------------------------------------
 
+CheckpointIndex ParseSafetensorsIndexJson(const char* text, size_t length) {
+  Scanner scanner{text, length, 0};
+  CheckpointIndex index;
+  bool found_map = false;
+  scanner.Expect('{');
+  if (!scanner.TryConsume('}')) {
+    do {
+      const std::string field = scanner.ReadString();
+      scanner.Expect(':');
+      if (field == "weight_map") {
+        DSV4_REQUIRE(!found_map, "duplicate weight_map in safetensors index");
+        found_map = true;
+        scanner.Expect('{');
+        if (!scanner.TryConsume('}')) {
+          do {
+            const std::string name = scanner.ReadString();
+            scanner.Expect(':');
+            const std::string shard = scanner.ReadString();
+            DSV4_REQUIRE(!name.empty() && !shard.empty(), "empty tensor name or shard in index");
+            DSV4_REQUIRE(index.emplace(name, shard).second, "duplicate index tensor " << name);
+          } while (scanner.TryConsume(','));
+          scanner.Expect('}');
+        }
+      } else {
+        scanner.SkipValue();
+      }
+    } while (scanner.TryConsume(','));
+    scanner.Expect('}');
+  }
+  scanner.SkipSpace();
+  DSV4_REQUIRE(scanner.position == length, "trailing content in safetensors index");
+  DSV4_REQUIRE(found_map && !index.empty(), "safetensors index has no nonempty weight_map");
+  return index;
+}
+
 std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* text, size_t length) {
   Scanner scanner{text, length, 0};
   std::map<std::string, SafetensorsTensor> tensors;
   scanner.Expect('{');
   if (scanner.TryConsume('}')) {
+    scanner.SkipSpace();
+    DSV4_REQUIRE(scanner.position == length, "trailing content in safetensors header");
     return tensors;
   }
   while (true) {
@@ -329,17 +366,22 @@ std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* 
       scanner.SkipValue();
     } else {
       SafetensorsTensor tensor;
+      bool has_dtype = false, has_shape = false, has_offsets = false;
       scanner.Expect('{');
       while (true) {
         const std::string field = scanner.ReadString();
         scanner.Expect(':');
         if (field == "dtype") {
           tensor.dtype = scanner.ReadString();
+          has_dtype = true;
         } else if (field == "shape") {
+          has_shape = true;
           scanner.Expect('[');
           if (!scanner.TryConsume(']')) {
             while (true) {
-              tensor.shape.push_back(scanner.ReadInteger());
+              const int64_t dimension = scanner.ReadInteger();
+              DSV4_REQUIRE(dimension >= 0, "negative tensor dimension for " << name);
+              tensor.shape.push_back(dimension);
               if (!scanner.TryConsume(',')) {
                 break;
               }
@@ -347,10 +389,14 @@ std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* 
             scanner.Expect(']');
           }
         } else if (field == "data_offsets") {
+          has_offsets = true;
           scanner.Expect('[');
-          tensor.payload_begin = static_cast<uint64_t>(scanner.ReadInteger());
+          const int64_t begin = scanner.ReadInteger();
           scanner.Expect(',');
-          tensor.payload_end = static_cast<uint64_t>(scanner.ReadInteger());
+          const int64_t end = scanner.ReadInteger();
+          DSV4_REQUIRE(begin >= 0 && end >= begin, "invalid tensor offsets for " << name);
+          tensor.payload_begin = static_cast<uint64_t>(begin);
+          tensor.payload_end = static_cast<uint64_t>(end);
           scanner.Expect(']');
         } else {
           scanner.SkipValue();
@@ -360,16 +406,20 @@ std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* 
         }
       }
       scanner.Expect('}');
+      DSV4_REQUIRE(has_dtype && !tensor.dtype.empty() && has_shape && has_offsets,
+                   "incomplete safetensors metadata for " << name);
       DSV4_REQUIRE(tensor.payload_end >= tensor.payload_begin,
                    "safetensors tensor " << name << " has data_offsets [" << tensor.payload_begin << ", "
                                          << tensor.payload_end << ")");
-      tensors.emplace(name, std::move(tensor));
+      DSV4_REQUIRE(tensors.emplace(name, std::move(tensor)).second, "duplicate tensor " << name);
     }
     if (!scanner.TryConsume(',')) {
       break;
     }
   }
   scanner.Expect('}');
+  scanner.SkipSpace();
+  DSV4_REQUIRE(scanner.position == length, "trailing content in safetensors header");
   return tensors;
 }
 
@@ -377,11 +427,16 @@ SafetensorsWeightSource::SafetensorsWeightSource(const std::string& path, const 
                                                  CheckpointNaming naming, int64_t num_layers, int64_t num_experts)
     : naming_(naming), num_layers_(num_layers), num_experts_(num_experts) {
   layout_ = layout;
-  OpenShards(path);
-  for (int32_t shard = 0; shard < static_cast<int32_t>(shards_.size()); ++shard) {
-    ParseShardHeader(shard);
+  try {
+    OpenShards(path);
+    for (int32_t shard = 0; shard < static_cast<int32_t>(shards_.size()); ++shard) {
+      ParseShardHeader(shard);
+    }
+    DSV4_REQUIRE(!tensors_.empty(), "no tensors found under " << path);
+  } catch (...) {
+    Close();
+    throw;
   }
-  DSV4_REQUIRE(!tensors_.empty(), "no tensors found under " << path);
 }
 
 SafetensorsWeightSource::~SafetensorsWeightSource() {
@@ -432,7 +487,11 @@ void SafetensorsWeightSource::ParseShardHeader(int32_t shard_index) {
   DSV4_REQUIRE(shard.file_size >= kSafetensorsHeaderLengthBytes,
                shard.path << " is too small to be a safetensors container");
   uint64_t header_length = 0;
-  PreadExact(shard_index, reinterpret_cast<uint8_t*>(&header_length), 0, kSafetensorsHeaderLengthBytes);
+  uint8_t prefix[kSafetensorsHeaderLengthBytes] = {};
+  PreadExact(shard_index, prefix, 0, sizeof(prefix));
+  for (size_t byte = 0; byte < sizeof(prefix); ++byte) {
+    header_length |= static_cast<uint64_t>(prefix[byte]) << (8 * byte);
+  }
   DSV4_REQUIRE(header_length > 0 && header_length <= kMaxHeaderBytes,
                shard.path << " declares a " << header_length << "-byte header");
   DSV4_REQUIRE(kSafetensorsHeaderLengthBytes + header_length <= shard.file_size,
@@ -443,7 +502,7 @@ void SafetensorsWeightSource::ParseShardHeader(int32_t shard_index) {
 
   std::map<std::string, SafetensorsTensor> parsed = ParseSafetensorsHeaderJson(header.data(), header.size());
   for (auto& entry : parsed) {
-    DSV4_REQUIRE(shard.data_start + entry.second.payload_end <= shard.file_size,
+    DSV4_REQUIRE(entry.second.payload_end <= shard.file_size - shard.data_start,
                  "tensor " << entry.first << " in " << shard.path << " ends past the file");
     entry.second.shard = shard_index;
     // Later shards never shadow an earlier definition: a duplicated tensor name

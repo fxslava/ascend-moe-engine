@@ -39,11 +39,12 @@
 # TARGETS
 #   ascend_moe_engine            libascend_moe_engine.so -- the engine itself
 #   moe_runner                   the inference binary (apps/moe_runner.cpp)
-#   moe_contract_smoke           the device-free contract test
-#   test_cann_backend_probe      device + operator-symbol probe (no npu-smi)
-#   test_weights_ingest_probe    safetensors header + pinned->HBM DMA probe
-#   test_e2e_single_token        one full decode step, one readback
-#   dsv4_mock_test               (mock mode) the zero-allocation symbolic suite
+#   mock_contract_smoke          (mock mode) the device-free contract test
+#   mock_pipeline_e2e            (mock mode) the symbolic pipeline suite
+#   mock_safetensors_index_probe (mock mode) header and index metadata only
+#   npu_backend_probe            (CANN mode) device + operator-symbol probe
+#   npu_weights_ingest_probe     (CANN mode) safetensors + pinned->HBM DMA
+#   npu_e2e_single_token         (CANN mode) one full decode step, one readback
 #   dsv4_verify_linkage          (CANN mode) zero undefined symbols, no Py/Torch
 #
 # AARCH64
@@ -102,6 +103,7 @@ set(MOE_ENGINE_SOURCES
   src/expert_layout.cpp
   src/model_config.cpp
   src/weight_source.cpp
+  src/inference_stats.cpp
   src/exclusive_staging.cpp
   src/op_table.cpp
   src/static_arena.cpp
@@ -143,6 +145,9 @@ if(ENABLE_MOCK_RUNTIME)
   )
   target_include_directories(opapi_mock PUBLIC "${MOE_MOCK_DIR}" "${MOE_MOCK_DIR}/include")
   target_compile_options(opapi_mock PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(opapi_mock PRIVATE -Werror)
+  endif()
   target_link_libraries(opapi_mock PUBLIC Threads::Threads)
   target_link_libraries(ascend_moe_engine PUBLIC opapi_mock)
 
@@ -274,54 +279,15 @@ if(DSV4_WERROR)
   target_compile_options(moe_runner PRIVATE -Werror)
 endif()
 
-# Every test binary, in one place. Each is a standalone diagnostic: the
-# contract smoke and the probes run device-free where they can and SKIP (exit
-# 0) where a capability is genuinely absent; dsv4_mock_test is mock-only.
-add_executable(moe_contract_smoke tests/contract_smoke.cpp)
-target_link_libraries(moe_contract_smoke PRIVATE ascend_moe_engine)
-target_compile_options(moe_contract_smoke PRIVATE -Wall -Wextra)
-if(DSV4_WERROR)
-  target_compile_options(moe_contract_smoke PRIVATE -Werror)
-endif()
-
-foreach(_test
-    test_cann_backend_probe
-    test_weights_ingest_probe
-    test_e2e_single_token)
-  add_executable(${_test} tests/${_test}.cpp)
-  target_link_libraries(${_test} PRIVATE ascend_moe_engine)
-  target_compile_options(${_test} PRIVATE -Wall -Wextra)
-  if(DSV4_WERROR)
-    target_compile_options(${_test} PRIVATE -Werror)
-  endif()
-endforeach()
-
-# $ORIGIN rpath so the executables find libascend_moe_engine.so (and, in mock
-# mode, libopapi_mock.so) next to themselves; the dlsym(RTLD_DEFAULT, ...)
-# operator table needs the libraries loaded and their symbols exported.
-foreach(_target moe_runner moe_contract_smoke test_cann_backend_probe
-                test_weights_ingest_probe test_e2e_single_token)
-  set_target_properties(${_target} PROPERTIES
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-  )
-endforeach()
+set_target_properties(moe_runner PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/apps"
+  BUILD_RPATH "$ORIGIN/.."
+  INSTALL_RPATH "$ORIGIN/.."
+)
 
 enable_testing()
-foreach(_test moe_contract_smoke test_cann_backend_probe test_weights_ingest_probe test_e2e_single_token)
-  add_test(NAME ${_test} COMMAND ${_test})
-endforeach()
-
-if(ENABLE_MOCK_RUNTIME)
-  add_executable(dsv4_mock_test tests/dsv4_mock_test.cpp)
-  target_link_libraries(dsv4_mock_test PRIVATE ascend_moe_engine)
-  target_compile_options(dsv4_mock_test PRIVATE -Wall -Wextra)
-  set_target_properties(dsv4_mock_test PROPERTIES
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-  )
-  add_test(NAME dsv4_mock_test COMMAND dsv4_mock_test)
-else()
+add_subdirectory(tests)
+if(NOT ENABLE_MOCK_RUNTIME)
   # -----------------------------------------------------------------------------
   # Linkage verification (physical build)
   # -----------------------------------------------------------------------------
@@ -338,8 +304,8 @@ else()
 
   add_custom_target(dsv4_verify_linkage
     COMMAND ${CMAKE_COMMAND} -E env bash "${CMAKE_CURRENT_BINARY_DIR}/verify_linkage.sh"
-            "$<TARGET_FILE:moe_runner>" "$<TARGET_FILE:moe_contract_smoke>"
-    DEPENDS moe_runner moe_contract_smoke
+            "$<TARGET_FILE:moe_runner>" "$<TARGET_FILE:npu_backend_probe>"
+    DEPENDS moe_runner npu_backend_probe
     COMMENT "Verifying zero undefined symbols and no Python/Torch linkage"
     VERBATIM
   )

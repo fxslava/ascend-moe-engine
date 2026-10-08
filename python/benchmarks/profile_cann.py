@@ -26,7 +26,7 @@ CANN toolkit (source set_env.sh so it is on PATH).
 
 Usage::
 
-    python -m benchmarks.profile_cann --engine build_cann/moe_runner \
+    python -m benchmarks.profile_cann --engine build_cann/apps/moe_runner \
         --engine-args "--synthetic-weights --prompt-ids 7 --max-new-tokens 4" \
         --output prof_out --top 20
 """
@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m benchmarks.profile_cann",
         description="msprof moe_runner and summarize the operator timeline (no MindStudio UI).",
     )
-    parser.add_argument("--engine", default="build_cann/moe_runner", help="moe_runner binary to profile")
+    parser.add_argument("--engine", default="build_cann/apps/moe_runner", help="moe_runner binary to profile")
     parser.add_argument("--engine-args", default="--dry-run --synthetic-weights",
                         help="arguments for moe_runner, one shell-like string")
     parser.add_argument("--output", default="moe_prof_out", help="msprof --output directory")

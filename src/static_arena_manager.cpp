@@ -63,6 +63,121 @@ std::string LayerTensorName(const char* pattern, int64_t layer) {
 
 }  // namespace
 
+bool IsAuxiliaryCheckpointTensor(const std::string& name) {
+  return name.compare(0, 4, "mtp.") == 0 || name.compare(0, 10, "model.mtp.") == 0;
+}
+
+std::string ResolveCheckpointTensorName(const std::string& requested,
+                                        const CheckpointHasTensor& has_tensor) {
+  if (IsAuxiliaryCheckpointTensor(requested)) return {};
+  std::vector<std::string> candidates{requested};
+  if (requested == "model.embed_tokens.weight") {
+    candidates.push_back("embed.weight");
+    candidates.push_back("embed_tokens.weight");
+  }
+  if (requested == "model.norm.weight") candidates.push_back("norm.weight");
+  if (requested == "lm_head.weight") candidates.push_back("head.weight");
+
+  const std::string prefix = "model.layers.";
+  if (requested.compare(0, prefix.size(), prefix) == 0) {
+    const size_t dot = requested.find('.', prefix.size());
+    if (dot != std::string::npos) {
+      const std::string layer = requested.substr(prefix.size(), dot - prefix.size());
+      if (!layer.empty() && layer.find_first_not_of("0123456789") == std::string::npos) {
+        const std::string flat = "layers." + layer + ".";
+        const std::string leaf = requested.substr(dot + 1);
+        candidates.push_back(flat + leaf);
+        const std::pair<const char*, const char*> aliases[] = {
+            {"input_layernorm.weight", "attn_norm.weight"},
+            {"post_attention_layernorm.weight", "ffn_norm.weight"},
+            {"mlp.gate.weight", "ffn.gate.weight"},
+            {"mlp.gate.e_score_correction_bias", "ffn.gate.bias"},
+            {"self_attn.q_a_layernorm.weight", "attn.q_norm.weight"},
+            {"self_attn.kv_a_layernorm.weight", "attn.kv_norm.weight"},
+        };
+        for (const auto& alias : aliases) {
+          if (leaf == alias.first) candidates.push_back(flat + alias.second);
+        }
+        // Both flattened expert layouts occur in converted checkpoints.
+        const std::string experts = "mlp.experts.";
+        if (leaf.compare(0, experts.size(), experts) == 0) {
+          const size_t expert_dot = leaf.find('.', experts.size());
+          if (expert_dot != std::string::npos) {
+            const std::string expert = leaf.substr(experts.size(), expert_dot - experts.size());
+            const std::string projection = leaf.substr(expert_dot + 1);
+            const std::pair<const char*, const char*> projections[] = {
+                {"gate_proj.weight", "w1.weight"}, {"up_proj.weight", "w3.weight"},
+                {"down_proj.weight", "w2.weight"}, {"gate_proj.weight_scale_inv", "w1.scale"},
+                {"up_proj.weight_scale_inv", "w3.scale"}, {"down_proj.weight_scale_inv", "w2.scale"},
+            };
+            for (const auto& alias : projections) {
+              if (projection == alias.first) {
+                candidates.push_back(flat + "ffn.experts." + expert + "." + alias.second);
+                candidates.push_back(flat + "experts." + expert + "." + alias.second);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  for (const auto& candidate : candidates) {
+    if (has_tensor(candidate)) return candidate;
+  }
+  return {};
+}
+
+CheckpointTopology ValidateCheckpointTopology(const CheckpointIndex& index, int64_t num_layers) {
+  DSV4_REQUIRE(num_layers > 0, "checkpoint topology needs a positive layer count");
+  CheckpointTopology topology;
+  const auto has = [&](const std::string& name) { return index.count(name) != 0; };
+  for (const auto& entry : index) {
+    if (IsAuxiliaryCheckpointTensor(entry.first)) {
+      ++topology.ignored_auxiliary_tensors;
+      continue;
+    }
+    const std::string& shard = entry.second;
+    const std::string suffix = ".safetensors";
+    DSV4_REQUIRE(shard.size() > suffix.size() &&
+                     shard.compare(shard.size() - suffix.size(), suffix.size(), suffix) == 0,
+                 "invalid shard target for " << entry.first << ": " << shard);
+  }
+  auto require = [&](std::map<std::string, std::string>& bindings, const std::string& role,
+                     const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+      const std::string resolved = ResolveCheckpointTensorName(name, has);
+      if (!resolved.empty()) {
+        bindings.emplace(role, resolved);
+        return;
+      }
+    }
+    throw Dsv4Error("checkpoint topology missing " + role + ": " + names.front());
+  };
+  require(topology.globals, "embedding", {"model.embed_tokens.weight"});
+  require(topology.globals, "final_norm", {"model.norm.weight"});
+  require(topology.globals, "lm_head", {"lm_head.weight"});
+  for (int64_t layer = 0; layer < num_layers; ++layer) {
+    std::map<std::string, std::string> bindings;
+    const std::string hf = "model.layers." + std::to_string(layer) + ".";
+    const std::string flat = "layers." + std::to_string(layer) + ".";
+    require(bindings, "input_norm", {hf + "input_layernorm.weight"});
+    require(bindings, "post_norm", {hf + "post_attention_layernorm.weight"});
+    require(bindings, "router", {hf + "mlp.gate.weight"});
+    require(bindings, "expert_gate", {hf + "mlp.experts.0.gate_proj.weight"});
+    if (has(flat + "hc_attn_base") || has(flat + "hc_ffn_base")) {
+      require(bindings, "attention", {flat + "hc_attn_base"});
+      require(bindings, "feed_forward", {flat + "hc_ffn_base"});
+    } else {
+      require(bindings, "attention", {hf + "self_attn.q_proj.weight", hf + "self_attn.q_a_proj.weight",
+                                      flat + "attn.wq_a.weight"});
+      require(bindings, "attention_output", {hf + "self_attn.o_proj.weight",
+                                             hf + "self_attn.o_proj_folded.weight", flat + "attn.wo_b.weight"});
+    }
+    topology.layers.push_back(std::move(bindings));
+  }
+  return topology;
+}
+
 int64_t DivideUp(int64_t value, int64_t divisor) { return (value + divisor - 1) / divisor; }
 size_t Fp8Bytes(int64_t elements) { return static_cast<size_t>(elements); }
 size_t Bf16Bytes(int64_t elements) { return static_cast<size_t>(elements) * 2; }
@@ -245,7 +360,9 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
 
   auto ingest = [&](ArenaHandle handle, const std::string& name, bool required) -> bool {
     const size_t bytes = arena_.Bytes(handle);
-    if (!source.HasNamed(name)) {
+    const std::string resolved = ResolveCheckpointTensorName(
+        name, [&](const std::string& candidate) { return source.HasNamed(candidate); });
+    if (resolved.empty()) {
       DSV4_REQUIRE(!required,
                    "the checkpoint has no tensor '"
                        << name
@@ -255,13 +372,14 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
                           "accuracy without saying so.");
       return false;
     }
-    const size_t available = source.NamedByteSize(name);
+    const size_t available = source.NamedByteSize(resolved);
     DSV4_REQUIRE(available == 0 || available == bytes,
-                 "tensor '" << name << "' holds " << available << " bytes, the arena reserved " << bytes);
+                 "tensor '" << resolved << "' (requested '" << name << "') holds " << available
+                             << " bytes, the arena reserved " << bytes);
     uint8_t* destination = arena_.AddressAs<uint8_t>(handle);
     for (size_t offset = 0; offset < bytes; offset += kTransferChunkBytes) {
       const size_t count = std::min(kTransferChunkBytes, bytes - offset);
-      source.ReadNamed(name, staging, kTransferChunkBytes, offset, count);
+      source.ReadNamed(resolved, staging, kTransferChunkBytes, offset, count);
       streams_.MemcpySync(destination + offset, bytes - offset, staging, count, MemcpyKind::kHostToDevice);
     }
     return true;
@@ -282,7 +400,7 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
         {layer.q_b_scale, kFoldedQScaleName},
         {layer.kv_a_weight, "model.layers.{L}.self_attn.kv_a_proj_with_mqa.weight"},
         {layer.kv_a_scale, "model.layers.{L}.self_attn.kv_a_proj_with_mqa.weight_scale_inv"},
-        {layer.kv_a_norm, "model.layers.{L}.self_attn.q_a_layernorm.weight"},
+        {layer.kv_a_norm, "model.layers.{L}.self_attn.kv_a_layernorm.weight"},
         {layer.o_weight, kFoldedOName},
         {layer.o_scale, kFoldedOScaleName},
         {layer.post_norm, "model.layers.{L}.post_attention_layernorm.weight"},

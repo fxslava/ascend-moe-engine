@@ -15,7 +15,7 @@
  */
 
 // The test-facing surface of libopapi_mock: direct declarations of the
-// operator entry points dsv4_mock_test calls (the dsv4 product reaches them
+// operator entry points mock_pipeline_e2e calls (the dsv4 product reaches them
 // through dlsym, so no product header declares them) plus the validator
 // entry points that skip executor plumbing for negative cases.
 

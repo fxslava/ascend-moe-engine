@@ -52,7 +52,7 @@ namespace mock {
 // transit scratch product code writes through directly: the exclusive
 // hierarchy memsets and stages its transfers across the DEFAULT
 // kTransferChunkBytes (4 MiB) chunk on the host, so the real tier has to
-// cover it or moe_runner crashes in mock mode where dsv4_mock_test (which
+// cover it or moe_runner crashes in mock mode where mock_pipeline_e2e (which
 // lowers its chunk to 512 KiB) does not.
 inline constexpr size_t kMockRealHostMaxBytes = 8ull << 20;  // 8 MiB
 

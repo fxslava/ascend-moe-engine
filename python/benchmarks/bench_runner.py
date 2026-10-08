@@ -27,7 +27,7 @@ is the honest number for this graph shape and is labeled as such in output.
 
 Usage::
 
-    python -m benchmarks.bench_runner --engine build_cann/moe_runner \
+    python -m benchmarks.bench_runner --engine build_cann/apps/moe_runner \
         --context-lengths 128,512,2048 --new-tokens 32 \
         --weights /mnt/c/models/DeepSeek-V4-Flash --out results.json
 """
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m benchmarks.bench_runner",
         description="TTFT / TPOT / swap sweep over moe_runner runs (zero torch).",
     )
-    parser.add_argument("--engine", default="build_cann/moe_runner", help="path to the moe_runner binary")
+    parser.add_argument("--engine", default="build_cann/apps/moe_runner", help="path to the moe_runner binary")
     parser.add_argument("--context-lengths", default="128,512,2048",
                         help="comma-separated prompt lengths to sweep (default 128,512,2048)")
     parser.add_argument("--new-tokens", type=int, default=32, help="generated tokens per run (default 32)")

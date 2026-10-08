@@ -47,7 +47,7 @@ aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
 // aclrtMallocHost actually serve -- page-aligned, huge-page-friendly memory --
 // and the arena's contract is stated on ABSOLUTE descriptor addresses, so the
 // simulator must hand out at least the finest alignment any reservation asks
-// for (moe_contract_smoke checks a 4096-byte reservation on its absolute
+// for (mock_contract_smoke checks a 4096-byte reservation on its absolute
 // address, not just its offset).
 void* AlignedHostAlloc(size_t bytes, size_t alignment = kSimDeviceAllocAlignBytes) {
   const size_t rounded = ((bytes + alignment - 1) / alignment) * alignment;

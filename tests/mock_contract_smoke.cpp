@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// dsv4_contract_smoke -- the parts of this runner that can be verified without
+// mock_contract_smoke -- the parts of this runner that can be verified without
 // an NPU attached, actually verified.
 //
 // This is not a compile check. The exclusive swap engine runs here for real,
@@ -23,7 +23,7 @@
 // ordering, the LRU victim choice, the byte-exact round trip of an evicted
 // expert, the poisoning on a failed transfer, and every refusal the sealed
 // arena is supposed to make. It also resolves the operator table against the
-// linked CANN libraries, which proves the link and the ABI without a device.
+// linked mock library, which proves the mock link and ABI without a device.
 //
 // What it cannot check, and says so: anything that needs a 950PR -- the real
 // `GetWorkspaceSize` numbers, whether a kernel exists for every op on the part,
@@ -208,7 +208,7 @@ void TestExpertBindingValidation() {
   const ExpertSlotLayout layout = ExpertSlotLayout::ForGeometry(64, 64);
   Check(layout.slot_num_bytes() == 6528, "the 64x64 test geometry packs into a 6,528-byte slot");
 
-  const char* path = "/tmp/dsv4_contract_smoke_experts.safetensors";
+  const char* path = "/tmp/mock_contract_smoke_experts.safetensors";
   std::vector<uint8_t> slot(layout.slot_num_bytes());
 
   // The admissible checkpoint: packed-FP4 weights and UE8M0 block scales.
@@ -367,6 +367,10 @@ void TestLayerPlanning() {
   experts.Synchronize();
   experts.ValidateResidency();
   Check(true, "the residency invariant still holds after six exchanges");
+  const auto& cache = experts.cache_stats();
+  Check(cache.total_expert_requests == 12 && cache.hbm_slot_hits == 6 && cache.host_promotions == 6 &&
+            cache.evictions_to_host == 6 && cache.HitRate() == 0.5,
+        "cache telemetry counts hits and completed promotions/evictions, excluding the refused plan");
 
   const DmaCounters& counters = device.counters();
   const size_t slot_bytes = layout.slot_num_bytes();
@@ -677,7 +681,7 @@ void TestMoeBlockSlotContract() {
 
 int main() {
   using namespace ascend_moe;
-  std::printf("dsv4_contract_smoke -- device-free verification of the DSV4 runner's contracts\n");
+  std::printf("mock_contract_smoke -- device-free verification of the DSV4 runner's contracts\n");
   try {
     TestExpertLayout();
     TestHeaderParsing();

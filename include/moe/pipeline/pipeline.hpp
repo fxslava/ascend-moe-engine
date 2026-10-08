@@ -224,6 +224,7 @@ class Dsv4Pipeline {
   int32_t ReadArgmaxToken();
 
   const StepCounters& counters() const { return counters_; }
+  const InferenceDiagnostics& diagnostics() const { return diagnostics_; }
   const StaticArenaManager& arena_manager() const { return arena_manager_; }
   const MoeRouterEngine& router() const { return router_; }
   const IRoutedMoeBlock& moe_block() const { return *moe_block_; }
@@ -267,6 +268,7 @@ class Dsv4Pipeline {
   static constexpr size_t kMaxPipelineStages = 40;
   StaticOpSlotTable stages_ = StaticOpSlotTable(kMaxPipelineStages, "pipeline");
   StepCounters counters_;
+  InferenceDiagnostics diagnostics_;
 
   // The six active experts' region addresses at descriptor time; the MoE
   // block plans against the same map.

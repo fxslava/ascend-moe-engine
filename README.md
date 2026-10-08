@@ -36,27 +36,68 @@ cmake --build build_cann --target dsv4_verify_linkage   # zero undefined symbols
 ## Run
 
 ```bash
-./build_cann/moe_runner --weights /mnt/c/models/DeepSeek-V4-Flash \
+./build_cann/apps/moe_runner --weights /mnt/c/models/DeepSeek-V4-Flash \
     --prompt-ids 7 --max-new-tokens 32 --stats-json stats.json
-./build_cann/moe_runner --config /mnt/c/models/DeepSeek-V4-Flash/config.json --dry-run
+./build_cann/apps/moe_runner --config /mnt/c/models/DeepSeek-V4-Flash/config.json --dry-run
 ```
 
 `--stats-json` emits the machine-readable run record (TTFT, TPOT, swap
 bytes, launch/residency counters) that `python/benchmarks` consumes.
 
+`--diag-json` exports structured inference diagnostics in both dry runs and
+decode runs. TTFT includes prefill and the first synchronized token readback;
+TPOT averages subsequent generated tokens (null when fewer than two). Entropy
+and perplexity are null until measured. Attention is currently dense MLA, so
+the observed sparsity ratio is zero, not the hypothetical Top-512 reduction.
+KV block counts sum the reservations across all 43 layers; utilization is the
+active context divided by the rounded reserved capacity per layer. MoE counters
+exclude startup ingestion and count expert requests, HBM hits, promotions, and
+evictions during routing.
+
+```bash
+./build_mock/apps/moe_runner \
+    --config /mnt/c/models/DeepSeek-V4-Flash/config.json \
+    --synthetic-weights --prompt-tokens 128 --max-new-tokens 1 \
+    --diag-json test_diag.json --dry-run
+```
+
+The dry run builds and plans without decoding, so latencies remain null and
+request counters remain zero. Omit `--dry-run` to exercise the full pipeline.
+`--prompt-tokens` supplies dummy zero IDs and requires synthetic weights. The
+mock build uses symbolic weights and seeded routing/token outputs; its timing
+measures host simulation, not NPU performance or model quality.
+
 ## Tests (`tests/`)
 
 | binary | what it proves | needs a device? |
 | --- | --- | --- |
-| `moe_contract_smoke` | slot layout, safetensors binding, hierarchy invariants, arena, model-config contract | no |
-| `test_cann_backend_probe` | ACL device query (init / count / SoC / HBM) + the six required operator symbols via `dlsym` | no (device section SKIPs) |
-| `test_weights_ingest_probe` | shard-00001 header parse + one real pinned→HBM DMA path | yes (`DSV4_MODEL_DIR`/`--model-dir`; SKIPs otherwise) |
-| `test_e2e_single_token` | one full 43-layer decode step: zero deadlocks, zero stream errors, 0 in-step allocations | mock: no; real: `--coverage` |
-| `dsv4_mock_test` | the full symbolic suite (mock build only) | no |
+| `mock_contract_smoke` | slot layout, safetensors binding, hierarchy invariants, arena, model-config contract | no |
+| `npu_backend_probe` | ACL device query (init / count / SoC / HBM) + the six required operator symbols via `dlsym` | yes |
+| `npu_weights_ingest_probe` | shard-00001 header parse + one real pinned→HBM DMA path | yes (`DSV4_MODEL_DIR`/`--model-dir`; SKIPs otherwise) |
+| `npu_e2e_single_token` | one full 43-layer decode step: zero deadlocks, zero stream errors, 0 in-step allocations | yes, explicit `--coverage` |
+| `mock_pipeline_e2e` | the full symbolic suite (mock build only) | no |
+| `mock_safetensors_index_probe` | headers, aliases, HF/HC topology, all local expert descriptors; no shard payloads | no |
+
+`ENABLE_MOCK_RUNTIME=ON` builds only `mock_*` tests; `OFF` builds only
+`npu_*` tests. Binaries live in `build_*/tests/`, and CTest labels are `mock`
+and `npu`. There are no CANN dependencies in the mock suite.
 
 All probes exit 0 with `[ SKIP ]` when the capability they probe is genuinely
 absent on the host (no weights dir, no NPU); they fail only when a present
 capability misbehaves.
+
+NPU probes print `[ SKIP ] Physical Ascend NPU not detected` when ACL cannot
+initialize or reports no device. A driverless CANN container must still have
+its shared libraries loadable before `main`: for skip-path testing only, add
+the toolkit's `x86_64-linux/devlib/linux/x86_64` directory to `LD_LIBRARY_PATH`
+alongside `x86_64-linux/lib64`. Use real driver libraries on the server.
+
+Embedding lookup prefers `model.embed_tokens.weight`, then `embed.weight`,
+then `embed_tokens.weight`. HC attention/FFN base keys are layout markers;
+they never substitute for RMSNorm or projection weights. MTP keys are ignored
+by backbone resolution. Passing the index probe does not certify shape/dtype
+or folded-MLA execution compatibility; checkpoint conversion is still required
+where the runner's absorbed projections are absent.
 
 ## Python harness (`python/`, zero torch)
 
@@ -67,12 +108,12 @@ cd python
 python -m tokenizer.dsv4_tokenizer "Hello DeepSeek"
 
 # TTFT/TPOT + swap sweep across context lengths (engine as subprocess):
-python -m benchmarks.bench_runner --engine ../build_cann/moe_runner \
+python -m benchmarks.bench_runner --engine ../build_cann/apps/moe_runner \
     --context-lengths 128,512,2048 --new-tokens 32 \
     --weights /mnt/c/models/DeepSeek-V4-Flash --out results.json
 
 # operator timeline via msprof, summarized on the CLI:
-python -m benchmarks.profile_cann --engine ../build_cann/moe_runner \
+python -m benchmarks.profile_cann --engine ../build_cann/apps/moe_runner \
     --engine-args "--synthetic-weights --prompt-ids 7 --max-new-tokens 4" \
     --output prof_out
 ```

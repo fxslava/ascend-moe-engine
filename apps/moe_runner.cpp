@@ -44,6 +44,11 @@
 #include "moe/pipeline/pipeline.hpp"
 #include "moe/pipeline/standard_aclnn_moe_block.hpp"
 #include "moe/core/weight_source.hpp"
+#include "moe/diagnostics/inference_stats.hpp"
+#if ASCEND_MOCK_RUNTIME
+#include "mock_allocator.hpp"
+#include "mock_weight_source.hpp"
+#endif
 
 namespace ascend_moe {
 namespace {
@@ -68,6 +73,7 @@ void PrintUsage() {
       "                            an error)\n"
       "  --prompt \"...\"            prompt text (token ids are read from --prompt-ids)\n"
       "  --prompt-ids a,b,c        explicit prompt token ids; this runner embeds no tokenizer\n"
+      "  --prompt-tokens <n>      synthesize n zero token IDs (requires --synthetic-weights)\n"
       "  --max-new-tokens <n>      tokens to generate (default 512)\n"
       "  --vram-slots <K>          resident routed-expert slots in HBM (default: as many as fit)\n"
       "  --device <id>             NPU device id (default 0)\n"
@@ -88,6 +94,7 @@ void PrintUsage() {
       "  --dry-run                 build, plan, report and exit without decoding; with no weights\n"
       "                            given, parse and validate the model configuration only\n"
       "  --report <path>           write the full report there as well as to stdout\n"
+      "  --diag-json <path>        structured diagnostics, including dry runs; null if unmeasured\n"
       "  --stats-json <path>       write machine-readable run stats (TTFT, TPOT, swap bytes, launch\n"
       "                            counters) there after a decode; consumed by python/benchmarks\n"
       "  --verbose                 print the arena ledger and operator inventory\n"
@@ -121,6 +128,8 @@ struct Arguments {
   std::vector<int32_t> prompt_ids;
   std::string model_config_path;  // empty = no --config flag given
   std::string stats_json_path;    // empty = no --stats-json flag given
+  std::string diag_json_path;
+  int64_t prompt_tokens = 0;
   bool help = false;
 };
 
@@ -144,6 +153,9 @@ Arguments ParseArguments(int argc, char** argv) {
       config.prompt = next("--prompt");
     } else if (flag == "--prompt-ids") {
       arguments.prompt_ids = ParseIdList(next("--prompt-ids"));
+    } else if (flag == "--prompt-tokens") {
+      arguments.prompt_tokens = ParseInt(next("--prompt-tokens"), "--prompt-tokens");
+      DSV4_REQUIRE(arguments.prompt_tokens > 0, "--prompt-tokens must be positive");
     } else if (flag == "--max-new-tokens") {
       config.max_new_tokens = ParseInt(next("--max-new-tokens"), "--max-new-tokens");
     } else if (flag == "--vram-slots") {
@@ -190,6 +202,8 @@ Arguments ParseArguments(int argc, char** argv) {
       config.report_path = next("--report");
     } else if (flag == "--stats-json") {
       arguments.stats_json_path = next("--stats-json");
+    } else if (flag == "--diag-json") {
+      arguments.diag_json_path = next("--diag-json");
     } else if (flag == "--verbose") {
       config.verbose = true;
     } else {
@@ -256,6 +270,26 @@ int Run(int argc, char** argv) {
   }
   RuntimeConfig& config = arguments.config;
 
+  DSV4_REQUIRE(config.max_context_len > 0 && config.block_size > 0,
+               "context length and block size must be positive");
+  DSV4_REQUIRE(config.max_new_tokens > 0, "--max-new-tokens must be positive");
+  if (arguments.prompt_tokens > 0) {
+    DSV4_REQUIRE(config.synthetic_weights && arguments.prompt_ids.empty(),
+                 "--prompt-tokens requires --synthetic-weights and cannot be combined with --prompt-ids");
+    DSV4_REQUIRE(arguments.prompt_tokens <= config.max_context_len, "synthetic prompt exceeds context capacity");
+    arguments.prompt_ids.assign(static_cast<size_t>(arguments.prompt_tokens), 0);
+  }
+  DSV4_REQUIRE(arguments.prompt_ids.size() <= static_cast<size_t>(config.max_context_len),
+               "prompt exceeds context capacity");
+  InferenceDiagnostics diagnostics;
+  diagnostics.synthetic_weights = config.synthetic_weights;
+  diagnostics.dry_run = config.dry_run;
+  diagnostics.prompt_tokens = arguments.prompt_ids.size();
+  diagnostics.paged_attention.block_size = static_cast<uint64_t>(config.block_size);
+#if ASCEND_MOCK_RUNTIME
+  diagnostics.mock_runtime = true;
+#endif
+
   // ---- the model configuration (Task: parse, assert, then plan) ---------
   std::string model_source;
   const ModelConfig model = LoadModelConfig(arguments, config, &model_source);
@@ -282,6 +316,7 @@ int Run(int argc, char** argv) {
   // A --dry-run with no weights is a configuration check: parse, validate,
   // report, exit -- no aclnn runtime, no device, no weight source.
   if (config.dry_run && config.weights_path.empty() && !config.synthetic_weights) {
+    if (!arguments.diag_json_path.empty()) diagnostics.DumpJson(arguments.diag_json_path);
     report << "\n--dry-run --config: model configuration parsed and validated; no device, no weights, "
               "no decode.\n";
     const std::string text = report.str();
@@ -326,6 +361,9 @@ int Run(int argc, char** argv) {
   options.top_k = model.num_experts_per_tok;
   options.routed_coverage = config.routed_coverage;
   options.device_slots = slots;
+#if ASCEND_MOCK_RUNTIME
+  options.host_available_bytes = 256ll << 30;  // interval bookkeeping, not physical pinned RAM
+#endif
   ExclusiveExpertManager experts(device, device, layout, options);
   report << experts.DescribeHierarchy();
 
@@ -347,7 +385,13 @@ int Run(int argc, char** argv) {
 
   std::unique_ptr<WeightByteSource> source;
   if (config.synthetic_weights) {
+#if ASCEND_MOCK_RUNTIME
+    source = std::make_unique<mock::SymbolicWeightSource>(layout, model.num_hidden_layers, model.n_routed_experts);
+    mock::MockSetD2HSeed(&mock::SeedSyntheticReadback);
+    report << "  mock outputs  synthetic routing and token readbacks; no numerical inference\n";
+#else
     source = std::make_unique<SyntheticWeightSource>(layout, model.num_hidden_layers, model.n_routed_experts);
+#endif
   } else {
     source = std::make_unique<SafetensorsWeightSource>(config.weights_path, layout, CheckpointNaming::kDsv4Flat,
                                                        model.num_hidden_layers, model.n_routed_experts);
@@ -358,6 +402,8 @@ int Run(int argc, char** argv) {
   // expert manager takes the routed slots and seals the source. Exactly one
   // owner closes it, and after that the hierarchy is the only copy.
   pipeline.Build(*source);
+  diagnostics = pipeline.diagnostics();
+  diagnostics.prompt_tokens = arguments.prompt_ids.size();
   experts.Ingest(*source, {});
   WeightByteSource::AssertNoOpenWeightDescriptors(config.synthetic_weights ? std::string() : config.weights_path);
   report << "  ingestion     " << (experts.stats().startup_bytes >> 20) << " MiB of routed experts, source '"
@@ -392,10 +438,11 @@ int Run(int argc, char** argv) {
     }
     int32_t token = pipeline.ReadArgmaxToken();
     first_token_time = std::chrono::steady_clock::now();
-    for (int64_t index = 0; index < config.max_new_tokens && position < config.max_context_len; ++index) {
-      generated.push_back(token);
+    generated.push_back(token);
+    for (int64_t index = 1; index < config.max_new_tokens && position < config.max_context_len; ++index) {
       pipeline.DecodeStep(token, position++);
       token = pipeline.ReadArgmaxToken();
+      generated.push_back(token);
     }
     const std::chrono::steady_clock::time_point decode_end = std::chrono::steady_clock::now();
     const double ttft_seconds =
@@ -404,6 +451,11 @@ int Run(int argc, char** argv) {
     const double total_seconds = std::chrono::duration<double>(decode_end - decode_start).count();
     const double tpot_seconds =
         generated.size() > 1 ? decode_span_seconds / static_cast<double>(generated.size() - 1) : 0.0;
+    diagnostics = pipeline.diagnostics();
+    diagnostics.prompt_tokens = arguments.prompt_ids.size();
+    diagnostics.generated_tokens = generated.size();
+    diagnostics.ttft_ms = ttft_seconds * 1000.0;
+    if (generated.size() > 1) diagnostics.tpot_ms = tpot_seconds * 1000.0;
     report << "\ngenerated " << generated.size() << " token ids:";
     for (int32_t id : generated) {
       report << " " << id;
@@ -418,7 +470,8 @@ int Run(int argc, char** argv) {
     report << "expert residency: " << counters.expert_slot_hits << " hits, " << counters.expert_slot_misses
            << " misses\n";
     report << "host synchronizations " << counters.host_synchronizations << " (expected "
-           << counters.steps * (model.num_hidden_layers + 1) << ": one per MoE layer plus one per step readback)\n";
+           << counters.steps * model.num_hidden_layers + generated.size()
+           << ": one per MoE layer plus one per generated-token readback)\n";
     report << "allocations inside a step " << counters.device_allocations_in_step << " (must be 0); descriptors "
            << counters.descriptors_built_in_step << " (must be 0)\n";
     DSV4_REQUIRE(counters.device_allocations_in_step == 0,
@@ -462,6 +515,11 @@ int Run(int argc, char** argv) {
 
   experts.Synchronize();
   experts.ValidateResidency();
+  diagnostics.moe_cache = experts.cache_stats();
+  if (!arguments.diag_json_path.empty()) {
+    diagnostics.DumpJson(arguments.diag_json_path);
+    report << "diagnostics written to " << arguments.diag_json_path << "\n";
+  }
   report << "exclusive residency invariant holds after the run.\n";
 
   const std::string text = report.str();

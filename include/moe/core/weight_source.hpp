@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "moe/memory/expert_layout.hpp"
+#include "moe/core/checkpoint_keys.hpp"
 
 namespace ascend_moe {
 
@@ -210,5 +211,8 @@ class SafetensorsWeightSource : public WeightByteSource {
 // handles -- it is not a general JSON parser and says so by throwing on
 // anything else.
 std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* text, size_t length);
+
+// Reads only the JSON index's name -> shard map. Does not open tensor shards.
+CheckpointIndex ParseSafetensorsIndexJson(const char* text, size_t length);
 
 }  // namespace ascend_moe

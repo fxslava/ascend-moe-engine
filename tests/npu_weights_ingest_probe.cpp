@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// test_weights_ingest_probe -- the ingestion path, end to end, one slot.
+// npu_weights_ingest_probe -- the ingestion path, end to end, one slot.
 //
 //   model dir (DSV4_MODEL_DIR or --model-dir)
 //     -> find safetensors shard 00001
@@ -31,6 +31,7 @@
 // is unreadable, or a DMA that returns a status, IS a failure.
 
 #include <acl/acl.h>
+#include "npu_test_support.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -162,7 +163,8 @@ bool ReadShardHeader(const std::string& path, std::vector<char>* header_json, ui
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::printf("test_weights_ingest_probe -- shard header + one pinned->HBM DMA, real bytes\n");
+  if (!PhysicalNpuPresent()) return 0;
+  std::printf("npu_weights_ingest_probe -- shard header + one pinned->HBM DMA, real bytes\n");
 
   const std::string model_dir = ModelDirFrom(argc, argv);
   if (model_dir.empty()) {
@@ -248,10 +250,7 @@ int main(int argc, char** argv) {
       if (file != nullptr) {
         // Chunked exactly like the exclusive hierarchy's ingestion: one
         // bounded pinned staging chunk, filled by the host, drained H2D,
-        // per chunk. A chunk must stay small enough that the mock's
-        // real-memory tier backs it (the mock gives symbolic memory above
-        // that bound; product code would write real bytes through a fake
-        // pointer).
+        // per chunk, bounding physical pinned staging memory.
         aclrtStream stream = nullptr;
         Check(aclrtCreateStream(&stream) == 0 && stream != nullptr, "aclrtCreateStream");
         uint64_t transferred = 0;

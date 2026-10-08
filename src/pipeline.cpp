@@ -140,6 +140,14 @@ void Dsv4Pipeline::Build(WeightByteSource& source) {
   PlanStages();
   arena_manager_.CommitWorkspace();
   arena_manager_.Seal();
+  diagnostics_.synthetic_weights = config_.synthetic_weights;
+  diagnostics_.dry_run = config_.dry_run;
+#if ASCEND_MOCK_RUNTIME
+  diagnostics_.mock_runtime = true;
+#endif
+  diagnostics_.paged_attention.block_size = static_cast<uint64_t>(config_.block_size);
+  diagnostics_.paged_attention.total_blocks_allocated =
+      static_cast<uint64_t>(arena_manager_.num_blocks() * kNumLayers);
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +560,11 @@ void Dsv4Pipeline::DecodeStep(int32_t token_id, int64_t position) {
   Launch(stages_.stage("argmax"));
 
   ++counters_.steps;
+  diagnostics_.decoded_steps = counters_.steps;
+  diagnostics_.moe_cache = experts_.cache_stats();
+  diagnostics_.paged_attention.active_context_tokens = static_cast<uint64_t>(position + 1);
+  diagnostics_.paged_attention.kv_cache_utilization = static_cast<double>(position + 1) /
+      static_cast<double>(arena_manager_.num_blocks() * config_.block_size);
   counters_.device_allocations_in_step += allocator_.DeviceAllocationCount() - allocations_before;
   counters_.descriptors_built_in_step += arena_manager_.arena().descriptors().size() - descriptors_before;
 }

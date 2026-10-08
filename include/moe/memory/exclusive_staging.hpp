@@ -72,6 +72,7 @@
 #include "moe/core/stream_engine.hpp"
 #include "moe/memory/expert_layout.hpp"
 #include "moe/core/weight_source.hpp"
+#include "moe/diagnostics/inference_stats.hpp"
 
 namespace ascend_moe {
 
@@ -205,6 +206,7 @@ class ExclusiveExpertManager {
   size_t host_bytes() const { return host_arena_bytes_; }
   size_t slot_num_bytes() const { return layout_.slot_num_bytes(); }
   const ExclusiveStagingStats& stats() const { return stats_; }
+  const MoeCacheStats& cache_stats() const { return cache_stats_; }
   const ExpertSlotLayout& layout() const { return layout_; }
 
   // Addresses that must never move after construction: the device arena, every
@@ -277,6 +279,7 @@ class ExclusiveExpertManager {
   bool ingested_ = false;
   bool poisoned_ = false;
   ExclusiveStagingStats stats_;
+  MoeCacheStats cache_stats_;
 };
 
 }  // namespace ascend_moe

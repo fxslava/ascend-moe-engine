@@ -483,10 +483,15 @@ void ExclusiveExpertManager::ExecutePlan(const LayerSwapPlan& plan, DeviceStream
                                          DeviceEvent compute_done) {
   RefuseIfPoisoned();
   DSV4_REQUIRE(ingested_, "the exclusive partition must be ingested before a layer is prepared");
+  DSV4_REQUIRE(plan.miss_count == 0 || compute_done != nullptr,
+               "ExecutePlan needs the compute-boundary event when the layer has a miss");
   ++layer_epoch_;
   ++stats_.layer_requests;
   stats_.slot_hits += static_cast<uint64_t>(plan.hit_count);
   stats_.slot_misses += static_cast<uint64_t>(plan.miss_count);
+  // PrepareLayer and callers using PlanLayer/ExecutePlan share this accounting.
+  cache_stats_.total_expert_requests += static_cast<uint64_t>(plan.count);
+  cache_stats_.hbm_slot_hits += static_cast<uint64_t>(plan.hit_count);
 
   // Touch every slot this layer reads, hits included, so the LRU order
   // reflects use rather than admission.
@@ -498,11 +503,6 @@ void ExclusiveExpertManager::ExecutePlan(const LayerSwapPlan& plan, DeviceStream
   if (plan.miss_count == 0) {
     return;  // nothing to transfer: no events, no gate, no stream touched
   }
-
-  DSV4_REQUIRE(compute_done != nullptr,
-               "ExecutePlan needs the compute-boundary event when the layer has a miss ("
-                   << plan.miss_count
-                   << " here): without it nothing orders this batch's overwrite after the previous layer's GEMM");
 
   // Two cross-resource hazards, both closed with events rather than a host
   // synchronization: the previous layer's expert GEMM may still be reading a
@@ -531,6 +531,8 @@ void ExclusiveExpertManager::ExecutePlan(const LayerSwapPlan& plan, DeviceStream
                    "expert key " << incoming_key << " lost its host slot between plan and execute");
 
       ExchangeSlot(slot, host_slot);
+      ++cache_stats_.host_promotions;
+      ++cache_stats_.evictions_to_host;
 
       // The promotee takes the device slot; the victim takes the host slot the
       // promotee just vacated. Exactly one location per expert, always.

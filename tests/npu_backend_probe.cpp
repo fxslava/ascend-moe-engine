@@ -14,29 +14,29 @@
  * limitations under the License.
  */
 
-// test_cann_backend_probe -- backend diagnostics without npu-smi.
+// npu_backend_probe -- backend diagnostics without npu-smi.
 //
 // Two sections, both read-only:
 //
 //   1. DEVICE: aclInit -> aclrtGetDeviceCount -> aclrtSetDevice(0) ->
 //      aclrtGetSocName -> aclrtGetMemInfo(ACL_HBM_MEM). Purely through the
 //      ACL C-APIs. No NPU attached (a build container, an x86 host) is a
-//      SKIP, not a failure -- the section simply does not apply. The mock
-//      runtime answers with one device, SoC "Ascend950PR-Mock".
+//      SKIP, not a failure -- the probe simply does not apply.
 //
 //   2. OPERATOR SYMBOLS: dlsym(RTLD_DEFAULT, ...) for the six GetWorkspaceSize
 //      entry points the decode graph plans against, with dladdr naming the
 //      providing shared object. This needs no device at all -- only that the
-//      toolkit (or libopapi_mock) is on the link line, which it is whenever
+//      toolkit is on the link line, which it is whenever
 //      this binary exists. A missing symbol is the difference between "this
 //      toolkit cannot run the model" and a confusing mid-run dlsym failure,
 //      which is exactly what this probe exists to surface early. No operator
 //      is invoked; nothing but symbol lookup happens.
 //
 // Exit status: 0 if every REQUIRED symbol resolved and no device claim was
-// false; 1 otherwise. A device-less host still exits 0 with [ SKIP ] lines.
+// false; 1 otherwise. A device-less host exits 0 before operator lookup.
 
 #include <acl/acl.h>
+#include "npu_test_support.hpp"
 
 #include <dlfcn.h>
 
@@ -150,8 +150,9 @@ bool ProbeDevice() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::printf("test_cann_backend_probe -- ACL device + operator-symbol diagnostics (no npu-smi)\n");
+  std::printf("npu_backend_probe -- ACL device + operator-symbol diagnostics (no npu-smi)\n");
   const bool require_device = argc > 1 && std::strcmp(argv[1], "--require-device") == 0;
+  if (!PhysicalNpuPresent()) return require_device ? 1 : 0;
 
   int failures_before_device = g_failures;
   const bool device_present = ProbeDevice();

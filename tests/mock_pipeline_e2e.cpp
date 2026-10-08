@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// dsv4_mock_test -- the zero-NPU, zero-allocation contract suite.
+// mock_pipeline_e2e -- the zero-NPU, zero-allocation contract suite.
 //
 // Runs natively on an x86 host (WSL) against libopapi_mock: the symbolic
 // allocator's interval registry, the shadow descriptor engine, the DeepSeek-V4
@@ -27,7 +27,11 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
+#include <sstream>
+#include <unistd.h>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -37,6 +41,7 @@
 #include "mock_ops_api.hpp"
 
 #include "moe/core/error.hpp"
+#include "moe/core/json.hpp"
 #include "moe/core/model_config.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/config.hpp"
@@ -617,6 +622,11 @@ void TestFullPipeline() {
   pipeline.Build(source);  // reserves, ingests, descriptors, PLANS EVERY STAGE
   experts.Ingest(source, {});
 
+  Check(pipeline.diagnostics().decoded_steps == 0 && !pipeline.diagnostics().ttft_ms &&
+            pipeline.diagnostics().paged_attention.total_blocks_allocated == 86 &&
+            pipeline.diagnostics().paged_attention.active_context_tokens == 0,
+        "planning reserves two KV blocks per layer without claiming decoded tokens or latency");
+
   Check(pipeline.arena_manager().arena().sealed(), "the arena is sealed after Build");
   Check(pipeline.arena_manager().arena().workspace_bytes() > 0, "the shared workspace holds the plan high-water mark");
   Check(pipeline.moe_block().GetExpertSlotBytes() == layout.slot_num_bytes(),
@@ -654,6 +664,16 @@ void TestFullPipeline() {
         "exactly the forced one-per-MoE-layer readback plus one per step");
   Check(counters.expert_slot_misses > 0 && counters.expert_slot_hits > 0,
         "the seeded routing produced both hits and misses across the swap engine");
+  const auto& diag = pipeline.diagnostics();
+  Check(diag.decoded_steps == 2 && diag.moe_cache.total_expert_requests == 2 * 43 * 6 &&
+            diag.moe_cache.hbm_slot_hits == counters.expert_slot_hits &&
+            diag.moe_cache.host_promotions == counters.expert_slot_misses &&
+            diag.moe_cache.evictions_to_host == diag.moe_cache.host_promotions,
+        "DecodeStep snapshots exact cache telemetry for two full layers-of-experts sweeps");
+  Check(diag.paged_attention.active_context_tokens == 2 && diag.paged_attention.block_size == 128 &&
+            diag.paged_attention.kv_cache_utilization == 2.0 / 256.0 &&
+            !diag.attention.attention_entropy && diag.attention.sparsity_ratio == 0.0,
+        "KV utilization reflects active tokens; dense attention does not invent entropy or sparsity");
 
   const MockMemoryStats& stats = MockMemoryStatistics();
   Check(stats.rejected_operations == 0,
@@ -671,18 +691,61 @@ void TestFullPipeline() {
   Check(rss_kb < 512 * 1024, "physical RSS stayed under 512 MiB (read " + std::to_string(rss_kb) + " kB)");
 }
 
+void TestDiagnosticsJson() {
+  Section("structured diagnostics: null measurements, counters, finite JSON, write failures");
+  struct TempFile {
+    char path[64] = "/tmp/dsv4-diag-XXXXXX";
+    TempFile() {
+      const int fd = ::mkstemp(path);
+      DSV4_REQUIRE(fd >= 0, "cannot create diagnostics fixture");
+      ::close(fd);
+    }
+    ~TempFile() { ::unlink(path); }
+  } file;
+  auto read = [&] {
+    std::ifstream input(file.path);
+    std::ostringstream text;
+    text << input.rdbuf();
+    return moe_json::Parse(text.str());
+  };
+  InferenceDiagnostics diag;
+  Check(diag.moe_cache.HitRate() == 0.0, "zero requests have a defined zero hit rate");
+  diag.DumpJson(file.path);
+  auto json = read();
+  Check(json.find("ttft_ms")->is_null() && json.find("tpot_ms")->is_null() &&
+            json.find("perplexity")->is_null() &&
+            json.find("attention")->find("attention_entropy")->is_null(), "unmeasured values serialize as null");
+  diag.moe_cache = {12, 3, 9, 9};
+  diag.ttft_ms = 1.25;
+  diag.tpot_ms = 0.5;
+  diag.perplexity = std::numeric_limits<double>::infinity();
+  diag.attention.attention_entropy = std::numeric_limits<double>::quiet_NaN();
+  diag.DumpJson(file.path);
+  json = read();
+  Check(json.find("ttft_ms")->as_number() == 1.25 && json.find("tpot_ms")->as_number() == 0.5 &&
+            json.find("moe_cache")->find("hit_rate")->as_number() == 0.25 &&
+            json.find("perplexity")->is_null() &&
+            json.find("attention")->find("attention_entropy")->is_null(),
+        "measured numbers are preserved; non-finite values never produce invalid JSON");
+  bool refused = false;
+  try { diag.DumpJson(std::string(file.path) + "/unwritable.json"); }
+  catch (const Dsv4Error&) { refused = true; }
+  Check(refused, "a failed diagnostics export is reported");
+}
+
 }  // namespace
 }  // namespace ascend_moe
 
 int main() {
   using namespace ascend_moe;
-  std::printf("dsv4_mock_test -- zero-NPU, zero-allocation contract suite over libopapi_mock\n");
+  std::printf("mock_pipeline_e2e -- zero-NPU, zero-allocation contract suite over libopapi_mock\n");
   try {
     TestIntervalRegistry();
     TestDescriptorEngine();
     TestOperatorContracts();
     TestModelConfig();
     TestFullPipeline();
+    TestDiagnosticsJson();
   } catch (const std::exception& error) {
     std::printf("\nunexpected exception: %s\n", error.what());
     ++g_failures;

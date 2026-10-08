@@ -6,5 +6,6 @@ compile_commands.json
 __pycache__/
 *.pyc
 stats.json
+test_diag.json
 results.json
 moe_prof_out/
