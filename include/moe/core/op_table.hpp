@@ -92,14 +92,21 @@ enum class OpId {
   kMoeTokenUnpermute,
   kGroupedMatmulSwigluQuantV2,
   kGroupedMatmulFinalizeRoutingV3,
-  // Vendored arch35 (Ascend 950PR) operators from third_party/ops_transformer:
-  // the mHC residual chain and the sparse-attention indexer front end. They
-  // resolve from libcust_opapi.so (CANN builds) or libopapi_mock.so (mock
-  // builds), never from the toolkit's own libopapi.
+  // Vendored arch35 (Ascend 950PR) DSV4 operators from third_party/ops_dsv4:
+  // the mHC residual chain, the sparse-attention indexer front end in both
+  // its forms, the token-level KV compressor, the shared-KV attention core
+  // and the two cache epilogs. They resolve from libcust_opapi.so (CANN
+  // builds) or libopapi_mock.so (mock builds), never from the toolkit's own
+  // libopapi.
   kMhcPre,
   kMhcSinkhorn,
   kMhcPost,
   kQuantLightningIndexer,
+  kCompressor,
+  kVllmQuantLightningIndexer,
+  kKvQuantSparseAttnSharedkv,
+  kKvCompressEpilog,
+  kIndexerCompressEpilogV2,
   kOpCount,
 };
 
@@ -872,7 +879,7 @@ using GroupedMatmulFinalizeRoutingV3PlanFn =
             uint64_t* workspace_size, aclOpExecutor** executor);
 
 // ---------------------------------------------------------------------------
-// Vendored ops-transformer arch35 operators (third_party/ops_transformer).
+// Vendored ops-transformer arch35 operators (third_party/ops_dsv4).
 // Prototypes: include/moe/ops/aclnn_dsv4_vendor_ops.h, transcribed from the
 // vendored op_host/op_api/aclnn_<op>.h headers.
 // ---------------------------------------------------------------------------
@@ -1004,6 +1011,221 @@ using QuantLightningIndexerPlanFn = int (*)(const aclTensor* query, const aclTen
                                             char* layout_key_optional, int64_t sparse_count, int64_t sparse_mode,
                                             int64_t pre_tokens, int64_t next_tokens, const aclTensor* out,
                                             uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnCompressor: plan phase (vendored arch35 custom op).
+ * @details Token-level KV compressor: project a window through wkv/wgate, add
+ * the positional bias, pool cmpRatio tokens with a softmax-weighted reduction,
+ * RMSNorm and apply the partial RoPE. cmp_ratio 4 is CSA, 128 is HCA.
+ * @note state_cache_ref is a REF parameter and is updated in place; it gets no
+ * ViewCopy, and cmp_kv_out is written through a distinct executor-owned
+ * tensor, so the returned executor is reusable (see @ref aclnn_contract).
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Token states, [T,H] or [B,S,H], BF16/FP16.
+ * @param[in] wkv Compressed-KV projection weight, dtype of x.
+ * @param[in] wgate Pooling-gate projection weight, dtype of x.
+ * @param[in,out] state_cache_ref Recurrent pooling state [blocks, blockSize, D]
+ * FP32; updated in place.
+ * @param[in] ape Absolute positional bias, FP32.
+ * @param[in] norm_weight RMSNorm gain, 1-D.
+ * @param[in] rope_sin RoPE sin table, rank of x.
+ * @param[in] rope_cos RoPE cos table, rank of x.
+ * @param[in] state_block_table_optional Paged state-cache map, INT32.
+ * @param[in] cu_seqlens_optional Cumulative sequence lengths, INT32.
+ * @param[in] seqused_optional Used length per batch, INT32.
+ * @param[in] start_pos_optional Window start per batch, INT32.
+ * @param[in] rope_head_dim RoPE head dimension (64).
+ * @param[in] cmp_ratio Compression ratio; 4 or 128.
+ * @param[in] coff Output-channel multiplier.
+ * @param[in] norm_eps RMSNorm epsilon.
+ * @param[in] rotary_mode RoPE interleaving mode.
+ * @param[in] cache_mode State-cache addressing mode.
+ * @param[in] state_cache_stride_dim0 Element stride of state-cache axis 0.
+ * @param[out] cmp_kv_out Compressed KV rows, dtype of x.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using CompressorPlanFn = int (*)(const aclTensor* x, const aclTensor* wkv, const aclTensor* wgate,
+                                 aclTensor* state_cache_ref, const aclTensor* ape, const aclTensor* norm_weight,
+                                 const aclTensor* rope_sin, const aclTensor* rope_cos,
+                                 const aclTensor* state_block_table_optional, const aclTensor* cu_seqlens_optional,
+                                 const aclTensor* seqused_optional, const aclTensor* start_pos_optional,
+                                 int64_t rope_head_dim, int64_t cmp_ratio, int64_t coff, double norm_eps,
+                                 int64_t rotary_mode, int64_t cache_mode, int64_t state_cache_stride_dim0,
+                                 const aclTensor* cmp_kv_out, uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnVllmQuantLightningIndexer: plan phase (vendored arch35 custom
+ * op).
+ * @details The shared-KV form of the quantized lightning indexer. Against
+ * aclnnQuantLightningIndexer it adds the scheduling-metadata input, the
+ * cmp_ratio / return_values attributes, the explicit key strides and the
+ * optional FP32 score output.
+ * @note Engine geometry: D=128, FP8 E4M3 or HiFloat8 query/key with BF16
+ * weights and FP32 dequant scales, PA_BSND key layout with a paged block
+ * table. Both outputs are staged through distinct executor-owned tensors, so
+ * the returned executor is reusable.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] query Index query, [B,S1,N1,D] or [T1,N1,D].
+ * @param[in] key Index key per layout_key_optional, N2=1, D=128.
+ * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], BF16/FP16.
+ * @param[in] query_dequant_scale Query dequant scales.
+ * @param[in] key_dequant_scale Key dequant scales, layout of key without D.
+ * @param[in] actual_seq_lengths_query_optional Cumulative query lengths, INT32.
+ * @param[in] actual_seq_lengths_key_optional Cumulative key lengths, INT32.
+ * @param[in] block_table_optional Paged-KV block map, INT32.
+ * @param[in] metadata_optional Precomputed scheduling metadata, INT32.
+ * @param[in] query_quant_mode Quantization mode; 0 = per-token-head.
+ * @param[in] key_quant_mode Quantization mode; 0 = per-token-head.
+ * @param[in] layout_query_optional Host layout string, "BSND" or "TND".
+ * @param[in] layout_key_optional Host layout string, "BSND"/"TND"/"PA_BSND".
+ * @param[in] sparse_count Top-k blocks retained, in [1, 2048].
+ * @param[in] sparse_mode 0 dense mask, 3 right-down causal.
+ * @param[in] pre_tokens Sparse window; INT64_MAX = unrestricted.
+ * @param[in] next_tokens Sparse window; INT64_MAX = unrestricted.
+ * @param[in] cmp_ratio Compression ratio of the key stream.
+ * @param[in] return_values true to fill sparse_values_out.
+ * @param[in] stride Element stride of the key axis 0.
+ * @param[in] scale_stride Element stride of the key_dequant_scale axis 0.
+ * @param[out] sparse_indices_out Selected sparse indices, INT32.
+ * @param[out] sparse_values_out Selected scores, FP32; a [0] tensor when
+ * return_values is false.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using VllmQuantLightningIndexerPlanFn =
+    int (*)(const aclTensor* query, const aclTensor* key, const aclTensor* weights,
+            const aclTensor* query_dequant_scale, const aclTensor* key_dequant_scale,
+            const aclTensor* actual_seq_lengths_query_optional, const aclTensor* actual_seq_lengths_key_optional,
+            const aclTensor* block_table_optional, const aclTensor* metadata_optional, int64_t query_quant_mode,
+            int64_t key_quant_mode, char* layout_query_optional, char* layout_key_optional, int64_t sparse_count,
+            int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_values,
+            int64_t stride, int64_t scale_stride, const aclTensor* sparse_indices_out,
+            const aclTensor* sparse_values_out, uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnKvQuantSparseAttnSharedkv: plan phase (vendored arch35 custom
+ * op).
+ * @details The shared-KV sparse attention core: one BF16 MQA query stream
+ * attends to both halves of the quantized hybrid KV cache -- the uncompressed
+ * (ori) stream and the compressor-produced compressed (cmp) stream -- each at
+ * its own sparse indices, block table and mask mode, with optional attention
+ * sinks folded into the softmax denominator.
+ * @note At least one of ori_kv_optional and cmp_kv_optional must be bound. The
+ * two paged caches are passed uncontiguized and their axis-0 strides travel as
+ * ori_kv_stride0 / cmp_kv_stride0. Both outputs are staged through distinct
+ * executor-owned tensors, so the returned executor is reusable.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] q Query, BF16, layout per layout_q_optional.
+ * @param[in] ori_kv_optional Uncompressed KV cache, FP8 E4M3.
+ * @param[in] cmp_kv_optional Compressed KV cache, FP8 E4M3.
+ * @param[in] ori_sparse_indices_optional INT32 indices into the ori stream.
+ * @param[in] cmp_sparse_indices_optional INT32 indices into the cmp stream.
+ * @param[in] ori_block_table_optional Paged block map for ori, INT32.
+ * @param[in] cmp_block_table_optional Paged block map for cmp, INT32.
+ * @param[in] cu_seqlens_q_optional Cumulative query lengths, INT32.
+ * @param[in] cu_seqlens_ori_kv_optional Cumulative ori KV lengths, INT32.
+ * @param[in] cu_seqlens_cmp_kv_optional Cumulative cmp KV lengths, INT32.
+ * @param[in] seqused_q_optional Used query length per batch, INT32.
+ * @param[in] seqused_kv_optional Used KV length per batch, INT32.
+ * @param[in] sinks_optional Attention sink logits, FP32.
+ * @param[in] metadata_optional Precomputed scheduling metadata, INT32.
+ * @param[in] kv_quant_mode KV quantization mode.
+ * @param[in] tile_size KV tile size (default 64).
+ * @param[in] rope_head_dim RoPE head dimension (default 64).
+ * @param[in] softmax_scale Logit scale.
+ * @param[in] cmp_ratio Compression ratio of the cmp stream; 4 or 128.
+ * @param[in] ori_mask_mode Mask mode for the ori stream (default 4).
+ * @param[in] cmp_mask_mode Mask mode for the cmp stream (default 3).
+ * @param[in] ori_win_left Sliding-window left bound.
+ * @param[in] ori_win_right Sliding-window right bound.
+ * @param[in] layout_q_optional Host layout string for q (default "BSND").
+ * @param[in] layout_kv_optional Host layout string for KV (default "PA_ND").
+ * @param[in] ori_kv_stride0 Element stride of the ori cache axis 0.
+ * @param[in] cmp_kv_stride0 Element stride of the cmp cache axis 0.
+ * @param[in] return_softmax_lse true to fill softmax_lse_out.
+ * @param[out] attn_out Attention output, BF16, shape of q.
+ * @param[out] softmax_lse_out Log-sum-exp, FP32; a [0] tensor when
+ * return_softmax_lse is false.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using KvQuantSparseAttnSharedkvPlanFn =
+    int (*)(const aclTensor* q, const aclTensor* ori_kv_optional, const aclTensor* cmp_kv_optional,
+            const aclTensor* ori_sparse_indices_optional, const aclTensor* cmp_sparse_indices_optional,
+            const aclTensor* ori_block_table_optional, const aclTensor* cmp_block_table_optional,
+            const aclTensor* cu_seqlens_q_optional, const aclTensor* cu_seqlens_ori_kv_optional,
+            const aclTensor* cu_seqlens_cmp_kv_optional, const aclTensor* seqused_q_optional,
+            const aclTensor* seqused_kv_optional, const aclTensor* sinks_optional,
+            const aclTensor* metadata_optional, int64_t kv_quant_mode, int64_t tile_size, int64_t rope_head_dim,
+            double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode,
+            int64_t ori_win_left, int64_t ori_win_right, char* layout_q_optional, char* layout_kv_optional,
+            int64_t ori_kv_stride0, int64_t cmp_kv_stride0, bool return_softmax_lse, const aclTensor* attn_out,
+            const aclTensor* softmax_lse_out, uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnKvCompressEpilog: plan phase (vendored arch35 custom op).
+ * @details Quantize the compressed-KV rows x and scatter them into the paged
+ * FP8 cache at the slots slot_mapping names.
+ * @note kv_compress_cache_ref is a REF parameter: it is the input AND the
+ * output, is written in place, and receives no ViewCopy -- so the returned
+ * executor is reusable under @ref aclnn_contract.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in,out] kv_compress_cache_ref Paged FP8 E5M2/E4M3 cache.
+ * @param[in] x Compressed KV rows to store, BF16.
+ * @param[in] slot_mapping Destination slot per row, INT32/INT64.
+ * @param[in] quant_group_size Elements per quant group (128 on 950PR).
+ * @param[in] quant_mode Quantization mode.
+ * @param[in] round_scale 1 to round the scale to a power of two.
+ * @param[in] layout Cache layout selector.
+ * @param[in] block_stride Element stride of the cache block axis.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using KvCompressEpilogPlanFn = int (*)(aclTensor* kv_compress_cache_ref, const aclTensor* x,
+                                       const aclTensor* slot_mapping, int64_t quant_group_size, int64_t quant_mode,
+                                       int64_t round_scale, int64_t layout, int64_t block_stride,
+                                       uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnIndexerCompressEpilogV2: plan phase (vendored arch35 custom op).
+ * @details Scatter the indexer-side compressed rows x into the paged UINT8
+ * indexer cache at the slots slot_mapping names.
+ * @note indexer_compress_cache_ref is a REF parameter: it is the input AND the
+ * output, is written in place, and receives no ViewCopy -- so the returned
+ * executor is reusable under @ref aclnn_contract.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in,out] indexer_compress_cache_ref Paged UINT8 indexer cache.
+ * @param[in] x Rows to store, FP16 or BF16.
+ * @param[in] slot_mapping Destination slot per row, INT32.
+ * @param[in] layout Cache layout selector.
+ * @param[in] block_stride Element stride of the cache block axis.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using IndexerCompressEpilogV2PlanFn = int (*)(aclTensor* indexer_compress_cache_ref, const aclTensor* x,
+                                              const aclTensor* slot_mapping, int64_t layout, int64_t block_stride,
+                                              uint64_t* workspace_size, aclOpExecutor** executor);
 
 /**
  * @brief Shared second-phase ABI for every imported ACLNN operator.

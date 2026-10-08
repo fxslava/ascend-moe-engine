@@ -678,6 +678,248 @@ void TestVendorMhcArena() {
   arena.Seal();
 }
 
+// The compressed-KV front end over the same arena discipline: the token-level
+// compressor, the shared-KV indexer, the shared-KV attention core and the two
+// cache epilogs. This checks the layout (every reservation lands in its own
+// non-overlapping byte range at its requested alignment, and every tensor
+// stays inside the reservation it was cut from) and that one shared workspace
+// reservation covers the whole five-operator chain.
+void TestVendorSharedKvArena() {
+  Section("vendored compressed-KV chain: arena layout and the shared workspace bound");
+  constexpr int64_t kTokensArena = 128;      // divisible by both compression ratios
+  constexpr int64_t kHeadsArena = 64;        // DSV4 query heads / indexer N1
+  constexpr int64_t kIndexerDim = 128;       // indexer head dim
+  constexpr int64_t kTotalHeadDim = 512;     // DSV4 MLA total head dim
+  constexpr int64_t kBlocksArena = 8;
+  constexpr int64_t kBlockSizeArena = 128;
+  constexpr int64_t kSparseCount = 16;
+  constexpr int64_t kCmpChannels = 256;
+  constexpr int64_t kRopeHeadDim = 64;
+  constexpr int64_t kStateDim = 128;
+  constexpr int64_t kCmpRatio = 4;           // CSA
+  constexpr int64_t kCompressedRows = kTokensArena / kCmpRatio;
+
+  SimulatedDeviceOps device(4ull << 30);
+  StaticMemoryArena arena(device);
+
+  // One reservation per lifetime class, as the decode path lays it out. The
+  // indexer cache is deliberately shared: indexer_compress_epilog_v2 writes
+  // the quantized key stream that the shared-KV indexer then scores.
+  const size_t ori_kv_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * kTotalHeadDim;   // FP8
+  const size_t cmp_kv_bytes = ori_kv_bytes;                                                          // FP8
+  const size_t idx_cache_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * kIndexerDim;  // UINT8
+  const size_t attn_query_bytes = static_cast<size_t>(kTokensArena) * kHeadsArena * kTotalHeadDim * 2;
+  const size_t attn_out_bytes = attn_query_bytes;
+  const size_t idx_query_bytes = static_cast<size_t>(kTokensArena) * kHeadsArena * kIndexerDim;      // FP8
+  const size_t weight_bytes = static_cast<size_t>(kHiddenSize) * kCmpChannels * 2 +                  // wkv BF16
+                              static_cast<size_t>(kHiddenSize) * 2;                                  // wgate BF16
+  const size_t staging_bytes = static_cast<size_t>(kTokensArena) * kHiddenSize * 2 +                 // x BF16
+                               static_cast<size_t>(kCompressedRows) * kCmpChannels * 2 +             // cmp rows BF16
+                               static_cast<size_t>(kCompressedRows) * kIndexerDim * 2;               // idx rows BF16
+  const size_t state_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * kStateDim * 4;    // FP32
+  const size_t k_scale_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * 4;              // FP32
+  // Scratch: every small per-token vector the five operators bind, laid out
+  // back to back by the cursor below. Sized generously; the assertion that
+  // matters is that the cursor never leaves the reservation.
+  const size_t scratch_bytes = 1u << 20;
+
+  const ArenaHandle h_ori = arena.Reserve("kv.ori", ori_kv_bytes, 4096);
+  const ArenaHandle h_cmp = arena.Reserve("kv.cmp", cmp_kv_bytes, 4096);
+  const ArenaHandle h_idx = arena.Reserve("kv.indexer", idx_cache_bytes, 4096);
+  const ArenaHandle h_attn_q = arena.Reserve("attn.query", attn_query_bytes, 4096);
+  const ArenaHandle h_attn_out = arena.Reserve("attn.out", attn_out_bytes, 4096);
+  const ArenaHandle h_idx_q = arena.Reserve("indexer.query", idx_query_bytes, 4096);
+  const ArenaHandle h_weights = arena.Reserve("compressor.weights", weight_bytes, 4096);
+  const ArenaHandle h_staging = arena.Reserve("compressor.staging", staging_bytes, 4096);
+  const ArenaHandle h_state = arena.Reserve("compressor.state", state_bytes, 4096);
+  const ArenaHandle h_k_scale = arena.Reserve("indexer.key_scale", k_scale_bytes, 4096);
+  const ArenaHandle h_scratch = arena.Reserve("vendor.scratch", scratch_bytes, 512);
+
+  arena.Commit();
+
+  // Layout: each reservation at its requested alignment, in its own byte range.
+  struct Span {
+    const char* name;
+    const char* base;
+    size_t bytes;
+    size_t align;
+  };
+  const Span spans[] = {
+      {"kv.ori", static_cast<const char*>(arena.Address(h_ori)), ori_kv_bytes, 4096},
+      {"kv.cmp", static_cast<const char*>(arena.Address(h_cmp)), cmp_kv_bytes, 4096},
+      {"kv.indexer", static_cast<const char*>(arena.Address(h_idx)), idx_cache_bytes, 4096},
+      {"attn.query", static_cast<const char*>(arena.Address(h_attn_q)), attn_query_bytes, 4096},
+      {"attn.out", static_cast<const char*>(arena.Address(h_attn_out)), attn_out_bytes, 4096},
+      {"indexer.query", static_cast<const char*>(arena.Address(h_idx_q)), idx_query_bytes, 4096},
+      {"compressor.weights", static_cast<const char*>(arena.Address(h_weights)), weight_bytes, 4096},
+      {"compressor.staging", static_cast<const char*>(arena.Address(h_staging)), staging_bytes, 4096},
+      {"compressor.state", static_cast<const char*>(arena.Address(h_state)), state_bytes, 4096},
+      {"indexer.key_scale", static_cast<const char*>(arena.Address(h_k_scale)), k_scale_bytes, 4096},
+      {"vendor.scratch", static_cast<const char*>(arena.Address(h_scratch)), scratch_bytes, 512},
+  };
+  constexpr size_t kSpanCount = sizeof(spans) / sizeof(spans[0]);
+  bool aligned = true;
+  bool disjoint = true;
+  for (size_t i = 0; i < kSpanCount; ++i) {
+    if (reinterpret_cast<uintptr_t>(spans[i].base) % spans[i].align != 0) {
+      aligned = false;
+      std::printf("  NOTE: %s is not %zu-aligned\n", spans[i].name, spans[i].align);
+    }
+    for (size_t j = i + 1; j < kSpanCount; ++j) {
+      const char* a_end = spans[i].base + spans[i].bytes;
+      const char* b_end = spans[j].base + spans[j].bytes;
+      if (spans[i].base < b_end && spans[j].base < a_end) {
+        disjoint = false;
+        std::printf("  NOTE: %s overlaps %s\n", spans[i].name, spans[j].name);
+      }
+    }
+  }
+  Check(aligned, "every compressed-KV reservation lands at its requested alignment");
+  Check(disjoint,
+        "the eleven compressed-KV reservations occupy strictly non-overlapping byte ranges");
+
+  const auto make = [&](ArenaHandle handle, size_t offset, const std::vector<int64_t>& shape, aclDataType dtype) {
+    void* base = static_cast<char*>(arena.Address(handle)) + offset;
+    return aclCreateTensor(shape.data(), shape.size(), dtype, nullptr, 0, ACL_FORMAT_ND, shape.data(), shape.size(),
+                           base);
+  };
+
+  // A bump cursor over vendor.scratch, 64-byte spaced, that refuses to leave
+  // the reservation -- the layout property this section exists to assert.
+  size_t scratch_cursor = 0;
+  bool scratch_fits = true;
+  const auto scratch = [&](const std::vector<int64_t>& shape, aclDataType dtype, size_t element_bytes) {
+    size_t elements = 1;
+    for (int64_t dim : shape) {
+      elements *= static_cast<size_t>(dim);
+    }
+    const size_t offset = scratch_cursor;
+    scratch_cursor += ((elements * element_bytes) + 63) & ~size_t(63);
+    if (scratch_cursor > scratch_bytes) {
+      scratch_fits = false;
+    }
+    return make(h_scratch, offset, shape, dtype);
+  };
+
+  // -- the compressor -------------------------------------------------------
+  aclTensor* comp_x = make(h_staging, 0, {kTokensArena, kHiddenSize}, ACL_BF16);
+  size_t staging_cursor = static_cast<size_t>(kTokensArena) * kHiddenSize * 2;
+  aclTensor* cmp_rows = make(h_staging, staging_cursor, {kCompressedRows, kCmpChannels}, ACL_BF16);
+  staging_cursor += static_cast<size_t>(kCompressedRows) * kCmpChannels * 2;
+  aclTensor* idx_rows = make(h_staging, staging_cursor, {kCompressedRows, kIndexerDim}, ACL_BF16);
+  staging_cursor += static_cast<size_t>(kCompressedRows) * kIndexerDim * 2;
+  Check(staging_cursor <= staging_bytes,
+        "the compressor staging tensors fit inside the compressor.staging reservation");
+
+  aclTensor* wkv = make(h_weights, 0, {kHiddenSize, kCmpChannels}, ACL_BF16);
+  aclTensor* wgate = make(h_weights, static_cast<size_t>(kHiddenSize) * kCmpChannels * 2, {kHiddenSize, 1},
+                          ACL_BF16);
+  aclTensor* state_cache = make(h_state, 0, {kBlocksArena, kBlockSizeArena, kStateDim}, ACL_FLOAT32);
+
+  aclTensor* ape = scratch({kTokensArena}, ACL_FLOAT32, 4);
+  aclTensor* norm_weight = scratch({kCmpChannels}, ACL_FLOAT32, 4);
+  aclTensor* rope_sin = scratch({kTokensArena, kRopeHeadDim}, ACL_FLOAT32, 4);
+  aclTensor* rope_cos = scratch({kTokensArena, kRopeHeadDim}, ACL_FLOAT32, 4);
+  aclTensor* slot_map = scratch({kCompressedRows}, ACL_INT32, 4);
+  aclTensor* ori_indices = scratch({kTokensArena, 1, kSparseCount}, ACL_INT32, 4);
+  aclTensor* cmp_indices = scratch({kTokensArena, 1, kSparseCount}, ACL_INT32, 4);
+  aclTensor* block_table = scratch({1, kBlocksArena}, ACL_INT32, 4);
+  aclTensor* seq_lengths = scratch({1}, ACL_INT32, 4);
+  aclTensor* idx_weights = scratch({kTokensArena, kHeadsArena}, ACL_BF16, 2);
+  aclTensor* idx_q_scale = scratch({kTokensArena, kHeadsArena}, ACL_FLOAT32, 4);
+  // returnValues / returnSoftmaxLse false are signalled by [0] placeholders,
+  // which is what the vendored wrappers check before issuing a second copy.
+  aclTensor* no_values = scratch({0}, ACL_FLOAT32, 4);
+  aclTensor* no_lse = scratch({0}, ACL_FLOAT32, 4);
+  Check(scratch_fits, "every per-token vector fits inside the vendor.scratch reservation");
+
+  // -- the paged caches and the two query streams ---------------------------
+  aclTensor* ori_kv = make(h_ori, 0, {kBlocksArena, kBlockSizeArena, kTotalHeadDim}, ACL_FLOAT8_E4M3FN);
+  aclTensor* cmp_kv = make(h_cmp, 0, {kBlocksArena, kBlockSizeArena, kTotalHeadDim}, ACL_FLOAT8_E4M3FN);
+  aclTensor* idx_cache = make(h_idx, 0, {kBlocksArena, kBlockSizeArena, kIndexerDim}, ACL_UINT8);
+  // The indexer reads the same bytes indexer_compress_epilog_v2 wrote, viewed
+  // as the FP8 key the scoring kernel expects.
+  aclTensor* idx_key = make(h_idx, 0, {kBlocksArena, kBlockSizeArena, 1, kIndexerDim}, ACL_FLOAT8_E4M3FN);
+  aclTensor* idx_k_scale = make(h_k_scale, 0, {kBlocksArena, kBlockSizeArena, 1}, ACL_FLOAT32);
+  aclTensor* query = make(h_attn_q, 0, {kTokensArena, kHeadsArena, kTotalHeadDim}, ACL_BF16);
+  aclTensor* attn_out = make(h_attn_out, 0, {kTokensArena, kHeadsArena, kTotalHeadDim}, ACL_BF16);
+  aclTensor* idx_query = make(h_idx_q, 0, {kTokensArena, kHeadsArena, kIndexerDim}, ACL_FLOAT8_E4M3FN);
+
+  OpTable ops;
+  uint64_t ws_compressor = 0;
+  uint64_t ws_indexer = 0;
+  uint64_t ws_attention = 0;
+  uint64_t ws_kv_epilog = 0;
+  uint64_t ws_idx_epilog = 0;
+  {
+    aclOpExecutor* executor = nullptr;
+    ws_compressor = PlanAclnnOp<CompressorPlanFn>(
+        ops, OpId::kCompressor, &executor, comp_x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+        block_table, seq_lengths, nullptr, nullptr, kRopeHeadDim, kCmpRatio, 1, 1e-6, 1, 1,
+        mock::AsMockTensor(state_cache)->strides.at(0), cmp_rows);
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_indexer = PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
+        ops, OpId::kVllmQuantLightningIndexer, &executor, idx_query, idx_key, idx_weights, idx_q_scale, idx_k_scale,
+        seq_lengths, seq_lengths, block_table, nullptr, 0, 0, const_cast<char*>("TND"),
+        const_cast<char*>("PA_BSND"), kSparseCount, 3, INT64_MAX, INT64_MAX, kCmpRatio, false,
+        mock::AsMockTensor(idx_key)->strides.at(0), mock::AsMockTensor(idx_k_scale)->strides.at(0), cmp_indices, no_values);
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_attention = PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+        ops, OpId::kKvQuantSparseAttnSharedkv, &executor, query, ori_kv, cmp_kv, ori_indices, cmp_indices,
+        block_table, block_table, seq_lengths, seq_lengths, seq_lengths, nullptr, nullptr, nullptr, nullptr, 1, 64,
+        kRopeHeadDim, 0.0441942, kCmpRatio, 4, 3, 127, 0, const_cast<char*>("TND"), const_cast<char*>("PA_ND"),
+        mock::AsMockTensor(ori_kv)->strides.at(0), mock::AsMockTensor(cmp_kv)->strides.at(0), false, attn_out, no_lse);
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_kv_epilog = PlanAclnnOp<KvCompressEpilogPlanFn>(ops, OpId::kKvCompressEpilog, &executor, cmp_kv, cmp_rows,
+                                                       slot_map, 128, 1, 1, 1,
+                                                       mock::AsMockTensor(cmp_kv)->strides.at(0));
+    aclDestroyAclOpExecutor(executor);
+    executor = nullptr;
+    ws_idx_epilog = PlanAclnnOp<IndexerCompressEpilogV2PlanFn>(ops, OpId::kIndexerCompressEpilogV2, &executor,
+                                                               idx_cache, idx_rows, slot_map, 2,
+                                                               mock::AsMockTensor(idx_cache)->strides.at(0));
+    aclDestroyAclOpExecutor(executor);
+  }
+  std::printf("  workspaces: compressor=%" PRIu64 " vllm_indexer=%" PRIu64 " sharedkv_attn=%" PRIu64
+              " kv_epilog=%" PRIu64 " idx_epilog=%" PRIu64 "\n",
+              ws_compressor, ws_indexer, ws_attention, ws_kv_epilog, ws_idx_epilog);
+
+  uint64_t peak = 0;
+  bool all_planned = true;
+  for (uint64_t ws : {ws_compressor, ws_indexer, ws_attention, ws_kv_epilog, ws_idx_epilog}) {
+    if (ws == 0) {
+      all_planned = false;
+    }
+    arena.NoteWorkspace(ws);
+    if (ws > peak) {
+      peak = ws;
+    }
+  }
+  Check(all_planned, "all five compressed-KV operators planned non-empty workspaces over arena addresses");
+  arena.CommitWorkspace();
+  Check(arena.workspace_bytes() == peak,
+        "one shared workspace reservation covers the whole five-operator compressed-KV chain");
+  arena.AssertWorkspaceFits(ws_compressor, "compressor");
+  arena.AssertWorkspaceFits(ws_indexer, "vllm_quant_lightning_indexer");
+  arena.AssertWorkspaceFits(ws_attention, "kv_quant_sparse_attn_sharedkv");
+  arena.AssertWorkspaceFits(ws_kv_epilog, "kv_compress_epilog");
+  arena.AssertWorkspaceFits(ws_idx_epilog, "indexer_compress_epilog_v2");
+  Check(true, "every compressed-KV workspace fits within the committed reservation");
+  CheckRefuses([&] { arena.AssertWorkspaceFits(peak + 1, "compressed-KV re-plan"); },
+               "a compressed-KV re-plan exceeding the reserved workspace");
+
+  for (aclTensor* tensor : {comp_x, cmp_rows, idx_rows, wkv, wgate, state_cache, ape, norm_weight, rope_sin,
+                            rope_cos, slot_map, ori_indices, cmp_indices, block_table, seq_lengths, idx_weights,
+                            idx_q_scale, no_values, no_lse, ori_kv, cmp_kv, idx_cache, idx_key, idx_k_scale, query,
+                            attn_out, idx_query}) {
+    aclDestroyTensor(tensor);
+  }
+  arena.Seal();
+}
+
 // ---------------------------------------------------------------------------
 // 5. Backbone sizing and the operator table
 // ---------------------------------------------------------------------------
@@ -791,6 +1033,7 @@ int RunMain() {
     TestHierarchyRefusals();
     TestStaticArena();
     TestVendorMhcArena();
+    TestVendorSharedKvArena();
     TestBackboneSizing();
     TestModelConfigContract();
     TestMoeBlockSlotContract();

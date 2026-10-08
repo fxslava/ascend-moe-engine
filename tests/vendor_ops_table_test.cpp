@@ -15,24 +15,35 @@
  */
 
 // vendor_ops_table_test -- the vendored arch35 (Ascend 950PR) operators from
-// third_party/ops_transformer, end to end through the engine's own machinery.
+// third_party/ops_dsv4, end to end through the engine's own machinery.
 //
 // What is verified here, without a device:
-//   * OpTable resolves all four vendored operators (mhc_pre, mhc_sinkhorn,
-//     mhc_post, quant_lightning_indexer) and the resolved addresses ARE the
-//     linked library's own symbols -- so the dlsym contract, the C prototypes
-//     in moe/ops/aclnn_dsv4_vendor_ops.h and the mock implementation cannot
-//     drift apart silently.
+//   * OpTable resolves all NINE vendored operators -- the mHC chain (mhc_pre,
+//     mhc_sinkhorn, mhc_post), both lightning indexers
+//     (quant_lightning_indexer, vllm_quant_lightning_indexer), the token-level
+//     compressor, the shared-KV sparse attention core and the two cache
+//     epilogs -- and the resolved addresses ARE the linked library's own
+//     symbols, so the dlsym contract, the C prototypes in
+//     moe/ops/aclnn_dsv4_vendor_ops.h and the mock implementation cannot drift
+//     apart silently.
 //   * The two-phase protocol runs for each operator through PlanAclnnOp +
 //     StaticOpSlot::Adopt + Launch: the plan validates the DSV4 geometry
-//     (n_hc = 4 streams over the 4096-wide hidden state, TND layout), the
-//     executor adopts (aclSetAclOpExecutorRepeatable succeeds), the launch
-//     is a validated no-op, and re-planning returns the same workspace size.
-//   * aclSetTensorAddr swaps a slot address inside the captured IR order.
-//   * The mhc_sinkhorn ViewCopy(output, output) guard: a contiguous output
-//     plans successfully but the same-address self-copy hazard is counted
-//     (manual 4.31: such an executor is non-reusable), while the
-//     non-contiguous output workaround path stays clean.
+//     (n_hc = 4 streams over the 4096-wide hidden state, 64 query heads over a
+//     512-wide total head dim, indexer D = 128, compression ratios 4 and 128,
+//     TND layout), the executor adopts (aclSetAclOpExecutorRepeatable
+//     succeeds), the launch is a validated no-op, and re-planning returns the
+//     same workspace size.
+//   * aclSetTensorAddr swaps a slot address inside the captured IR order, and
+//     re-binding across two launch cycles keeps hitting the captured slots.
+//   * The manual-4.31 self-copy invariant across the whole vendored set: no
+//     wrapper plans a same-address ViewCopy. In particular the patched
+//     mhc_sinkhorn elides its trailing copy for a contiguous output (where
+//     upstream copied onto its own address) and still copies, src != dst, for
+//     a non-contiguous one; and the three REF-output operators
+//     (Compressor.stateCache and the two epilogs) stage no copy at all.
+//   * The stride attributes that address the paged caches and keys agree with
+//     the views the caller handed over -- a stale value would read or scatter
+//     into the wrong block.
 //
 // What is NOT verified here: the arch35 kernel numerics and the real
 // GetWorkspaceSize numbers -- those need a 950PR with the vendored opp
@@ -124,12 +135,20 @@ void TestTableResolution() {
     std::printf("  NOTE: the aclnn runtime is not on the loader path; nothing to resolve.\n");
     return;
   }
-  const OpId vendored[] = {OpId::kMhcPre, OpId::kMhcSinkhorn, OpId::kMhcPost, OpId::kQuantLightningIndexer};
+  const std::vector<OpId> vendored = {OpId::kMhcPre,
+                                      OpId::kMhcSinkhorn,
+                                      OpId::kMhcPost,
+                                      OpId::kQuantLightningIndexer,
+                                      OpId::kCompressor,
+                                      OpId::kVllmQuantLightningIndexer,
+                                      OpId::kKvQuantSparseAttnSharedkv,
+                                      OpId::kKvCompressEpilog,
+                                      OpId::kIndexerCompressEpilogV2};
   for (OpId id : vendored) {
     Check(ops.available(id), std::string(OpName(id)) + " resolved from the linked libraries");
   }
-  ops.RequireAll({OpId::kMhcPre, OpId::kMhcSinkhorn, OpId::kMhcPost, OpId::kQuantLightningIndexer});
-  Check(true, "RequireAll accepts the four vendored operators");
+  ops.RequireAll(vendored);
+  Check(true, "RequireAll accepts all nine vendored operators");
 
   // The engine's C prototypes and the linked implementation are the same
   // symbols: OpTable's dlsym address equals the address the declaration in
@@ -145,13 +164,37 @@ void TestTableResolution() {
         "OpTable's mhc_post plan is exactly &aclnnMhcPostGetWorkspaceSize");
   Check(reinterpret_cast<void*>(&aclnnQuantLightningIndexerGetWorkspaceSize) == ops.op(OpId::kQuantLightningIndexer).plan,
         "OpTable's quant_lightning_indexer plan is exactly &aclnnQuantLightningIndexerGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnCompressorGetWorkspaceSize) == ops.op(OpId::kCompressor).plan,
+        "OpTable's compressor plan is exactly &aclnnCompressorGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnCompressor) == ops.op(OpId::kCompressor).launch,
+        "OpTable's compressor launch is exactly &aclnnCompressor");
+  Check(reinterpret_cast<void*>(&aclnnVllmQuantLightningIndexerGetWorkspaceSize) ==
+            ops.op(OpId::kVllmQuantLightningIndexer).plan,
+        "OpTable's vllm_quant_lightning_indexer plan is exactly "
+        "&aclnnVllmQuantLightningIndexerGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnKvQuantSparseAttnSharedkvGetWorkspaceSize) ==
+            ops.op(OpId::kKvQuantSparseAttnSharedkv).plan,
+        "OpTable's kv_quant_sparse_attn_sharedkv plan is exactly "
+        "&aclnnKvQuantSparseAttnSharedkvGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnKvCompressEpilogGetWorkspaceSize) == ops.op(OpId::kKvCompressEpilog).plan,
+        "OpTable's kv_compress_epilog plan is exactly &aclnnKvCompressEpilogGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnIndexerCompressEpilogV2GetWorkspaceSize) ==
+            ops.op(OpId::kIndexerCompressEpilogV2).plan,
+        "OpTable's indexer_compress_epilog_v2 plan is exactly "
+        "&aclnnIndexerCompressEpilogV2GetWorkspaceSize");
+  // The two indexers are distinct operators with distinct ABIs; a copy-paste
+  // in the vendor tree or the OpTable declaration would alias them.
+  Check(ops.op(OpId::kQuantLightningIndexer).plan != ops.op(OpId::kVllmQuantLightningIndexer).plan,
+        "the two lightning indexers resolve to different entry points");
 
   const std::string inventory = ops.DescribeInventory();
-  Check(inventory.find("aclnnMhcPre") != std::string::npos &&
-            inventory.find("aclnnMhcSinkhorn") != std::string::npos &&
-            inventory.find("aclnnMhcPost") != std::string::npos &&
-            inventory.find("aclnnQuantLightningIndexer") != std::string::npos,
-        "the inventory lists all four vendored operators");
+  bool inventory_lists_all = true;
+  for (OpId id : vendored) {
+    if (inventory.find(OpName(id)) == std::string::npos) {
+      inventory_lists_all = false;
+    }
+  }
+  Check(inventory_lists_all, "the inventory lists all nine vendored operators");
   for (OpId id : vendored) {
     Check(!ops.op(id).provider.empty(), std::string(OpName(id)) + " names its provider (" + ops.op(id).provider + ")");
   }
@@ -216,33 +259,48 @@ void TestMhcChain() {
   pre_slot.Reset();
 
   // -- mhc_sinkhorn: [T,4,4] -> doubly-stochastic --------------------------------
-  // The CONTIGUOUS output is the hazard: Contiguous(output) is the identity,
-  // MhcSinkhorn writes into and returns that same tensor, and the trailing
-  // ViewCopy becomes the manual-4.31 same-address self-copy that makes the
-  // executor non-reusable. The mock still plans and launches it -- the guard
-  // counts the condition for the assertions below.
+  // The CONTIGUOUS output is the case upstream got wrong: Contiguous(output)
+  // is the identity, MhcSinkhorn writes into and returns that same tensor, and
+  // the unconditional trailing ViewCopy(kernelOut, output) becomes a
+  // manual-4.31 same-address self-copy that makes the executor non-reusable.
+  // The patched wrapper skips the copy in exactly that case -- the result is
+  // already in the caller buffer -- so the executor stays reusable and no
+  // hazard is recorded on either path.
   aclTensor* sink_in = MakeTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
   aclTensor* sink_out = MakeTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
-  const int warnings_before = mock::MockSinkhornViewCopyWarnings();
+  const int elisions_before = mock::MockSinkhornSelfCopyElisions();
+  const int hazards_before = mock::MockVendorSelfCopyHazards();
   ws = PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, &executor, sink_in, 1e-6f, 20, sink_out, nullptr,
                                       nullptr);
   StaticOpSlot sink_slot;
   sink_slot.Adopt(OpId::kMhcSinkhorn, "vendor/mhc_sinkhorn", ws, executor);
   sink_slot.Launch(ops, workspace, stream);
-  Check(mock::MockSinkhornViewCopyWarnings() == warnings_before + 1,
-        "a contiguous mhc_sinkhorn output plans and launches but is counted as the ViewCopy(output, output) "
-        "self-copy hazard (executor non-reusable per manual 4.31)");
+  Check(mock::MockSinkhornSelfCopyElisions() == elisions_before + 1,
+        "a contiguous mhc_sinkhorn output elides the trailing ViewCopy (the patch firing on the case "
+        "upstream copied onto its own address)");
+  Check(mock::MockVendorSelfCopyHazards() == hazards_before,
+        "the contiguous mhc_sinkhorn path records no manual-4.31 self-copy hazard, so its executor is "
+        "reusable");
+  // Reusability is the whole point of the patch: re-bind the output address on
+  // the adopted executor and launch again on the same plan.
+  const uint64_t sink_mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  sink_slot.SetAddress(1, sink_out, AsMockTensor(sink_out)->device_addr);
+  sink_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == sink_mismatches_before,
+        "the contiguous mhc_sinkhorn plan relaunches after aclSetTensorAddr on its output slot");
   sink_slot.Reset();
 
-  // The workaround: a strided output view forces Contiguous to allocate a
-  // distinct executor-owned temp, so the final ViewCopy runs src != dst and
-  // repeatability is restored -- no hazard counted on this path.
+  // A strided output view makes Contiguous allocate a distinct
+  // executor-owned temp, so the final ViewCopy still runs -- but with
+  // src != dst, which is equally reusable and costs one extra copy launch.
   aclTensor* strided_out = MakeStridedTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32,
                                              next(kTokens * kNhc * kNhc * 16));
   ws = PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, &executor, sink_in, 1e-6f, 20, strided_out, nullptr,
                                       nullptr);
-  Check(mock::MockSinkhornViewCopyWarnings() == warnings_before + 1,
-        "a non-contiguous mhc_sinkhorn output (the workaround) raises no further hazard");
+  Check(mock::MockSinkhornSelfCopyElisions() == elisions_before + 1,
+        "a non-contiguous mhc_sinkhorn output keeps its ViewCopy (src != dst), so nothing is elided");
+  Check(mock::MockVendorSelfCopyHazards() == hazards_before,
+        "the non-contiguous mhc_sinkhorn path records no self-copy hazard either");
   aclDestroyAclOpExecutor(executor);
 
   // numIters bounds come from the vendored aclnn layer's own checks.
@@ -355,6 +413,433 @@ void TestQuantLightningIndexer() {
   mock::MockUnregisterSpan(arena);
 }
 
+// ---------------------------------------------------------------------------
+// 4. The token-level compressor: both compression ratios, REF state cache
+// ---------------------------------------------------------------------------
+
+void TestCompressor() {
+  Section("vendored compressor: CSA (cmp_ratio 4) and HCA (cmp_ratio 128), REF state cache");
+  mock::MockResetAllocatorForTest();
+  OpTable ops;
+
+  constexpr int64_t kCompTokens = 128;  // divisible by both 4 and 128
+  constexpr int64_t kStateBlocks = 4;
+  constexpr int64_t kStateBlockSize = 8;
+  constexpr int64_t kStateDim = 128;
+  constexpr int64_t kCmpChannels = 256;  // normWeight[0]
+  constexpr int64_t kRopeHeadDim = 64;
+  constexpr int64_t kCoff = 1;
+
+  const uintptr_t arena = mock::MockDeviceMalloc(32ull << 20);
+  size_t cursor = 0;
+  const auto next = [&](size_t bytes) {
+    cursor += (bytes + 63) & ~size_t(63);
+    return reinterpret_cast<void*>(arena + cursor);
+  };
+
+  aclTensor* x = MakeTensor({kCompTokens, kHiddenSize}, ACL_BF16, next(kCompTokens * kHiddenSize * 2));
+  aclTensor* wkv = MakeTensor({kHiddenSize, kCmpChannels}, ACL_BF16, next(kHiddenSize * kCmpChannels * 2));
+  aclTensor* wgate = MakeTensor({kHiddenSize, 1}, ACL_BF16, next(kHiddenSize * 2));
+  aclTensor* state_cache = MakeTensor({kStateBlocks, kStateBlockSize, kStateDim}, ACL_FLOAT32,
+                                      next(kStateBlocks * kStateBlockSize * kStateDim * 4));
+  aclTensor* ape = MakeTensor({kCompTokens}, ACL_FLOAT32, next(kCompTokens * 4));
+  aclTensor* norm_weight = MakeTensor({kCmpChannels}, ACL_FLOAT32, next(kCmpChannels * 4));
+  aclTensor* rope_sin = MakeTensor({kCompTokens, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
+  aclTensor* rope_cos = MakeTensor({kCompTokens, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
+  aclTensor* block_table = MakeTensor({1, kStateBlocks}, ACL_INT32, next(kStateBlocks * 4));
+  aclTensor* cu_seqlens = MakeTensor({1}, ACL_INT32, next(4));
+
+  // The kernel addresses the paged state cache through this attribute, so it
+  // must be the axis-0 stride of the view the caller owns.
+  const int64_t state_stride0 = AsMockTensor(state_cache)->strides.at(0);
+  Check(state_stride0 == kStateBlockSize * kStateDim,
+        "the contiguous state cache's axis-0 stride is blockSize*D as the kernel expects");
+
+  SimulatedDeviceOps device(16ull << 20);
+  DeviceStream stream = device.CreateStream();
+
+  // -- CSA: cmp_ratio 4 -------------------------------------------------------
+  aclTensor* cmp_kv_csa = MakeTensor({kCompTokens / 4, kCmpChannels * kCoff}, ACL_BF16,
+                                     next(kCompTokens / 4 * kCmpChannels * kCoff * 2));
+  const int ref_plans_before = mock::MockRefOutputPlans();
+  aclOpExecutor* executor = nullptr;
+  uint64_t ws = PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &executor, x, wkv, wgate, state_cache, ape,
+                                              norm_weight, rope_sin, rope_cos, block_table, cu_seqlens, nullptr,
+                                              nullptr, kRopeHeadDim, 4, kCoff, 1e-6, 1, 1, state_stride0,
+                                              cmp_kv_csa);
+  Check(ws > 0, "the compressor planned a non-empty workspace at cmp_ratio 4 (CSA)");
+  StaticOpSlot csa_slot;
+  csa_slot.Adopt(OpId::kCompressor, "vendor/compressor_csa", ws, executor);
+  Check(csa_slot.planned(), "the compressor's CSA executor adopted (aclSetAclOpExecutorRepeatable)");
+  void* workspace = ws > 0 ? device.DeviceMalloc(ws) : nullptr;
+  csa_slot.Launch(ops, workspace, stream);
+
+  // Re-bind the REF state cache across a second launch cycle on the same plan:
+  // it is IR slot 3 ({x, wkv, wgate, stateCache, ...}).
+  const uint64_t mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  csa_slot.SetAddress(3, state_cache, AsMockTensor(state_cache)->device_addr);
+  csa_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "aclSetTensorAddr re-binds the compressor's REF state cache slot across launch cycles");
+  Check(mock::MockRefOutputPlans() == ref_plans_before + 1,
+        "the compressor is recorded as a REF-output plan (no copy stage, so no self-copy hazard)");
+  csa_slot.Reset();
+
+  // -- HCA: cmp_ratio 128 -----------------------------------------------------
+  aclTensor* cmp_kv_hca = MakeTensor({kCompTokens / 128, kCmpChannels * kCoff}, ACL_BF16,
+                                     next(kCompTokens / 128 * kCmpChannels * kCoff * 2));
+  aclOpExecutor* hca_executor = nullptr;
+  const uint64_t ws_hca = PlanAclnnOp<CompressorPlanFn>(
+      ops, OpId::kCompressor, &hca_executor, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+      block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 128, kCoff, 1e-6, 1, 1, state_stride0, cmp_kv_hca);
+  Check(ws_hca > 0, "the compressor planned a non-empty workspace at cmp_ratio 128 (HCA)");
+  aclDestroyAclOpExecutor(hca_executor);
+
+  // A ratio outside {4, 128} is not a DSV4-Flash configuration.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &bad, x, wkv, wgate, state_cache, ape, norm_weight,
+                                  rope_sin, rope_cos, block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 8,
+                                  kCoff, 1e-6, 1, 1, state_stride0, cmp_kv_csa);
+  }, "the compressor at cmp_ratio 8 (outside the DSV4 {4, 128} set)");
+
+  // cmp_kv rows must be T/cmp_ratio: handing the CSA output to the HCA plan
+  // would silently write 32x too many rows on device.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &bad, x, wkv, wgate, state_cache, ape, norm_weight,
+                                  rope_sin, rope_cos, block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 128,
+                                  kCoff, 1e-6, 1, 1, state_stride0, cmp_kv_csa);
+  }, "the compressor at cmp_ratio 128 with a T/4-row cmp_kv output");
+
+  // A stale stride attribute would make the kernel scatter into the wrong
+  // block of the paged state cache.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &bad, x, wkv, wgate, state_cache, ape, norm_weight,
+                                  rope_sin, rope_cos, block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 4,
+                                  kCoff, 1e-6, 1, 1, state_stride0 + 1, cmp_kv_csa);
+  }, "the compressor with a stateCacheStrideDim0 that disagrees with the state cache view");
+
+  // The state cache is the recurrent pooling state and must be FP32.
+  aclTensor* bf16_state = MakeTensor({kStateBlocks, kStateBlockSize, kStateDim}, ACL_BF16,
+                                     next(kStateBlocks * kStateBlockSize * kStateDim * 2));
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &bad, x, wkv, wgate, bf16_state, ape, norm_weight,
+                                  rope_sin, rope_cos, block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 4,
+                                  kCoff, 1e-6, 1, 1, state_stride0, cmp_kv_csa);
+  }, "the compressor with a BF16 state cache where FP32 is required");
+
+  for (aclTensor* tensor : {x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos, block_table,
+                            cu_seqlens, cmp_kv_csa, cmp_kv_hca, bf16_state}) {
+    aclDestroyTensor(tensor);
+  }
+  device.DestroyStream(stream);
+  mock::MockUnregisterSpan(arena);
+}
+
+// ---------------------------------------------------------------------------
+// 5. The shared-KV indexer and the shared-KV sparse attention core
+// ---------------------------------------------------------------------------
+
+void TestSharedKvPath() {
+  Section("vendored shared-KV path: vllm indexer -> kv_quant_sparse_attn_sharedkv");
+  mock::MockResetAllocatorForTest();
+  OpTable ops;
+
+  constexpr int64_t kHeads = 64;        // N1 / query heads
+  constexpr int64_t kHeadDim = 128;     // indexer D
+  constexpr int64_t kQueryTokens = 8;   // T
+  constexpr int64_t kBlocks = 4;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kSparseCount = 16;
+  constexpr int64_t kTotalHeadDim = 512;  // DSV4 MLA total head dim
+  constexpr int64_t kTileSize = 64;
+  constexpr int64_t kRopeHeadDim = 64;
+
+  const uintptr_t arena = mock::MockDeviceMalloc(64ull << 20);
+  size_t cursor = 0;
+  const auto next = [&](size_t bytes) {
+    cursor += (bytes + 63) & ~size_t(63);
+    return reinterpret_cast<void*>(arena + cursor);
+  };
+
+  SimulatedDeviceOps device(32ull << 20);
+  DeviceStream stream = device.CreateStream();
+
+  // -- the shared-KV indexer --------------------------------------------------
+  aclTensor* query = MakeTensor({kQueryTokens, kHeads, kHeadDim}, ACL_FLOAT8_E4M3FN,
+                                next(kQueryTokens * kHeads * kHeadDim));
+  aclTensor* key = MakeTensor({kBlocks, kBlockSize, 1, kHeadDim}, ACL_FLOAT8_E4M3FN,
+                              next(kBlocks * kBlockSize * kHeadDim));
+  aclTensor* weights = MakeTensor({kQueryTokens, kHeads}, ACL_BF16, next(kQueryTokens * kHeads * 2));
+  aclTensor* q_scale = MakeTensor({kQueryTokens, kHeads}, ACL_FLOAT32, next(kQueryTokens * kHeads * 4));
+  aclTensor* k_scale = MakeTensor({kBlocks, kBlockSize, 1}, ACL_FLOAT32, next(kBlocks * kBlockSize * 4));
+  aclTensor* seq_q = MakeTensor({1}, ACL_INT32, next(4));
+  aclTensor* seq_k = MakeTensor({1}, ACL_INT32, next(4));
+  aclTensor* block_table = MakeTensor({1, kBlocks}, ACL_INT32, next(kBlocks * 4));
+  aclTensor* metadata = MakeTensor({16}, ACL_INT32, next(16 * 4));
+  aclTensor* cmp_indices = MakeTensor({kQueryTokens, 1, kSparseCount}, ACL_INT32,
+                                      next(kQueryTokens * kSparseCount * 4));
+  // returnValues=false is signalled by a [0] placeholder, which is what the
+  // vendored wrapper checks before issuing the second copy.
+  aclTensor* no_values = MakeTensor({0}, ACL_FLOAT32, next(4));
+
+  const int64_t key_stride0 = AsMockTensor(key)->strides.at(0);
+  const int64_t scale_stride0 = AsMockTensor(k_scale)->strides.at(0);
+
+  aclOpExecutor* executor = nullptr;
+  uint64_t ws = PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
+      ops, OpId::kVllmQuantLightningIndexer, &executor, query, key, weights, q_scale, k_scale, seq_q, seq_k,
+      block_table, metadata, 0, 0, const_cast<char*>("TND"), const_cast<char*>("PA_BSND"), kSparseCount, 3,
+      INT64_MAX, INT64_MAX, /*cmp_ratio=*/4, /*return_values=*/false, key_stride0, scale_stride0, cmp_indices,
+      no_values);
+  Check(ws > 0, "the shared-KV indexer planned a non-empty workspace over TND + PA_BSND at cmp_ratio 4");
+  StaticOpSlot indexer_slot;
+  indexer_slot.Adopt(OpId::kVllmQuantLightningIndexer, "vendor/vllm_quant_lightning_indexer", ws, executor);
+  void* workspace = ws > 0 ? device.DeviceMalloc(ws) : nullptr;
+  indexer_slot.Launch(ops, workspace, stream);
+  Check(true, "the shared-KV indexer's executor adopted (repeatable) and launched");
+  indexer_slot.Reset();
+
+  // returnValues=true needs a real sparse_values output, not the placeholder.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
+        ops, OpId::kVllmQuantLightningIndexer, &bad, query, key, weights, q_scale, k_scale, seq_q, seq_k,
+        block_table, metadata, 0, 0, const_cast<char*>("TND"), const_cast<char*>("PA_BSND"), kSparseCount, 3,
+        INT64_MAX, INT64_MAX, 4, /*return_values=*/true, key_stride0, scale_stride0, cmp_indices, no_values);
+  }, "the shared-KV indexer with returnValues=true and a [0] sparse_values placeholder");
+
+  // A stale key stride would read the wrong page of the paged key.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
+        ops, OpId::kVllmQuantLightningIndexer, &bad, query, key, weights, q_scale, k_scale, seq_q, seq_k,
+        block_table, metadata, 0, 0, const_cast<char*>("TND"), const_cast<char*>("PA_BSND"), kSparseCount, 3,
+        INT64_MAX, INT64_MAX, 4, false, key_stride0 + 1, scale_stride0, cmp_indices, no_values);
+  }, "the shared-KV indexer with a stride attribute that disagrees with the paged key view");
+
+  // -- the shared-KV sparse attention core ------------------------------------
+  aclTensor* q = MakeTensor({kQueryTokens, kHeads, kTotalHeadDim}, ACL_BF16,
+                            next(kQueryTokens * kHeads * kTotalHeadDim * 2));
+  aclTensor* ori_kv = MakeTensor({kBlocks, kBlockSize, kTotalHeadDim}, ACL_FLOAT8_E4M3FN,
+                                 next(kBlocks * kBlockSize * kTotalHeadDim));
+  aclTensor* cmp_kv = MakeTensor({kBlocks, kBlockSize, kTotalHeadDim}, ACL_FLOAT8_E4M3FN,
+                                 next(kBlocks * kBlockSize * kTotalHeadDim));
+  aclTensor* ori_indices = MakeTensor({kQueryTokens, 1, kSparseCount}, ACL_INT32,
+                                      next(kQueryTokens * kSparseCount * 4));
+  aclTensor* sinks = MakeTensor({kHeads}, ACL_FLOAT32, next(kHeads * 4));
+  aclTensor* attn_out = MakeTensor({kQueryTokens, kHeads, kTotalHeadDim}, ACL_BF16,
+                                   next(kQueryTokens * kHeads * kTotalHeadDim * 2));
+  aclTensor* no_lse = MakeTensor({0}, ACL_FLOAT32, next(4));
+
+  const int64_t ori_stride0 = AsMockTensor(ori_kv)->strides.at(0);
+  const int64_t cmp_stride0 = AsMockTensor(cmp_kv)->strides.at(0);
+  const int hazards_before = mock::MockVendorSelfCopyHazards();
+
+  aclOpExecutor* attn_executor = nullptr;
+  const uint64_t attn_ws = PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+      ops, OpId::kKvQuantSparseAttnSharedkv, &attn_executor, q, ori_kv, cmp_kv, ori_indices, cmp_indices,
+      block_table, block_table, seq_q, seq_k, seq_k, nullptr, nullptr, sinks, metadata, /*kv_quant_mode=*/1,
+      kTileSize, kRopeHeadDim, /*softmax_scale=*/0.0441942, /*cmp_ratio=*/4, /*ori_mask_mode=*/4,
+      /*cmp_mask_mode=*/3, /*ori_win_left=*/127, /*ori_win_right=*/0, const_cast<char*>("TND"),
+      const_cast<char*>("PA_ND"), ori_stride0, cmp_stride0, /*return_softmax_lse=*/false, attn_out, no_lse);
+  Check(attn_ws > 0, "the shared-KV attention core planned a non-empty workspace over both KV streams");
+  StaticOpSlot attn_slot;
+  attn_slot.Adopt(OpId::kKvQuantSparseAttnSharedkv, "vendor/kv_quant_sparse_attn_sharedkv", attn_ws, attn_executor);
+  void* attn_workspace = attn_ws > 0 ? device.DeviceMalloc(attn_ws) : nullptr;
+  attn_slot.Launch(ops, attn_workspace, stream);
+  // Slot 0 is q; re-binding it and relaunching is the per-token decode step.
+  const uint64_t attn_mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  attn_slot.SetAddress(0, q, AsMockTensor(q)->device_addr);
+  attn_slot.Launch(ops, attn_workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == attn_mismatches_before,
+        "the shared-KV attention plan relaunches after aclSetTensorAddr on its query slot");
+  Check(mock::MockVendorSelfCopyHazards() == hazards_before,
+        "the shared-KV attention core records no manual-4.31 self-copy hazard");
+  attn_slot.Reset();
+
+  // The compressed half alone is a valid configuration (HCA-only decode).
+  aclOpExecutor* cmp_only = nullptr;
+  const uint64_t cmp_only_ws = PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+      ops, OpId::kKvQuantSparseAttnSharedkv, &cmp_only, q, nullptr, cmp_kv, nullptr, cmp_indices, nullptr,
+      block_table, seq_q, nullptr, seq_k, nullptr, nullptr, sinks, metadata, 1, kTileSize, kRopeHeadDim, 0.0441942,
+      128, 4, 3, 127, 0, const_cast<char*>("TND"), const_cast<char*>("PA_ND"), 0, cmp_stride0, false, attn_out,
+      no_lse);
+  Check(cmp_only_ws > 0, "the shared-KV attention core plans with only the compressed KV stream bound");
+  aclDestroyAclOpExecutor(cmp_only);
+
+  // Neither half bound makes the operator meaningless.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+        ops, OpId::kKvQuantSparseAttnSharedkv, &bad, q, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, seq_q,
+        nullptr, nullptr, nullptr, nullptr, sinks, metadata, 1, kTileSize, kRopeHeadDim, 0.0441942, 4, 4, 3, 127, 0,
+        const_cast<char*>("TND"), const_cast<char*>("PA_ND"), 0, 0, false, attn_out, no_lse);
+  }, "the shared-KV attention core with neither KV stream bound");
+
+  // A bound cmp stream without its sparse indices has nothing to gather.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+        ops, OpId::kKvQuantSparseAttnSharedkv, &bad, q, ori_kv, cmp_kv, ori_indices, nullptr, block_table,
+        block_table, seq_q, seq_k, seq_k, nullptr, nullptr, sinks, metadata, 1, kTileSize, kRopeHeadDim, 0.0441942,
+        4, 4, 3, 127, 0, const_cast<char*>("TND"), const_cast<char*>("PA_ND"), ori_stride0, cmp_stride0, false,
+        attn_out, no_lse);
+  }, "the shared-KV attention core with a bound cmpKv but no cmpSparseIndices");
+
+  // 512 is the DSV4 total head dim; a 128-wide query is the indexer geometry,
+  // not the attention geometry.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvQuantSparseAttnSharedkvPlanFn>(
+        ops, OpId::kKvQuantSparseAttnSharedkv, &bad, query, ori_kv, cmp_kv, ori_indices, cmp_indices, block_table,
+        block_table, seq_q, seq_k, seq_k, nullptr, nullptr, sinks, metadata, 1, kTileSize, kRopeHeadDim, 0.0441942,
+        4, 4, 3, 127, 0, const_cast<char*>("TND"), const_cast<char*>("PA_ND"), ori_stride0, cmp_stride0, false,
+        attn_out, no_lse);
+  }, "the shared-KV attention core with a 128-wide head dim where the DSV4 512 is required");
+
+  for (aclTensor* tensor : {query, key, weights, q_scale, k_scale, seq_q, seq_k, block_table, metadata, cmp_indices,
+                            no_values, q, ori_kv, cmp_kv, ori_indices, sinks, attn_out, no_lse}) {
+    aclDestroyTensor(tensor);
+  }
+  device.DestroyStream(stream);
+  mock::MockUnregisterSpan(arena);
+}
+
+// ---------------------------------------------------------------------------
+// 6. The two cache epilogs: REF-output scatter, no copy stage
+// ---------------------------------------------------------------------------
+
+void TestCacheEpilogs() {
+  Section("vendored cache epilogs: kv_compress_epilog, indexer_compress_epilog_v2");
+  mock::MockResetAllocatorForTest();
+  OpTable ops;
+
+  constexpr int64_t kBlocks = 8;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kKvDim = 512;
+  constexpr int64_t kIndexerDim = 128;
+  constexpr int64_t kRows = 16;
+  constexpr int64_t kQuantGroup = 128;
+
+  const uintptr_t arena = mock::MockDeviceMalloc(32ull << 20);
+  size_t cursor = 0;
+  const auto next = [&](size_t bytes) {
+    cursor += (bytes + 63) & ~size_t(63);
+    return reinterpret_cast<void*>(arena + cursor);
+  };
+
+  SimulatedDeviceOps device(16ull << 20);
+  DeviceStream stream = device.CreateStream();
+
+  // -- kv_compress_epilog -----------------------------------------------------
+  aclTensor* kv_cache = MakeTensor({kBlocks, kBlockSize, kKvDim}, ACL_FLOAT8_E4M3FN,
+                                   next(kBlocks * kBlockSize * kKvDim));
+  aclTensor* kv_rows = MakeTensor({kRows, kKvDim}, ACL_BF16, next(kRows * kKvDim * 2));
+  aclTensor* kv_slots = MakeTensor({kRows}, ACL_INT32, next(kRows * 4));
+  const int64_t kv_block_stride = AsMockTensor(kv_cache)->strides.at(0);
+  const int ref_plans_before = mock::MockRefOutputPlans();
+  const int hazards_before = mock::MockVendorSelfCopyHazards();
+
+  aclOpExecutor* executor = nullptr;
+  uint64_t ws = PlanAclnnOp<KvCompressEpilogPlanFn>(ops, OpId::kKvCompressEpilog, &executor, kv_cache, kv_rows,
+                                                    kv_slots, kQuantGroup, 1, 1, 1, kv_block_stride);
+  Check(ws > 0, "kv_compress_epilog planned a non-empty workspace");
+  StaticOpSlot kv_slot;
+  kv_slot.Adopt(OpId::kKvCompressEpilog, "vendor/kv_compress_epilog", ws, executor);
+  void* workspace = ws > 0 ? device.DeviceMalloc(ws) : nullptr;
+  kv_slot.Launch(ops, workspace, stream);
+  // The cache is IR slot 0 and is the REF output: re-binding it is how the
+  // decode loop walks blocks on one plan.
+  const uint64_t mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  kv_slot.SetAddress(0, kv_cache, AsMockTensor(kv_cache)->device_addr);
+  kv_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "aclSetTensorAddr re-binds kv_compress_epilog's REF cache slot across launch cycles");
+  kv_slot.Reset();
+
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvCompressEpilogPlanFn>(ops, OpId::kKvCompressEpilog, &bad, kv_cache, kv_rows, kv_slots,
+                                        kQuantGroup, 1, 1, 1, kv_block_stride + 1);
+  }, "kv_compress_epilog with a blockStride that disagrees with the cache view");
+
+  aclTensor* short_slots = MakeTensor({kRows / 2}, ACL_INT32, next(kRows / 2 * 4));
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvCompressEpilogPlanFn>(ops, OpId::kKvCompressEpilog, &bad, kv_cache, kv_rows, short_slots,
+                                        kQuantGroup, 1, 1, 1, kv_block_stride);
+  }, "kv_compress_epilog with fewer slot_mapping entries than rows of x");
+
+  aclTensor* fp32_cache = MakeTensor({kBlocks, kBlockSize, kKvDim}, ACL_FLOAT32,
+                                     next(kBlocks * kBlockSize * kKvDim * 4));
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<KvCompressEpilogPlanFn>(ops, OpId::kKvCompressEpilog, &bad, fp32_cache, kv_rows, kv_slots,
+                                        kQuantGroup, 1, 1, 1, AsMockTensor(fp32_cache)->strides.at(0));
+  }, "kv_compress_epilog with an FP32 cache where FP8 is required");
+
+  // -- indexer_compress_epilog_v2 ---------------------------------------------
+  aclTensor* idx_cache = MakeTensor({kBlocks, kBlockSize, kIndexerDim}, ACL_UINT8,
+                                    next(kBlocks * kBlockSize * kIndexerDim));
+  aclTensor* idx_rows = MakeTensor({kRows, kIndexerDim}, ACL_BF16, next(kRows * kIndexerDim * 2));
+  aclTensor* idx_slots = MakeTensor({kRows}, ACL_INT32, next(kRows * 4));
+  const int64_t idx_block_stride = AsMockTensor(idx_cache)->strides.at(0);
+
+  aclOpExecutor* idx_executor = nullptr;
+  const uint64_t idx_ws = PlanAclnnOp<IndexerCompressEpilogV2PlanFn>(
+      ops, OpId::kIndexerCompressEpilogV2, &idx_executor, idx_cache, idx_rows, idx_slots, 2, idx_block_stride);
+  Check(idx_ws > 0, "indexer_compress_epilog_v2 planned a non-empty workspace");
+  StaticOpSlot idx_slot;
+  idx_slot.Adopt(OpId::kIndexerCompressEpilogV2, "vendor/indexer_compress_epilog_v2", idx_ws, idx_executor);
+  idx_slot.Launch(ops, idx_ws > 0 ? device.DeviceMalloc(idx_ws) : nullptr, stream);
+  Check(true, "indexer_compress_epilog_v2 adopted (repeatable) and launched");
+  idx_slot.Reset();
+
+  aclTensor* wide_rows = MakeTensor({kRows, 256}, ACL_BF16, next(kRows * 256 * 2));
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<IndexerCompressEpilogV2PlanFn>(ops, OpId::kIndexerCompressEpilogV2, &bad, idx_cache, wide_rows,
+                                               idx_slots, 2, idx_block_stride);
+  }, "indexer_compress_epilog_v2 with a 256-wide x where the indexer width is 128");
+
+  // Both epilogs are REF-output operators: they stage no copy at all, so
+  // neither can contribute a manual-4.31 self-copy hazard.
+  Check(mock::MockRefOutputPlans() >= ref_plans_before + 2,
+        "both cache epilogs are recorded as REF-output plans");
+  Check(mock::MockVendorSelfCopyHazards() == hazards_before,
+        "neither cache epilog records a manual-4.31 self-copy hazard");
+
+  for (aclTensor* tensor : {kv_cache, kv_rows, kv_slots, short_slots, fp32_cache, idx_cache, idx_rows, idx_slots,
+                            wide_rows}) {
+    aclDestroyTensor(tensor);
+  }
+  device.DestroyStream(stream);
+  mock::MockUnregisterSpan(arena);
+}
+
+// ---------------------------------------------------------------------------
+// 7. The repeatability invariant over the whole vendored set
+// ---------------------------------------------------------------------------
+
+void TestRepeatabilityInvariant() {
+  Section("vendored operator set: the manual-4.31 self-copy invariant");
+  // Every wrapper in third_party/ops_dsv4 either writes its output through a
+  // distinct executor-owned tensor (so its ViewCopy has src != dst), or has a
+  // REF output and stages no copy, or -- for the patched mhc_sinkhorn -- elides
+  // the copy when the kernel already wrote the caller tensor. So after
+  // exercising all nine above, the hazard ledger must be empty.
+  Check(mock::MockVendorSelfCopyHazards() == 0,
+        "no vendored operator planned a same-address ViewCopy across the whole suite");
+  Check(mock::MockSinkhornSelfCopyElisions() > 0,
+        "the mhc_sinkhorn patch fired at least once (the contiguous-output path was exercised)");
+  Check(mock::MockRefOutputPlans() >= 3,
+        "all three REF-output operators (compressor, both epilogs) were exercised");
+}
+
 }  // namespace
 }  // namespace ascend_moe
 
@@ -365,6 +850,10 @@ int RunMain() {
     TestTableResolution();
     TestMhcChain();
     TestQuantLightningIndexer();
+    TestCompressor();
+    TestSharedKvPath();
+    TestCacheEpilogs();
+    TestRepeatabilityInvariant();
   } catch (const std::exception& error) {
     std::printf("\nunexpected exception: %s\n", error.what());
     ++g_failures;

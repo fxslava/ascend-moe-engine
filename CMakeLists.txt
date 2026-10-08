@@ -35,12 +35,14 @@
 #   mock/       the symbolic libopapi_mock backend (headers + implementation)
 #   tests/      every test binary: contract smoke, mock suite, device probes
 #   python/     torch-free tokenizer + benchmark harness
-#   third_party/ vendored arch35 operator sources (ops-transformer)
+#   third_party/ops_dsv4/ vendored arch35 DSV4 operator sources
 #
 # TARGETS
 #   ascend_moe_engine            libascend_moe_engine.so -- the engine itself
-#   cust_opapi                   (CANN mode) libcust_opapi.so, the vendored
-#                                mHC + lightning-indexer operator entry points
+#   cust_opapi                   (CANN mode) libcust_opapi.so, the nine
+#                                vendored arch35 operator entry points (mHC chain,
+#                                both indexers, compressor, shared-KV attention,
+#                                the two cache epilogs)
 #   moe_runner                   the inference binary (apps/moe_runner.cpp)
 #   mock_contract_smoke          (mock mode) the device-free contract test
 #   mock_pipeline_e2e            (mock mode) the symbolic pipeline suite
@@ -275,12 +277,17 @@ else()
   # scoped to that one translation unit so the vendor tree stays out of the
   # engine's public include path.
   set(_moe_vendor_check_includes
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_pre/op_host/op_api"
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_sinkhorn/op_host/op_api"
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/mhc/mhc_post/op_host/op_api"
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/attention/quant_lightning_indexer/op_host/op_api"
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/common/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_transformer/common/include/external"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_pre/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_sinkhorn/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_post/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/quant_lightning_indexer/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/compressor/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/vllm_quant_lightning_indexer/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/kv_quant_sparse_attn_sharedkv/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/kv_compress_epilog/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/indexer_compress_epilog_v2/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/common/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/common/include/external"
       "${ASCEND_HOME_PATH}/include/aclnn")
   set_source_files_properties(src/core/aclnn_signature_check.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${_moe_vendor_check_includes}"
@@ -297,14 +304,17 @@ else()
 endif()
 
 # -----------------------------------------------------------------------------
-# Vendored arch35 (Ascend 950PR) operators from ops-transformer
+# Vendored arch35 (Ascend 950PR) DeepSeek-V4-Flash operators
 # -----------------------------------------------------------------------------
-# mhc_pre / mhc_sinkhorn / mhc_post / quant_lightning_indexer. In a CANN build
-# this produces libcust_opapi.so in the build root and link-loads it into the
-# engine, so OpTable's dlsym(RTLD_DEFAULT, ...) resolves the four vendored
-# entry-point pairs. In a mock build the directory contributes nothing: the
-# stubs live in mock/mock_ops.cpp inside libopapi_mock.so.
-add_subdirectory(third_party/ops_transformer)
+# The mHC residual chain (mhc_pre / mhc_sinkhorn / mhc_post), both lightning
+# indexers, the token-level compressor, the shared-KV sparse attention core and
+# the two cache epilogs -- see third_party/ops_dsv4/CMakeLists.txt for which
+# upstream each subtree came from. In a CANN build this produces
+# libcust_opapi.so in the build root and link-loads it into the engine, so
+# OpTable's dlsym(RTLD_DEFAULT, ...) resolves all nine vendored entry-point
+# pairs. In a mock build the directory contributes nothing: the stubs live in
+# mock/mock_ops.cpp inside libopapi_mock.so.
+add_subdirectory(third_party/ops_dsv4)
 if(TARGET cust_opapi)
   target_link_libraries(ascend_moe_engine PUBLIC cust_opapi)
 endif()

@@ -76,12 +76,17 @@
 
 // The vendored arch35 operators have no toolkit header to check against --
 // the authoritative declaration is the vendored copy this repository builds
-// libcust_opapi.so from (third_party/ops_transformer), reached here through
+// libcust_opapi.so from (third_party/ops_dsv4), reached here through
 // the per-file include directories set in the root CMakeLists.
 #include "aclnn_mhc_pre.h"
 #include "aclnn_mhc_sinkhorn.h"
 #include "aclnn_mhc_post.h"
 #include "aclnn_quant_lightning_indexer.h"
+#include "aclnn_compressor.h"
+#include "aclnn_vllm_quant_lightning_indexer.h"
+#include "aclnn_kv_quant_sparse_attn_sharedkv.h"
+#include "aclnn_kv_compress_epilog.h"
+#include "aclnn_indexer_compress_epilog_v2.h"
 
 namespace ascend_moe {
 namespace {
@@ -147,10 +152,20 @@ DSV4_ASSERT_SIGNATURE(aclnnMhcPreGetWorkspaceSize, MhcPrePlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhornGetWorkspaceSize, MhcSinkhornPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPostGetWorkspaceSize, MhcPostPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexerGetWorkspaceSize, QuantLightningIndexerPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnCompressorGetWorkspaceSize, CompressorPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnVllmQuantLightningIndexerGetWorkspaceSize, VllmQuantLightningIndexerPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnKvQuantSparseAttnSharedkvGetWorkspaceSize, KvQuantSparseAttnSharedkvPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnKvCompressEpilogGetWorkspaceSize, KvCompressEpilogPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnIndexerCompressEpilogV2GetWorkspaceSize, IndexerCompressEpilogV2PlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPre, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhorn, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPost, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexer, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnCompressor, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnVllmQuantLightningIndexer, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnKvQuantSparseAttnSharedkv, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnKvCompressEpilog, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnIndexerCompressEpilogV2, AclnnLaunchFn);
 
 #undef DSV4_ASSERT_SIGNATURE
 

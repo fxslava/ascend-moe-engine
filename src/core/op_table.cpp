@@ -76,16 +76,28 @@ const OpDeclaration kDeclarations[] = {
      "fused expert GEMM1 + clamped SwiGLU + MX requant (fused path)", false, false},
     {OpId::kGroupedMatmulFinalizeRoutingV3, "aclnnGroupedMatmulFinalizeRoutingV3",
      "fused GEMM2 + combine; unusable with scattered expert slots, see dsv4_pipeline.cpp", false, false},
-    // Vendored arch35 operators (third_party/ops_transformer, libcust_opapi.so
-    // in a CANN build): the mHC residual chain and the sparse-attention
-    // indexer. They are required -- this repository builds their host library
-    // itself, so a missing symbol is a build problem, not a toolkit variant.
+    // Vendored arch35 DSV4 operators (third_party/ops_dsv4, libcust_opapi.so
+    // in a CANN build): the mHC residual chain, both sparse-attention
+    // indexers, the token-level KV compressor, the shared-KV attention core
+    // and the two cache epilogs. They are required -- this repository builds
+    // their host library itself, so a missing symbol is a build problem, not a
+    // toolkit variant.
     {OpId::kMhcPre, "aclnnMhcPre", "vendored mHC pre-mapping (fold states into layer input + routing state)", true,
      false},
     {OpId::kMhcSinkhorn, "aclnnMhcSinkhorn", "vendored mHC doubly-stochastic normalization of hRes", true, false},
     {OpId::kMhcPost, "aclnnMhcPost", "vendored mHC residual combine after the attention/MLP layer", true, false},
     {OpId::kQuantLightningIndexer, "aclnnQuantLightningIndexer",
      "vendored sparse-flash indexer top-k + query/key quantization", true, false},
+    {OpId::kCompressor, "aclnnCompressor",
+     "vendored token-level KV compressor (softmax pooling + RMSNorm + RoPE, cmp_ratio 4/128)", true, false},
+    {OpId::kVllmQuantLightningIndexer, "aclnnVllmQuantLightningIndexer",
+     "vendored shared-KV indexer top-k (metadata input, compressed key stream)", true, false},
+    {OpId::kKvQuantSparseAttnSharedkv, "aclnnKvQuantSparseAttnSharedkv",
+     "vendored shared-KV MQA sparse attention over the hybrid quantized KV cache", true, false},
+    {OpId::kKvCompressEpilog, "aclnnKvCompressEpilog",
+     "vendored compressed-KV quantize + paged-cache scatter epilog", true, false},
+    {OpId::kIndexerCompressEpilogV2, "aclnnIndexerCompressEpilogV2",
+     "vendored indexer-cache scatter epilog", true, false},
 };
 
 // Resolve a symbol out of the libraries already on the loader path. The CANN
