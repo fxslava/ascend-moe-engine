@@ -62,6 +62,7 @@ aclnnStatus CheckParams(const aclTensor *query, const aclTensor *key, const aclT
                         const aclTensor *queryDequantScale, const aclTensor *keyDequantScale,
                         const aclTensor *actualSeqLengthsQueryOptional,
                         const aclTensor *actualSeqLengthsKeyOptional, const aclTensor *blockTableOptional,
+                        const aclTensor *metadataOptional,
                         const char *layoutQueryOptional, const char *layoutKeyOptional, int64_t sparseCount,
                         const aclTensor *sparseIndicesOut, const aclTensor *sparseValuesOut)
 {
@@ -70,12 +71,24 @@ aclnnStatus CheckParams(const aclTensor *query, const aclTensor *key, const aclT
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
 
     const auto queryDtype = query->GetDataType();
-    if (queryDtype != DataType::DT_FLOAT8_E4M3FN && queryDtype != DataType::DT_HIFLOAT8) {
-        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "query must be FP8 E4M3 or HiFloat8.");
+    if (queryDtype != DataType::DT_FLOAT8_E4M3FN) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "arch35 query must be FP8 E4M3FN.");
         return ACLNN_ERR_PARAM_INVALID;
     }
     if (key->GetDataType() != queryDtype) {
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "key must share the dtype of query.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (weights->GetDataType() != DataType::DT_FLOAT ||
+        queryDequantScale->GetDataType() != DataType::DT_FLOAT ||
+        keyDequantScale->GetDataType() != DataType::DT_FLOAT) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "arch35 weights and dequant scales must be FP32.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (metadataOptional == nullptr || metadataOptional->GetDataType() != DataType::DT_INT32 ||
+        metadataOptional->GetViewShape().GetDimNum() != 1 ||
+        metadataOptional->GetViewShape().GetDim(0) != 1024) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "metadata must be an INT32 [1024] work schedule.");
         return ACLNN_ERR_PARAM_INVALID;
     }
     if (sparseIndicesOut->GetDataType() != DataType::DT_INT32) {
@@ -117,6 +130,15 @@ aclnnStatus CheckParams(const aclTensor *query, const aclTensor *key, const aclT
         OP_LOGE(ACLNN_ERR_PARAM_INVALID, "a PA_BSND key layout requires blockTableOptional.");
         return ACLNN_ERR_PARAM_INVALID;
     }
+    if (LayoutIs(layoutKeyOptional, "PA_BSND")) {
+        const auto shape = key->GetViewShape();
+        if (shape.GetDimNum() != 4 || (shape.GetDim(1) <= 0 || shape.GetDim(1) > 1024 || shape.GetDim(1) % 16 != 0) || shape.GetDim(2) != 1 ||
+            shape.GetDim(3) != kIndexerHeadDim || blockTableOptional->GetDataType() != DataType::DT_INT32 ||
+            blockTableOptional->GetViewShape().GetDimNum() != 2) {
+            OP_LOGE(ACLNN_ERR_PARAM_INVALID, "PA_BSND requires [blocks,blockSize,1,128], blockSize a multiple of 16 in [16,1024], and an INT32 block table.");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
     return ACLNN_SUCCESS;
 }
 
@@ -155,7 +177,7 @@ aclnnStatus aclnnVllmQuantLightningIndexerGetWorkspaceSize(
     CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
     auto ret = CheckParams(query, key, weights, queryDequantScale, keyDequantScale, actualSeqLengthsQueryOptional,
-                           actualSeqLengthsKeyOptional, blockTableOptional, layoutQueryOptional, layoutKeyOptional,
+                           actualSeqLengthsKeyOptional, blockTableOptional, metadataOptional, layoutQueryOptional, layoutKeyOptional,
                            sparseCount, sparseIndicesOut, sparseValuesOut);
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
 

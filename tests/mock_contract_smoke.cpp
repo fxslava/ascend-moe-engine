@@ -694,9 +694,9 @@ void TestVendorSharedKvArena() {
   constexpr int64_t kBlocksArena = 8;
   constexpr int64_t kBlockSizeArena = 128;
   constexpr int64_t kSparseCount = 16;
-  constexpr int64_t kCmpChannels = 256;
+  constexpr int64_t kCmpChannels = 512;
   constexpr int64_t kRopeHeadDim = 64;
-  constexpr int64_t kStateDim = 128;
+  constexpr int64_t kStateDim = 1024;
   constexpr int64_t kCmpRatio = 4;           // CSA
   constexpr int64_t kCompressedRows = kTokensArena / kCmpRatio;
 
@@ -713,9 +713,9 @@ void TestVendorSharedKvArena() {
   const size_t attn_out_bytes = attn_query_bytes;
   const size_t idx_query_bytes = static_cast<size_t>(kTokensArena) * kHeadsArena * kIndexerDim;      // FP8
   const size_t weight_bytes = static_cast<size_t>(kHiddenSize) * kCmpChannels * 2 +                  // wkv BF16
-                              static_cast<size_t>(kHiddenSize) * 2;                                  // wgate BF16
+                              static_cast<size_t>(kHiddenSize) * kCmpChannels * 2; // wgate BF16
   const size_t staging_bytes = static_cast<size_t>(kTokensArena) * kHiddenSize * 2 +                 // x BF16
-                               static_cast<size_t>(kCompressedRows) * kCmpChannels * 2 +             // cmp rows BF16
+                               static_cast<size_t>(kCompressedRows + 1) * kCmpChannels * 2 +             // cmp rows BF16
                                static_cast<size_t>(kCompressedRows) * kIndexerDim * 2;               // idx rows BF16
   const size_t state_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * kStateDim * 4;    // FP32
   const size_t k_scale_bytes = static_cast<size_t>(kBlocksArena) * kBlockSizeArena * 4;              // FP32
@@ -805,28 +805,31 @@ void TestVendorSharedKvArena() {
   // -- the compressor -------------------------------------------------------
   aclTensor* comp_x = make(h_staging, 0, {kTokensArena, kHiddenSize}, ACL_BF16);
   size_t staging_cursor = static_cast<size_t>(kTokensArena) * kHiddenSize * 2;
+  aclTensor* cmp_padded = make(h_staging, staging_cursor, {kCompressedRows + 1, kCmpChannels}, ACL_BF16);
   aclTensor* cmp_rows = make(h_staging, staging_cursor, {kCompressedRows, kCmpChannels}, ACL_BF16);
-  staging_cursor += static_cast<size_t>(kCompressedRows) * kCmpChannels * 2;
+  staging_cursor += static_cast<size_t>(kCompressedRows + 1) * kCmpChannels * 2;
   aclTensor* idx_rows = make(h_staging, staging_cursor, {kCompressedRows, kIndexerDim}, ACL_BF16);
   staging_cursor += static_cast<size_t>(kCompressedRows) * kIndexerDim * 2;
   Check(staging_cursor <= staging_bytes,
         "the compressor staging tensors fit inside the compressor.staging reservation");
 
-  aclTensor* wkv = make(h_weights, 0, {kHiddenSize, kCmpChannels}, ACL_BF16);
-  aclTensor* wgate = make(h_weights, static_cast<size_t>(kHiddenSize) * kCmpChannels * 2, {kHiddenSize, 1},
+  aclTensor* wkv = make(h_weights, 0, {kCmpChannels, kHiddenSize}, ACL_BF16);
+  aclTensor* wgate = make(h_weights, static_cast<size_t>(kHiddenSize) * kCmpChannels * 2, {kCmpChannels, kHiddenSize},
                           ACL_BF16);
   aclTensor* state_cache = make(h_state, 0, {kBlocksArena, kBlockSizeArena, kStateDim}, ACL_FLOAT32);
 
-  aclTensor* ape = scratch({kTokensArena}, ACL_FLOAT32, 4);
+  aclTensor* ape = scratch({kCmpRatio, kCmpChannels}, ACL_FLOAT32, 4);
   aclTensor* norm_weight = scratch({kCmpChannels}, ACL_FLOAT32, 4);
-  aclTensor* rope_sin = scratch({kTokensArena, kRopeHeadDim}, ACL_FLOAT32, 4);
-  aclTensor* rope_cos = scratch({kTokensArena, kRopeHeadDim}, ACL_FLOAT32, 4);
+  aclTensor* rope_sin = scratch({kCompressedRows + 1, kRopeHeadDim}, ACL_FLOAT32, 4);
+  aclTensor* rope_cos = scratch({kCompressedRows + 1, kRopeHeadDim}, ACL_FLOAT32, 4);
   aclTensor* slot_map = scratch({kCompressedRows}, ACL_INT32, 4);
   aclTensor* ori_indices = scratch({kTokensArena, 1, kSparseCount}, ACL_INT32, 4);
   aclTensor* cmp_indices = scratch({kTokensArena, 1, kSparseCount}, ACL_INT32, 4);
   aclTensor* block_table = scratch({1, kBlocksArena}, ACL_INT32, 4);
+  aclTensor* cu_lengths = scratch({2}, ACL_INT32, 4);
+  aclTensor* idx_metadata = scratch({1024}, ACL_INT32, 4);
   aclTensor* seq_lengths = scratch({1}, ACL_INT32, 4);
-  aclTensor* idx_weights = scratch({kTokensArena, kHeadsArena}, ACL_BF16, 2);
+  aclTensor* idx_weights = scratch({kTokensArena, kHeadsArena}, ACL_FLOAT32, 4);
   aclTensor* idx_q_scale = scratch({kTokensArena, kHeadsArena}, ACL_FLOAT32, 4);
   // returnValues / returnSoftmaxLse false are signalled by [0] placeholders,
   // which is what the vendored wrappers check before issuing a second copy.
@@ -856,13 +859,13 @@ void TestVendorSharedKvArena() {
     aclOpExecutor* executor = nullptr;
     ws_compressor = PlanAclnnOp<CompressorPlanFn>(
         ops, OpId::kCompressor, &executor, comp_x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
-        block_table, seq_lengths, nullptr, nullptr, kRopeHeadDim, kCmpRatio, 1, 1e-6, 1, 1,
-        mock::AsMockTensor(state_cache)->strides.at(0), cmp_rows);
+        block_table, cu_lengths, nullptr, nullptr, kRopeHeadDim, kCmpRatio, 1, 1e-6, 1, 1,
+        mock::AsMockTensor(state_cache)->strides.at(0), cmp_padded);
     aclDestroyAclOpExecutor(executor);
     executor = nullptr;
     ws_indexer = PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
         ops, OpId::kVllmQuantLightningIndexer, &executor, idx_query, idx_key, idx_weights, idx_q_scale, idx_k_scale,
-        seq_lengths, seq_lengths, block_table, nullptr, 0, 0, const_cast<char*>("TND"),
+        seq_lengths, seq_lengths, block_table, idx_metadata, 0, 0, const_cast<char*>("TND"),
         const_cast<char*>("PA_BSND"), kSparseCount, 3, INT64_MAX, INT64_MAX, kCmpRatio, false,
         mock::AsMockTensor(idx_key)->strides.at(0), mock::AsMockTensor(idx_k_scale)->strides.at(0), cmp_indices, no_values);
     aclDestroyAclOpExecutor(executor);

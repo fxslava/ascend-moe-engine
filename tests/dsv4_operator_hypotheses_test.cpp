@@ -25,7 +25,7 @@
 // whether the operator agrees -- BEFORE any fusing, patching or caching work
 // depends on it being true.
 //
-// THE FOUR HYPOTHESES
+// THE HYPOTHESES
 //   H1  aclnnMhcPre / aclnnMhcPost accept the DSV4 residual-stream geometry
 //       (n_hc = 4 streams over the 4096-wide hidden state, phi [24, 16384]
 //       FP32, FP32 alpha / bias) in both the TND and BSND spellings, emit the
@@ -41,9 +41,9 @@
 //       Birkhoff half stands. See the [refuted] verdict below for what the
 //       engine does instead; the claims are kept stated rather than rewritten
 //       so this file still records what was believed and what disproved it.
-//   H3  aclnnCompressor expresses a sequence-ring cadence at cmpRatio 4 (CSA):
-//       an incomplete window emits nothing at all, and the window-closing step
-//       emits exactly one compressed row.
+//   H3  The engine fills a device window ring and only launches aclnnCompressor
+//       on every fourth token. TH storage reserves one emitted row plus padding;
+//       partial windows create no descriptors or executors.
 //   H4  aclnnVllmQuantLightningIndexer returns top-512 sparse indices as INT32
 //       at [1, 1, 1, 512] over an FP8 E4M3 paged key stream, and every index
 //       it returns is a valid, non-negative sequence slot.
@@ -84,6 +84,7 @@
 // the real GetWorkspaceSize magnitudes. Those need a 950PR with the vendored
 // opp package deployed, which is what the compiled binary is for.
 
+#include <algorithm>
 #include <cinttypes>
 #include <functional>
 #include <cmath>
@@ -97,6 +98,7 @@
 #include "aclnn/acl_meta.h"
 
 #include "moe/core/config.hpp"
+#include "moe/core/arch35_contract.hpp"
 #include "moe/core/device_ops.hpp"
 #include "moe/core/error.hpp"
 #include "moe/core/kv_cache_layout.hpp"
@@ -189,15 +191,9 @@ constexpr double kBirkhoffTolerance = 1e-5;  // the hypothesis' own tolerance
 // H3: the CSA compressor at the brief's geometry.
 constexpr int64_t kCompressRatio = 4;                          // CSA
 constexpr int64_t kCompressedDim = kDefaultKvLoraRank;         // D = 512
-constexpr int64_t kCompressorGateWidth = 2 * kDefaultKvLoraRank;  // 1024
 constexpr int64_t kRopeHeadDim = kDefaultQkRopeHeadDim;        // 64
 constexpr int64_t kStateBlocks = 4;
 constexpr int64_t kStateBlockSize = 8;
-// The compressed-entry width the task brief states. It is NOT derivable from
-// any (D, dtype) pair in this geometry, so H3 asserts the derived width and
-// records this one for the on-device run to settle. See the note it prints.
-constexpr int64_t kBriefCompressedEntryBytes = 604;
-
 // H4: the lightning indexer at the brief's geometry.
 constexpr int64_t kIndexerBlocks = 8;
 constexpr int64_t kIndexerBlockSize = 128;
@@ -331,6 +327,7 @@ class DeviceArena {
     base_ = reinterpret_cast<char*>(mock::MockDeviceMalloc(bytes));
 #else
     base_ = static_cast<char*>(allocator_->DeviceMalloc(bytes));
+    if (base_ != nullptr) allocator_->DeviceMemset(base_, bytes, 0, bytes);
 #endif
     DSV4_REQUIRE(base_ != nullptr, "the hypothesis arena could not be reserved");
     // A leading guard so no tensor ever starts exactly at the span base: every
@@ -459,7 +456,7 @@ PlanResult RunPlan(Fn plan) {
   } catch (const AclError& error) {
     result.status = error.status();
     result.contract_verdict = result.status == kStatusNullPointer || result.status == kStatusParamInvalid ||
-                              result.status == kStatusMockContract;
+                              result.status == kStatusMockContract || result.status == 561103;
     result.detail = error.what();
   } catch (const Dsv4Error& error) {
     // A refusal raised by the engine's own validation, or by the symbolic
@@ -573,14 +570,24 @@ bool CheckBirkhoffInvariant(const float* blocks, int64_t count, int64_t n, doubl
     for (int64_t row = 0; row < n; ++row) {
       double sum = 0.0;
       for (int64_t column = 0; column < n; ++column) {
-        sum += matrix[row * n + column];
+        const float value = matrix[row * n + column];
+        if (!std::isfinite(value) || value < 0.0f) {
+          *worst = INFINITY;
+          return false;
+        }
+        sum += value;
       }
       worst_deviation = std::fmax(worst_deviation, std::fabs(sum - 1.0));
     }
     for (int64_t column = 0; column < n; ++column) {
       double sum = 0.0;
       for (int64_t row = 0; row < n; ++row) {
-        sum += matrix[row * n + column];
+        const float value = matrix[row * n + column];
+        if (!std::isfinite(value) || value < 0.0f) {
+          *worst = INFINITY;
+          return false;
+        }
+        sum += value;
       }
       worst_deviation = std::fmax(worst_deviation, std::fabs(sum - 1.0));
     }
@@ -1151,6 +1158,7 @@ void TestFusedHcPreSinkhorn(const Backend& backend) {
         "y comes out at [1, 4096] -- the activation RMSNorm and the attention projections already take, "
         "so the engine feeds it on with no reshape");
 
+  Note("provider: " + ops.op(OpId::kHcPre).provider);
   std::printf("\n-- H5.1 the fused plan, and whether it can be retained --\n");
   PlanResult plan = RunPlan([&](aclOpExecutor** executor) {
     // hcEps precedes normEps here, the reverse of aclnnMhcPre's order.
@@ -1191,6 +1199,7 @@ void TestFusedHcPreSinkhorn(const Backend& backend) {
     // residual stream -- and relaunch.
     slot.SetAddress(0, x.handle, x.address);
     slot.Launch(ops, workspace, stream);
+    backend.streams->SynchronizeStream(stream);
     Check(true, "the fused plan relaunched after aclSetTensorAddr on its stream input");
   }
 
@@ -1243,199 +1252,88 @@ void TestFusedHcPreSinkhorn(const Backend& backend) {
 }
 
 void TestCompressorRingCadence(const Backend& backend) {
-  Hypothesis(3, "aclnnCompressor expresses a sequence-ring cadence at cmpRatio 4 (CSA)");
-  Assume("compression ratio 4 (CSA), compressed width D = 512, ropeHeadDim = 64");
-  Assume("the pooling state is a paged ring buffer [blocks, blockSize, D] FP32, updated in place (REF)");
-  Assume("steps t = 0, 1, 2 emit nothing and write nothing into the compressed KV destination");
-  Assume("step t = 3 closes the window and emits exactly one compressed entry");
-
+  Hypothesis(3, "full-window compressor with device ring buffering");
   OpTable ops;
-  if (!ops.runtime_reachable()) {
-    Skip("the aclnn runtime is not on the loader path; no operator to question");
-    return;
-  }
-
-  Note("API mapping: the compressed rows land in cmpKvOut (the brief's 'kvCacheRef' destination) and the "
-       "recurrent ring lives in stateCacheRef, the one REF parameter. 'emitted' is cmpKvOut's row count, "
-       "which the wrapper pins at T / cmpRatio.");
-
   DeviceArena arena(backend.allocator, 64ull << 20);
   std::vector<Tensor> owned;
-  const auto track = [&owned](Tensor tensor) {
+  const auto make = [&](std::vector<int64_t> shape, aclDataType dtype) {
+    Tensor tensor = arena.Make(shape, dtype);
     owned.push_back(tensor);
     return tensor;
   };
-
-  // The projection pair, the positional bias and the RoPE tables are the same
-  // weights at every step; only the window and its destination move.
-  const Tensor wkv = track(arena.Make({kHiddenSize, kCompressedDim}, kDtBf16));
-  const Tensor wgate = track(arena.Make({kHiddenSize, 1}, kDtBf16));
-  const Tensor ape = track(arena.Make({kCompressRatio, kCompressedDim}, kDtFp32));
-  const Tensor norm_weight = track(arena.Make({kCompressedDim}, kDtFp32));
-  const Tensor state_cache = track(arena.Make({kStateBlocks, kStateBlockSize, kCompressedDim}, kDtFp32));
-  const Tensor state_blocks = track(arena.Make({1, kStateBlocks}, kDtInt32));
-  const Tensor cu_seqlens = track(arena.Make({1}, kDtInt32));
-  const Tensor seqused = track(arena.Make({1}, kDtInt32));
-  const Tensor start_pos = track(arena.Make({1}, kDtInt32));
-
-  Check(state_cache.shape.size() == 3 && state_cache.dtype == kDtFp32,
-        "the ring state is the paged 3-D FP32 buffer the wrapper requires, " + state_cache.text());
-  Check(norm_weight.shape == std::vector<int64_t>({kCompressedDim}),
-        "normWeight is 1-D at the compressed width, so cmpKvOut channels are normWeight[0] * coff = " +
-            std::to_string(kCompressedDim));
-  Note("the brief's [1, 1, 1024] KV and score tensors map onto the compressor's wkv/wgate projection pair "
-       "over the 4096-wide residual stream; 1024 = 2 * kv_lora_rank is the gate-side width, not a tensor "
-       "this operator takes directly.");
-
-  const int64_t state_stride0 = state_cache.strides.at(0);
-
-  // ---- the four steps of one CSA window ----------------------------------
-  int64_t emitted_total = 0;
-  for (int64_t step = 0; step < kCompressRatio; ++step) {
-    const int64_t window = step + 1;               // tokens the caller is holding
-    const int64_t emitted = window / kCompressRatio;  // the wrapper's own rule
-    const bool closing = window % kCompressRatio == 0;
-    std::printf("\n-- H3 step t = %" PRId64 ": window %" PRId64 " token(s), cmpKvOut rows %" PRId64 " --\n",
-                step, window, emitted);
-
-    const Tensor x = track(arena.Make({window, kHiddenSize}, kDtBf16));
-    const Tensor rope_sin = track(arena.Make({window, kRopeHeadDim}, kDtBf16));
-    const Tensor rope_cos = track(arena.Make({window, kRopeHeadDim}, kDtBf16));
-    const Tensor cmp_kv_out = track(arena.Make({emitted, kCompressedDim}, kDtBf16));
-
-    const Ledger before = ReadLedger();
-    PlanResult plan = RunPlan([&](aclOpExecutor** executor) {
-      return PlanAclnnOp<CompressorPlanFn>(
-          ops, OpId::kCompressor, executor, x.handle, wkv.handle, wgate.handle, state_cache.handle, ape.handle,
-          norm_weight.handle, rope_sin.handle, rope_cos.handle, state_blocks.handle, cu_seqlens.handle,
-          seqused.handle, start_pos.handle, kRopeHeadDim, kCompressRatio, /*coff=*/1, kRmsNormEpsilon,
-          /*rotaryMode=*/0, /*cacheMode=*/0, state_stride0, cmp_kv_out.handle);
-    });
-    if (!ExpectPlanned(plan, "the compressor accepts the step-" + std::to_string(step) + " window x " + x.text())) {
-      continue;
-    }
-    const Ledger after = ReadLedger();
-
-    if (!closing) {
-      Check(emitted == 0, "step " + std::to_string(step) + " emits nothing: cmpKvOut is " + cmp_kv_out.text());
-      Check(plan.workspace == 0,
-            "the incomplete window plans a ZERO-byte workspace -- the wrapper's empty-tensor early return "
-            "fired, so no kernel and no ViewCopy were staged");
-      if (after.available) {
-        Check(after.ref_output_plans == before.ref_output_plans,
-              "no in-place update of stateCacheRef was staged either: the step is a total no-op, so nothing "
-              "can reach the compressed KV destination");
-      } else {
-        Skip("the REF-plan ledger is a mock-build instrument; the zero workspace above is the device-side "
-             "witness that nothing was staged");
-      }
-    } else {
-      Check(emitted == 1, "step " + std::to_string(step) + " emits exactly one row: cmpKvOut is " +
-                              cmp_kv_out.text());
-      Check(plan.workspace > 0, "the window-closing step plans a non-empty workspace -- real work is staged");
-      if (after.available) {
-        Check(after.ref_output_plans == before.ref_output_plans + 1,
-              "exactly one REF plan was recorded: stateCacheRef is updated in place, with no copy stage to "
-              "alias");
-        Check(after.self_copy_hazards == before.self_copy_hazards,
-              "the emitting step plans no same-address ViewCopy, so its executor stays reusable across windows");
-      }
-      const int64_t entry_bytes =
-          kCompressedDim * static_cast<int64_t>(DataTypeBytes(cmp_kv_out.dtype));
-      Check(cmp_kv_out.bytes == static_cast<size_t>(entry_bytes),
-            "the emitted entry is " + std::to_string(entry_bytes) + " bytes (D = " +
-                std::to_string(kCompressedDim) + " x " + DataTypeName(cmp_kv_out.dtype) + ")");
-
-      // THE MEASURED RECORD LAYOUT, read back off the descriptors the kernel
-      // was actually handed rather than recomputed. This is the record the
-      // on-device run exists to produce: the engine sizes its paged cache from
-      // Dsv4CompressedKvEntry and derives every stride attribute from the
-      // bound view, so these three numbers are what a disagreement would show
-      // up in.
-      const int64_t out_row_stride = DeriveDimensionStrideElements(cmp_kv_out.handle, 0);
-      const size_t out_row_bytes = DeriveDimensionStrideBytes(cmp_kv_out.handle, 0);
-      const int64_t ring_stride = DeriveDimensionStrideElements(state_cache.handle, 0);
-      const size_t ring_bytes = DeriveDimensionStrideBytes(state_cache.handle, 0);
-      Note("MEASURED LAYOUT: cmpKvOut row stride " + std::to_string(out_row_stride) + " elements = " +
-           std::to_string(out_row_bytes) + " bytes (" + DataTypeName(cmp_kv_out.dtype) + " x " +
-           std::to_string(kCompressedDim) + "); stateCacheRef axis-0 stride " + std::to_string(ring_stride) +
-           " elements = " + std::to_string(ring_bytes) + " bytes. Both were DERIVED from the bound view with "
-           "aclGetViewStrides, which is the only way the runtime is allowed to learn a stride attribute.");
-      Check(out_row_bytes == static_cast<size_t>(entry_bytes),
-            "the derived byte stride of one emitted row agrees with D x sizeof(dtype) -- the destination view "
-            "really is contiguous rows, so a cache sized on that stride addresses it correctly");
-      if (entry_bytes != kBriefCompressedEntryBytes) {
-        Note("UNRESOLVED: the brief states a " + std::to_string(kBriefCompressedEntryBytes) +
-             "-byte compressed entry, and the kernel's own cmpKvOut row is " + std::to_string(entry_bytes) +
-             " bytes. No (width, dtype) pair in this geometry produces " +
-             std::to_string(kBriefCompressedEntryBytes) + ": BF16 x 512 = " +
-             std::to_string(kCompressedDim * 2) + ", FP8 x 512 = " + std::to_string(kCompressedDim) +
-             ", FP8 x (512 + 64 rope) = " + std::to_string(kCompressedDim + kRopeHeadDim) +
-             ". The " + std::to_string(kBriefCompressedEntryBytes) +
-             "-byte figure is a PACKED CACHE ENTRY (448 nope FP8 + 7 UE8M0 scales + 21 pad + 64 rope BF16), "
-             "which is what aclnnKvCompressEpilog produces FROM this row -- not what the compressor emits. "
-             "Dsv4CompressedKvEntry in kv_cache_layout.hpp holds that packing to the byte; this probe "
-             "asserts the compressor's own row width, which is the number its destination view must match.");
-      }
-    }
-    emitted_total += emitted;
-
-    if (plan.planned) {
-      StaticOpSlot slot;
-      slot.Adopt(OpId::kCompressor, "hypothesis/compressor", plan.workspace, plan.executor);
-      void* workspace = plan.workspace > 0 ? backend.allocator->DeviceMalloc(plan.workspace) : nullptr;
-      DeviceStream stream = backend.streams->CreateStream();
-      slot.Launch(ops, workspace, stream);
-      Check(true, "the step-" + std::to_string(step) + " plan adopted (repeatable) and launched");
-      slot.Reset();
-      backend.streams->DestroyStream(stream);
-      if (workspace != nullptr) {
-        backend.allocator->DeviceFree(workspace);
-      }
-    }
+  const Tensor x = make({kCompressRatio, kHiddenSize}, kDtBf16);
+  const Tensor token = make({1, kHiddenSize}, kDtBf16);
+  const Tensor wkv = make({kCompressedDim, kHiddenSize}, kDtBf16);
+  const Tensor wgate = make({kCompressedDim, kHiddenSize}, kDtBf16);
+  const Tensor state = make({kStateBlocks, kStateBlockSize, 2 * kCompressedDim}, kDtFp32);
+  const Tensor ape = make({kCompressRatio, kCompressedDim}, kDtFp32);
+  const Tensor norm = make({kCompressedDim}, kDtFp32);
+  const Tensor sin = make({kCompressorWindowOutputRows, kRopeHeadDim}, kDtFp32);
+  const Tensor cos = make({kCompressorWindowOutputRows, kRopeHeadDim}, kDtFp32);
+  const Tensor blocks = make({1, kStateBlocks}, kDtInt32);
+  const Tensor lengths = make({2}, kDtInt32);
+  const Tensor used = make({1}, kDtInt32);
+  const Tensor start = make({1}, kDtInt32);
+  const Tensor output = make({kCompressorWindowOutputRows, kCompressedDim}, kDtBf16);
+  Note("TH tiling reserves two output rows: one emitted row plus padding. State stores both KV and scores.");
+  if (backend.numerics_live) {
+    const int32_t block_ids[] = {0, 1, 2, 3};
+    const int32_t cu[] = {0, static_cast<int32_t>(kCompressRatio)};
+    const int32_t count = kCompressRatio;
+    backend.streams->MemcpySync(blocks.address, blocks.bytes, block_ids, sizeof(block_ids), MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(lengths.address, lengths.bytes, cu, sizeof(cu), MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(used.address, used.bytes, &count, sizeof(count), MemcpyKind::kHostToDevice);
+    std::vector<float> ones(static_cast<size_t>(kCompressedDim), 1.0f);
+    backend.streams->MemcpySync(norm.address, norm.bytes, ones.data(), norm.bytes, MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(cos.address, cos.bytes, ones.data(), cos.bytes, MemcpyKind::kHostToDevice);
   }
-
-  std::printf("\n-- H3 the cadence over one full window --\n");
-  Check(emitted_total == 1,
-        "four steps at cmpRatio 4 emit exactly one compressed entry in total (" +
-            std::to_string(emitted_total) + ")");
-
-  // The stride attribute is how the kernel addresses the paged ring; a stale
-  // value scatters the pooling state into the wrong block.
-  std::printf("\n-- H3 the ring's addressing attribute --\n");
-  const Tensor x_closing = track(arena.Make({kCompressRatio, kHiddenSize}, kDtBf16));
-  const Tensor sin_closing = track(arena.Make({kCompressRatio, kRopeHeadDim}, kDtBf16));
-  const Tensor cos_closing = track(arena.Make({kCompressRatio, kRopeHeadDim}, kDtBf16));
-  const Tensor out_closing = track(arena.Make({1, kCompressedDim}, kDtBf16));
-  ReportAttributeGuard(RunPlan([&](aclOpExecutor** executor) {
-                         return PlanAclnnOp<CompressorPlanFn>(
-                             ops, OpId::kCompressor, executor, x_closing.handle, wkv.handle, wgate.handle,
-                             state_cache.handle, ape.handle, norm_weight.handle, sin_closing.handle,
-                             cos_closing.handle, state_blocks.handle, cu_seqlens.handle, seqused.handle,
-                             start_pos.handle, kRopeHeadDim, kCompressRatio, /*coff=*/1, kRmsNormEpsilon,
-                             /*rotaryMode=*/0, /*cacheMode=*/0, state_stride0 + 1, out_closing.handle);
-                       }),
-                       "a stateCacheStrideDim0 one element past the ring buffer's own axis-0 stride (" +
-                           std::to_string(state_stride0) + ")",
-                       "the kernel addresses the paged ring through this attribute, so a stale value pools "
-                       "into the wrong block with no diagnostic. The runtime must DERIVE it from the view it "
-                       "just bound -- never carry it as an independent number.");
-  ExpectRefused(RunPlan([&](aclOpExecutor** executor) {
-                  return PlanAclnnOp<CompressorPlanFn>(
-                      ops, OpId::kCompressor, executor, x_closing.handle, wkv.handle, wgate.handle,
-                      state_cache.handle, ape.handle, norm_weight.handle, sin_closing.handle, cos_closing.handle,
-                      state_blocks.handle, cu_seqlens.handle, seqused.handle, start_pos.handle, kRopeHeadDim,
-                      /*cmpRatio=*/8, /*coff=*/1, kRmsNormEpsilon, /*rotaryMode=*/0, /*cacheMode=*/0,
-                      state_stride0, out_closing.handle);
-                }),
-                "cmpRatio = 8, outside the deployed {4 (CSA), 128 (HCA)} pair");
-
+  const auto plan_window = [&](aclOpExecutor** executor, int64_t ratio) {
+    return PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, executor,
+        x.handle, wkv.handle, wgate.handle, state.handle, ape.handle, norm.handle,
+        sin.handle, cos.handle, blocks.handle, lengths.handle, used.handle, start.handle,
+        kRopeHeadDim, ratio, 1, kRmsNormEpsilon, 1, 2, state.strides[0], output.handle);
+  };
+  PlanResult plan = RunPlan([&](aclOpExecutor** executor) { return plan_window(executor, kCompressRatio); });
+  if (!ExpectPlanned(plan, "full TH window plans with FP32 RoPE, [0,4] lengths and cyclic state")) {
+    Destroy(&owned);
+    return;
+  }
+  StaticOpSlot slot;
+  slot.Adopt(OpId::kCompressor, "hypothesis/compressor", plan.workspace, plan.executor);
+  void* workspace = plan.workspace ? backend.allocator->DeviceMalloc(plan.workspace) : nullptr;
+  DeviceStream stream = backend.streams->CreateStream();
+  int emissions = 0;
+  for (int step = 0; step < 8; ++step) {
+    const size_t offset = static_cast<size_t>(step % kCompressRatio) * token.bytes;
+    if (backend.numerics_live) {
+      backend.streams->MemcpyAsync(static_cast<char*>(x.address) + offset, token.bytes,
+          token.address, token.bytes, MemcpyKind::kDeviceToDevice, stream);
+    }
+    if ((step + 1) % kCompressRatio != 0) continue;
+    if (backend.numerics_live) {
+      backend.streams->SynchronizeStream(stream);
+      const int32_t position = step + 1 - kCompressRatio;
+      backend.streams->MemcpySync(start.address, start.bytes, &position, sizeof(position), MemcpyKind::kHostToDevice);
+    }
+    slot.Launch(ops, workspace, stream);
+    backend.streams->SynchronizeStream(stream);
+    ++emissions;
+  }
+  Check(emissions == 2, "eight ring updates replay one retained plan twice; HOLD creates no descriptors or executor");
+  if (backend.numerics_live) {
+    std::vector<uint16_t> row(static_cast<size_t>(kCompressedDim), 1);
+    backend.streams->MemcpySync(row.data(), row.size() * sizeof(uint16_t), output.address,
+                                row.size() * sizeof(uint16_t), MemcpyKind::kDeviceToHost);
+    Check(std::all_of(row.begin(), row.end(), [](uint16_t value) { return value == 0; }),
+          "zero input and projections produce a zero compressed row on replay");
+  }
+  ExpectRefused(RunPlan([&](aclOpExecutor** executor) { return plan_window(executor, 8); }),
+                "unsupported compressor ratio 8");
+  slot.Reset();
+  backend.streams->DestroyStream(stream);
+  if (workspace) backend.allocator->DeviceFree(workspace);
   Destroy(&owned);
 }
-
-// ===========================================================================
-// HYPOTHESIS 4 -- the lightning indexer's top-k sparsity range
-// ===========================================================================
 
 void TestIndexerTopKRange(const Backend& backend) {
   Hypothesis(4, "aclnnVllmQuantLightningIndexer: top-512 indices, INT32, inside the sequence");
@@ -1461,12 +1359,12 @@ void TestIndexerTopKRange(const Backend& backend) {
   const Tensor query = track(arena.Make({kBatch, kSeq, kIndexNumHeads, kIndexHeadDim}, kDtFp8E4m3));
   const Tensor key =
       track(arena.Make({kIndexerBlocks, kIndexerBlockSize, 1, kIndexHeadDim}, kDtFp8E4m3));
-  const Tensor weights = track(arena.Make({kBatch, kSeq, kIndexNumHeads}, kDtBf16));
+  const Tensor weights = track(arena.Make({kBatch, kSeq, kIndexNumHeads}, kDtFp32));
   const Tensor query_scale = track(arena.Make({kBatch, kSeq, kIndexNumHeads}, kDtFp32));
   const Tensor key_scale = track(arena.Make({kIndexerBlocks, kIndexerBlockSize, 1}, kDtFp32));
   const Tensor seq_key = track(arena.Make({kBatch}, kDtInt32));
   const Tensor block_table = track(arena.Make({kBatch, kIndexerBlocks}, kDtInt32));
-  const Tensor metadata = track(arena.Make({kBatch}, kDtInt32));
+  const Tensor metadata = track(arena.Make({kIndexerMetadataElements}, kDtInt32));
   const Tensor indices_out = track(arena.Make({kBatch, kSeq, 1, kIndexTopK}, kDtInt32));
   const Tensor values_out = track(arena.Make({0}, kDtFp32));
 
@@ -1475,22 +1373,44 @@ void TestIndexerTopKRange(const Backend& backend) {
   Check(indices_out.shape == std::vector<int64_t>({1, 1, 1, 512}) && indices_out.dtype == kDtInt32,
         "the output really is [1, 1, 1, 512] INT32 at top-k = " + std::to_string(kIndexTopK));
   Check(kIndexTopK <= 2048, "top-k = " + std::to_string(kIndexTopK) + " sits inside the operator's [1, 2048] bound");
-  Note("the operator also admits HiFloat8 for query/key; E4M3 is the path this engine selects on 950PR, and "
-       "ACL_HIFLOAT8 is the single-token change if that choice is revisited.");
+  Note("arch35 requires ACL_FLOAT8_E4M3FN query/key and FP32 scoring weights and scales.");
 
   const int64_t key_stride0 = key.strides.at(0);
   const int64_t scale_stride0 = key_scale.strides.at(0);
 
+  if (backend.numerics_live) {
+    const auto schedule = DecodeIndexerMetadata();
+    const int32_t original_length = kIndexerKeySlots * kCompressRatio;
+    std::vector<int32_t> blocks(static_cast<size_t>(kIndexerBlocks));
+    for (int32_t i = 0; i < kIndexerBlocks; ++i) blocks[static_cast<size_t>(i)] = i;
+    std::vector<float> ones(static_cast<size_t>(kIndexerKeySlots), 1.0f);
+    backend.streams->MemcpySync(metadata.address, metadata.bytes, schedule.data(), sizeof(schedule), MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(seq_key.address, seq_key.bytes, &original_length, sizeof(original_length), MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(block_table.address, block_table.bytes, blocks.data(), block_table.bytes, MemcpyKind::kHostToDevice);
+    for (const Tensor& tensor : {weights, query_scale, key_scale}) {
+      backend.streams->MemcpySync(tensor.address, tensor.bytes, ones.data(), tensor.bytes, MemcpyKind::kHostToDevice);
+    }
+  }
+  Check(key.shape == std::vector<int64_t>({kIndexerBlocks, 128, 1, 128}) &&
+        key.strides == std::vector<int64_t>({16384, 128, 128, 1}), "PA_BSND uses block/slot/head/dim order");
+  Note("provider: " + ops.op(OpId::kVllmQuantLightningIndexer).provider);
   std::printf("\n-- H4.1 the plan over the paged FP8 key stream --\n");
-  PlanResult plan = RunPlan([&](aclOpExecutor** executor) {
+  const auto plan_indexer = [&](aclOpExecutor** executor, const Tensor& gains, const Tensor& schedule) {
     return PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
-        ops, OpId::kVllmQuantLightningIndexer, executor, query.handle, key.handle, weights.handle,
+        ops, OpId::kVllmQuantLightningIndexer, executor, query.handle, key.handle, gains.handle,
         query_scale.handle, key_scale.handle, /*actualSeqLengthsQuery=*/nullptr, seq_key.handle,
-        block_table.handle, metadata.handle, /*queryQuantMode=*/0, /*keyQuantMode=*/0,
+        block_table.handle, schedule.handle, /*queryQuantMode=*/0, /*keyQuantMode=*/0,
         const_cast<char*>("BSND"), const_cast<char*>("PA_BSND"), kIndexTopK, /*sparseMode=*/3, INT64_MAX,
         INT64_MAX, /*cmpRatio=*/kCompressRatio, /*returnValues=*/false, key_stride0, scale_stride0,
         indices_out.handle, values_out.handle);
-  });
+  };
+  const Tensor bad_weights = track(arena.Make(weights.shape, kDtBf16));
+  const Tensor bad_metadata = track(arena.Make({1}, kDtInt32));
+  ExpectRefused(RunPlan([&](aclOpExecutor** executor) { return plan_indexer(executor, bad_weights, metadata); }),
+                "the old BF16 indexer scoring weights");
+  ExpectRefused(RunPlan([&](aclOpExecutor** executor) { return plan_indexer(executor, weights, bad_metadata); }),
+                "the old one-element indexer work schedule");
+  PlanResult plan = RunPlan([&](aclOpExecutor** executor) { return plan_indexer(executor, weights, metadata); });
 
   StaticOpSlot slot;
   void* workspace = nullptr;
@@ -1503,7 +1423,11 @@ void TestIndexerTopKRange(const Backend& backend) {
     workspace = plan.workspace > 0 ? backend.allocator->DeviceMalloc(plan.workspace) : nullptr;
     stream = backend.streams->CreateStream();
     slot.Launch(ops, workspace, stream);
-    Check(true, "the indexer launched on the retained executor");
+    backend.streams->SynchronizeStream(stream);
+    slot.SetAddress(0, query.handle, query.address);
+    slot.Launch(ops, workspace, stream);
+    backend.streams->SynchronizeStream(stream);
+    Check(true, "the indexer launched and replayed on the retained executor");
   }
 
   std::printf("\n-- H4.2 the attributes that address the paged stream --\n");
@@ -1627,6 +1551,10 @@ int main(int argc, char** argv) {
   backend.numerics_live = false;
   backend.name = device.backend_name();
 #else
+  OpTable providers;
+  for (OpId id : {OpId::kHcPre, OpId::kCompressor, OpId::kVllmQuantLightningIndexer}) {
+    std::printf("provider %s: %s\n", OpName(id), providers.op(id).provider.c_str());
+  }
   if (!PhysicalNpuPresent()) {
     return require_device ? 1 : 0;
   }

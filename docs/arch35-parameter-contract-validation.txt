@@ -1,0 +1,36 @@
+arch35 parameter-contract validation — 2026-10-09T14:52:44Z
+host: WSL Ubuntu-22.04, toolkit /usr/local/Ascend/cann-9.2.0-beta.2, no NPU attached
+
+== 1. mock build (ENABLE_MOCK_RUNTIME=ON, Debug, DSV4_WERROR=ON) ==
+cmake --build build_mock: OK
+100% tests passed, 0 tests failed out of 6
+
+Total Test time (real) =   8.46 sec
+
+== 2. symbolic hypotheses suite ==
+=============================================================
+48 checks, 0 failures, 3 skipped, 1 refuted-and-encoded
+every decidable hypothesis holds at the DSV4-Flash geometry.
+
+1 claim(s) were refuted by the 950PR run and are ALREADY encoded in the engine; they are
+recorded above as [refuted] and do not fail this suite. See the B_l note in config.hpp.
+=============================================================
+
+== 3. CANN build (ENABLE_MOCK_RUNTIME=OFF, Release, DSV4_WERROR=ON) ==
+cmake --build build_cann: OK
+
+== 4. ldd -r build_cann/libcust_opapi.so ==
+ldd -r: exit 0, no undefined symbols, all DT_NEEDED resolved with the toolkit env sourced
+
+== 5. vendored symbol resolution (no device attached: providers, then the device check) ==
+dsv4_operator_hypotheses_test -- targeted contract verification of the vendored
+arch35 (Ascend 950PR) DeepSeek-V4-Flash operators at the engine's own geometry.
+provider aclnnHcPre: /mnt/c/ascend-moe-engine/build_cann/tests/../libcust_opapi.so
+provider aclnnCompressor: /mnt/c/ascend-moe-engine/build_cann/tests/../libcust_opapi.so
+provider aclnnVllmQuantLightningIndexer: /mnt/c/ascend-moe-engine/build_cann/tests/../libcust_opapi.so
+[ SKIP ] Physical Ascend NPU not detected
+
+== 6. the shadowing hazard this defends against ==
+system libopapi.so exports 4 aclnnCompressor symbol(s) with a different ABI;
+the providers above show the engine resolving all three vendored ops from
+build_cann/libcust_opapi.so, never falling through to the toolkit export.

@@ -1167,9 +1167,9 @@ using QuantLightningIndexerPlanFn = int (*)(const aclTensor* query, const aclTen
  * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
  * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
  * @param[in] x Token states, [T,H] or [B,S,H], BF16/FP16.
- * @param[in] wkv Compressed-KV projection weight, dtype of x.
- * @param[in] wgate Pooling-gate projection weight, dtype of x.
- * @param[in,out] state_cache_ref Recurrent pooling state [blocks, blockSize, D]
+ * @param[in] wkv Compressed-KV projection [coff*D,H], dtype of x.
+ * @param[in] wgate Pooling-gate projection [coff*D,H], dtype of x.
+ * @param[in,out] state_cache_ref Recurrent pooling state [blocks, blockSize, 2*coff*D]
  * FP32; updated in place.
  * @param[in] ape Absolute positional bias, FP32.
  * @param[in] norm_weight RMSNorm gain, 1-D.
@@ -1209,7 +1209,7 @@ using CompressorPlanFn = int (*)(const aclTensor* x, const aclTensor* wkv, const
  * aclnnQuantLightningIndexer it adds the scheduling-metadata input, the
  * cmp_ratio / return_values attributes, the explicit key strides and the
  * optional FP32 score output.
- * @note Engine geometry: D=128, FP8 E4M3 or HiFloat8 query/key with BF16
+ * @note Engine geometry: D=128, FP8 E4M3FN query/key with FP32
  * weights and FP32 dequant scales, PA_BSND key layout with a paged block
  * table. Both outputs are staged through distinct executor-owned tensors, so
  * the returned executor is reusable.
@@ -1217,7 +1217,7 @@ using CompressorPlanFn = int (*)(const aclTensor* x, const aclTensor* wkv, const
  * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
  * @param[in] query Index query, [B,S1,N1,D] or [T1,N1,D].
  * @param[in] key Index key per layout_key_optional, N2=1, D=128.
- * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], BF16/FP16.
+ * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], FP32.
  * @param[in] query_dequant_scale Query dequant scales.
  * @param[in] key_dequant_scale Key dequant scales, layout of key without D.
  * @param[in] actual_seq_lengths_query_optional Cumulative query lengths, INT32.

@@ -335,9 +335,9 @@ ACLNN_API aclnnStatus aclnnQuantLightningIndexer(void* workspace, uint64_t works
  * reduction over cmpRatio tokens, RMSNorm with normWeight and rotate by the
  * partial RoPE in ropeSin/ropeCos. cmpRatio 4 selects CSA, 128 selects HCA.
  * @param[in] x Token states, [T, H] or [B, S, H], BF16/FP16.
- * @param[in] wkv Compressed-KV projection weight, dtype of x.
- * @param[in] wgate Pooling-gate projection weight, dtype of x.
- * @param[in,out] stateCacheRef Recurrent pooling state, [blocks, blockSize, D]
+ * @param[in] wkv Compressed-KV projection [coff*D,H], dtype of x.
+ * @param[in] wgate Pooling-gate projection [coff*D,H], dtype of x.
+ * @param[in,out] stateCacheRef Recurrent pooling state, [blocks, blockSize, 2*coff*D]
  * FP32; a REF parameter, UPDATED IN PLACE and never ViewCopied.
  * @param[in] ape Absolute positional bias, FP32.
  * @param[in] normWeight RMSNorm gain, 1-D.
@@ -374,13 +374,13 @@ ACLNN_API aclnnStatus aclnnCompressor(void* workspace, uint64_t workspaceSize, a
  * @brief aclnnVllmQuantLightningIndexer: plan phase (vendored vllm-ascend
  * arch35).
  * @details The quantized lightning indexer in its shared-KV form: a mixed
- * Cube/Vector kernel that scores FP8 E4M3 / HiFloat8 query against key under
+ * Cube/Vector kernel that scores FP8 E4M3FN query against key under
  * their dequant scales and emits the top-sparseCount block indices. Against
  * aclnnQuantLightningIndexer this adds the metadata input, the cmpRatio /
  * returnValues / stride / scaleStride attributes and the sparseValues output.
  * @param[in] query Index query, [B,S1,N1,D] or [T1,N1,D]; D=128.
  * @param[in] key Index key per layoutKeyOptional, N2=1, D=128, dtype of query.
- * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], BF16/FP16.
+ * @param[in] weights Scoring weights, [B,S1,N1] or [T,N1], FP32.
  * @param[in] queryDequantScale Query dequant scales, [B,S1,N1] or [T,N1].
  * @param[in] keyDequantScale Key dequant scales, layout of key without D.
  * @param[in] actualSeqLengthsQueryOptional Cumulative query lengths, INT32.

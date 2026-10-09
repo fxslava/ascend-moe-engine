@@ -1548,7 +1548,7 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(
                "Compressor: ropeHeadDim must be positive and even, got " + std::to_string(rope_head_dim));
   MOCK_REQUIRE(norm_eps > 0.0, "Compressor: normEps must be positive");
   MOCK_REQUIRE(coff >= 1, "Compressor: coff must be at least 1");
-  MOCK_REQUIRE(rotary_mode == 0 || rotary_mode == 1, "Compressor: rotaryMode must be 0 or 1");
+  MOCK_REQUIRE(rotary_mode == 1 || rotary_mode == 2, "Compressor: rotaryMode must be 1 or 2");
 
   // The recurrent pooling state is a paged [blocks, blockSize, D] FP32 cache
   // and is a REF parameter: the operator updates it in place.
@@ -1560,7 +1560,7 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(
   MOCK_REQUIRE(state_cache_stride_dim0 == msc->strides.at(0),
                "Compressor: stateCacheStrideDim0 (" + std::to_string(state_cache_stride_dim0) +
                    ") must equal the stateCacheRef axis-0 stride (" + std::to_string(msc->strides.at(0)) + ")");
-  MOCK_REQUIRE(cache_mode == 0 || cache_mode == 1, "Compressor: cacheMode must be 0 or 1");
+  MOCK_REQUIRE(cache_mode == 1 || cache_mode == 2, "Compressor: cacheMode must be 1 or 2");
 
   MOCK_REQUIRE(mape->dtype == ACL_FLOAT32, "Compressor: ape must be FP32");
   MOCK_REQUIRE(mnw->shape.size() == 1, "Compressor: normWeight must be 1-D, got " + ShapeOf(mnw));
@@ -1572,10 +1572,10 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(
   // cmp_kv_out holds one pooled row per cmp_ratio input tokens, widened by
   // coff on the channel axis.
   MOCK_REQUIRE(mkv->shape.size() == 2, "Compressor: cmpKvOut must be [cmpS, D], got " + ShapeOf(mkv));
-  MOCK_REQUIRE(mkv->dim(0) == tokens / cmp_ratio,
+  MOCK_REQUIRE(mkv->dim(0) == std::min(tokens, tokens / cmp_ratio + 1),
                "Compressor: cmpKvOut rows must be T/cmpRatio = " + std::to_string(tokens / cmp_ratio) + ", got " +
                    std::to_string(mkv->dim(0)));
-  MOCK_REQUIRE(mkv->dim(1) == mnw->dim(0) * coff,
+  MOCK_REQUIRE(mkv->dim(1) == mnw->dim(0),
                "Compressor: cmpKvOut channels must be normWeight[0]*coff = " +
                    std::to_string(mnw->dim(0) * coff) + ", got " + std::to_string(mkv->dim(1)));
 
@@ -1592,20 +1592,18 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(
     }
   }
 
-  // The sequence-ring cadence, straight out of the vendored wrapper:
-  //
-  //   if (x->IsEmpty() || cmpKvOut->IsEmpty()) { *workspaceSize = 0; return 0; }
-  //
-  // sits AFTER the parameter checks and before any l0 call. An incomplete
-  // compression window therefore plans a validated, completely empty
-  // executor: no kernel, no ViewCopy into cmpKvOut and no in-place update of
-  // stateCacheRef. That is how a caller holding back T < cmpRatio tokens
-  // emits nothing at all -- not a zero-row write, but no write.
-  if (mx->elements() == 0 || mkv->elements() == 0) {
-    *workspace_size = 0;
-    *executor = NewExecutor("aclnnCompressor", {});
-    return 0;
-  }
+  MOCK_REQUIRE(tokens > 0 && mkv->elements() > 0, "Compressor: HOLD must not create an executor");
+  MOCK_REQUIRE(mwkv->shape == std::vector<int64_t>({coff * mnw->dim(0), kHidden}) &&
+               mwg->shape == mwkv->shape, "Compressor: both projections must be [coff*D,H]");
+  MOCK_REQUIRE(msc->dim(2) == 2 * coff * mnw->dim(0), "Compressor: state stores both KV and scores");
+  MOCK_REQUIRE(mnw->dtype == ACL_FLOAT32 && msin->dtype == ACL_FLOAT32 && mcos->dtype == ACL_FLOAT32,
+               "Compressor: arch35 norm and RoPE must be FP32");
+  MOCK_REQUIRE(msin->shape == std::vector<int64_t>({mkv->dim(0), rope_head_dim}),
+               "Compressor: TH RoPE rows must include padding");
+  MOCK_REQUIRE(mape->shape == std::vector<int64_t>({cmp_ratio, coff * mnw->dim(0)}),
+               "Compressor: ape must be [ratio,coff*D]");
+  MOCK_REQUIRE(cu_seqlens_optional != nullptr && AsMockTensor(cu_seqlens_optional)->shape == std::vector<int64_t>({2}),
+               "Compressor: single-sequence TH needs cumulative lengths [0,T]");
 
   // The REF parameter takes no copy stage, so nothing here can be a
   // same-address self-copy (see g_ref_selfcopy_hazards).
@@ -1681,8 +1679,8 @@ aclnnStatus aclnnVllmQuantLightningIndexerGetWorkspaceSize(
                    ") must equal the keyDequantScale axis-0 stride (" + std::to_string(mks->strides.at(0)) + ")");
 
   MOCK_REQUIRE(mw->shape.size() == (query_tnd ? 2u : 3u) && mw->dim(mw->shape.size() - 1) == heads &&
-                   (mw->dtype == ACL_BF16 || mw->dtype == ACL_FLOAT16),
-               "VllmQuantLightningIndexer: weights must be [T,N1]/[B,S,N1] BF16/FP16");
+                   mw->dtype == ACL_FLOAT32,
+               "VllmQuantLightningIndexer: weights must be [T,N1]/[B,S,N1] FP32");
   MOCK_REQUIRE(mqs->shape == mw->shape && mqs->dtype == ACL_FLOAT32,
                "VllmQuantLightningIndexer: queryDequantScale must match weights shape in FP32");
   MOCK_REQUIRE(mks->dtype == ACL_FLOAT32, "VllmQuantLightningIndexer: keyDequantScale must be FP32");
@@ -1715,6 +1713,8 @@ aclnnStatus aclnnVllmQuantLightningIndexerGetWorkspaceSize(
     MOCK_REQUIRE(mblocks != nullptr && mblocks->dtype == ACL_INT32 && mblocks->shape.size() == 2,
                  "VllmQuantLightningIndexer: PA_BSND key requires a 2-D INT32 blockTable");
   }
+  MOCK_REQUIRE(metadata_optional != nullptr && AsMockTensor(metadata_optional)->shape == std::vector<int64_t>({1024}),
+               "VllmQuantLightningIndexer: metadata must be a populated INT32 [1024] schedule");
   if (metadata_optional != nullptr) {
     MOCK_REQUIRE(AsMockTensor(metadata_optional)->dtype == ACL_INT32,
                  "VllmQuantLightningIndexer: metadataOptional must be INT32");

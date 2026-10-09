@@ -683,8 +683,8 @@ void TestCompressor() {
   constexpr int64_t kCompTokens = 128;  // divisible by both 4 and 128
   constexpr int64_t kStateBlocks = 4;
   constexpr int64_t kStateBlockSize = 8;
-  constexpr int64_t kStateDim = 128;
-  constexpr int64_t kCmpChannels = 256;  // normWeight[0]
+  constexpr int64_t kStateDim = 1024;
+  constexpr int64_t kCmpChannels = 512;  // normWeight[0]
   constexpr int64_t kRopeHeadDim = 64;
   constexpr int64_t kCoff = 1;
 
@@ -696,16 +696,16 @@ void TestCompressor() {
   };
 
   aclTensor* x = MakeTensor({kCompTokens, kHiddenSize}, ACL_BF16, next(kCompTokens * kHiddenSize * 2));
-  aclTensor* wkv = MakeTensor({kHiddenSize, kCmpChannels}, ACL_BF16, next(kHiddenSize * kCmpChannels * 2));
-  aclTensor* wgate = MakeTensor({kHiddenSize, 1}, ACL_BF16, next(kHiddenSize * 2));
+  aclTensor* wkv = MakeTensor({kCmpChannels, kHiddenSize}, ACL_BF16, next(kHiddenSize * kCmpChannels * 2));
+  aclTensor* wgate = MakeTensor({kCmpChannels, kHiddenSize}, ACL_BF16, next(kHiddenSize * kCmpChannels * 2));
   aclTensor* state_cache = MakeTensor({kStateBlocks, kStateBlockSize, kStateDim}, ACL_FLOAT32,
                                       next(kStateBlocks * kStateBlockSize * kStateDim * 4));
-  aclTensor* ape = MakeTensor({kCompTokens}, ACL_FLOAT32, next(kCompTokens * 4));
+  aclTensor* ape = MakeTensor({4, kCmpChannels}, ACL_FLOAT32, next(4 * kCmpChannels * 4));
   aclTensor* norm_weight = MakeTensor({kCmpChannels}, ACL_FLOAT32, next(kCmpChannels * 4));
-  aclTensor* rope_sin = MakeTensor({kCompTokens, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
-  aclTensor* rope_cos = MakeTensor({kCompTokens, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
+  aclTensor* rope_sin = MakeTensor({kCompTokens / 4 + 1, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
+  aclTensor* rope_cos = MakeTensor({kCompTokens / 4 + 1, kRopeHeadDim}, ACL_FLOAT32, next(kCompTokens * kRopeHeadDim * 4));
   aclTensor* block_table = MakeTensor({1, kStateBlocks}, ACL_INT32, next(kStateBlocks * 4));
-  aclTensor* cu_seqlens = MakeTensor({1}, ACL_INT32, next(4));
+  aclTensor* cu_seqlens = MakeTensor({2}, ACL_INT32, next(8));
 
   // The kernel addresses the paged state cache through this attribute, so it
   // must be the axis-0 stride of the view the caller owns.
@@ -717,8 +717,8 @@ void TestCompressor() {
   DeviceStream stream = device.CreateStream();
 
   // -- CSA: cmp_ratio 4 -------------------------------------------------------
-  aclTensor* cmp_kv_csa = MakeTensor({kCompTokens / 4, kCmpChannels * kCoff}, ACL_BF16,
-                                     next(kCompTokens / 4 * kCmpChannels * kCoff * 2));
+  aclTensor* cmp_kv_csa = MakeTensor({kCompTokens / 4 + 1, kCmpChannels * kCoff}, ACL_BF16,
+                                     next((kCompTokens / 4 + 1) * kCmpChannels * kCoff * 2));
   const int ref_plans_before = mock::MockRefOutputPlans();
   aclOpExecutor* executor = nullptr;
   uint64_t ws = PlanAclnnOp<CompressorPlanFn>(ops, OpId::kCompressor, &executor, x, wkv, wgate, state_cache, ape,
@@ -744,11 +744,14 @@ void TestCompressor() {
   csa_slot.Reset();
 
   // -- HCA: cmp_ratio 128 -----------------------------------------------------
-  aclTensor* cmp_kv_hca = MakeTensor({kCompTokens / 128, kCmpChannels * kCoff}, ACL_BF16,
-                                     next(kCompTokens / 128 * kCmpChannels * kCoff * 2));
+  aclTensor* cmp_kv_hca = MakeTensor({kCompTokens / 128 + 1, kCmpChannels * kCoff}, ACL_BF16,
+                                     next((kCompTokens / 128 + 1) * kCmpChannels * kCoff * 2));
+  aclTensor* ape_hca = MakeTensor({128, kCmpChannels}, ACL_FLOAT32, next(128 * kCmpChannels * 4));
+  aclTensor* sin_hca = MakeTensor({2, kRopeHeadDim}, ACL_FLOAT32, next(2 * kRopeHeadDim * 4));
+  aclTensor* cos_hca = MakeTensor({2, kRopeHeadDim}, ACL_FLOAT32, next(2 * kRopeHeadDim * 4));
   aclOpExecutor* hca_executor = nullptr;
   const uint64_t ws_hca = PlanAclnnOp<CompressorPlanFn>(
-      ops, OpId::kCompressor, &hca_executor, x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos,
+      ops, OpId::kCompressor, &hca_executor, x, wkv, wgate, state_cache, ape_hca, norm_weight, sin_hca, cos_hca,
       block_table, cu_seqlens, nullptr, nullptr, kRopeHeadDim, 128, kCoff, 1e-6, 1, 1, state_stride0, cmp_kv_hca);
   Check(ws_hca > 0, "the compressor planned a non-empty workspace at cmp_ratio 128 (HCA)");
   aclDestroyAclOpExecutor(hca_executor);
@@ -790,7 +793,7 @@ void TestCompressor() {
   }, "the compressor with a BF16 state cache where FP32 is required");
 
   for (aclTensor* tensor : {x, wkv, wgate, state_cache, ape, norm_weight, rope_sin, rope_cos, block_table,
-                            cu_seqlens, cmp_kv_csa, cmp_kv_hca, bf16_state}) {
+                            cu_seqlens, cmp_kv_csa, cmp_kv_hca, bf16_state, ape_hca, sin_hca, cos_hca}) {
     aclDestroyTensor(tensor);
   }
   device.DestroyStream(stream);
@@ -831,13 +834,13 @@ void TestSharedKvPath() {
                                 next(kQueryTokens * kHeads * kHeadDim));
   aclTensor* key = MakeTensor({kBlocks, kBlockSize, 1, kHeadDim}, ACL_FLOAT8_E4M3FN,
                               next(kBlocks * kBlockSize * kHeadDim));
-  aclTensor* weights = MakeTensor({kQueryTokens, kHeads}, ACL_BF16, next(kQueryTokens * kHeads * 2));
+  aclTensor* weights = MakeTensor({kQueryTokens, kHeads}, ACL_FLOAT32, next(kQueryTokens * kHeads * 4));
   aclTensor* q_scale = MakeTensor({kQueryTokens, kHeads}, ACL_FLOAT32, next(kQueryTokens * kHeads * 4));
   aclTensor* k_scale = MakeTensor({kBlocks, kBlockSize, 1}, ACL_FLOAT32, next(kBlocks * kBlockSize * 4));
   aclTensor* seq_q = MakeTensor({1}, ACL_INT32, next(4));
   aclTensor* seq_k = MakeTensor({1}, ACL_INT32, next(4));
   aclTensor* block_table = MakeTensor({1, kBlocks}, ACL_INT32, next(kBlocks * 4));
-  aclTensor* metadata = MakeTensor({16}, ACL_INT32, next(16 * 4));
+  aclTensor* metadata = MakeTensor({1024}, ACL_INT32, next(1024 * 4));
   aclTensor* cmp_indices = MakeTensor({kQueryTokens, 1, kSparseCount}, ACL_INT32,
                                       next(kQueryTokens * kSparseCount * 4));
   // returnValues=false is signalled by a [0] placeholder, which is what the

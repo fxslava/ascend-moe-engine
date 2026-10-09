@@ -10,6 +10,8 @@
 
 #include "aclnn_compressor.h"
 
+#include <algorithm>
+
 #include "aclnn_kernels/common/op_error_check.h"
 #include "aclnn_kernels/contiguous.h"
 #include "compressor.h"
@@ -154,6 +156,47 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(const aclTensor *x, const aclTensor 
     auto ret = CheckParams(x, wkv, wgate, stateCacheRef, ape, normWeight, ropeSin, ropeCos, ropeHeadDim, cmpRatio,
                            normEps, cmpKvOut);
     CHECK_RET(ret == ACLNN_SUCCESS, ret);
+
+    // Match the arch35 tiler before staging any inputs. TH output/RoPE
+    // capacity includes one padding row per sequence, even for full windows.
+    if (normWeight->GetDataType() != DataType::DT_FLOAT ||
+        ropeSin->GetDataType() != DataType::DT_FLOAT || ropeCos->GetDataType() != DataType::DT_FLOAT ||
+        (rotaryMode != 1 && rotaryMode != 2) || (cacheMode != 1 && cacheMode != 2) ||
+        (coff != 1 && coff != 2)) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "arch35 requires FP32 norm/RoPE and rotary/cache/coff in {1,2}.");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    const auto xShape = x->GetViewShape();
+    const int64_t hidden = xShape.GetDim(xShape.GetDimNum() - 1);
+    const int64_t width = normWeight->GetViewShape().GetDim(0);
+    for (const aclTensor *weight : {wkv, wgate}) {
+        const auto shape = weight->GetViewShape();
+        if (shape.GetDimNum() != 2 || shape.GetDim(0) != coff * width || shape.GetDim(1) != hidden) {
+            OP_LOGE(ACLNN_ERR_PARAM_INVALID, "wkv and wgate must be [coff*D,H].");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
+    if (stateCacheRef->GetViewShape().GetDim(2) != 2 * coff * width) {
+        OP_LOGE(ACLNN_ERR_PARAM_INVALID, "stateCache must hold both KV and score channels: [blocks,blockSize,2*coff*D].");
+        return ACLNN_ERR_PARAM_INVALID;
+    }
+    if (xShape.GetDimNum() == 2) {
+        if (cuSeqlensOptional == nullptr || cuSeqlensOptional->GetDataType() != DataType::DT_INT32 ||
+            cuSeqlensOptional->GetViewShape().GetDimNum() != 1 ||
+            cuSeqlensOptional->GetViewShape().GetDim(0) < 2) {
+            OP_LOGE(ACLNN_ERR_PARAM_INVALID, "TH requires INT32 cuSeqlens [B+1], including the leading zero.");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+        const int64_t batch = cuSeqlensOptional->GetViewShape().GetDim(0) - 1;
+        const int64_t rows = std::min(xShape.GetDim(0), xShape.GetDim(0) / cmpRatio + batch);
+        if (cmpKvOut->GetViewShape().GetDimNum() != 2 || cmpKvOut->GetViewShape().GetDim(0) != rows ||
+            cmpKvOut->GetViewShape().GetDim(1) != width ||
+            ropeSin->GetViewShape().GetDim(0) != rows || ropeCos->GetViewShape().GetDim(0) != rows ||
+            ropeSin->GetViewShape().GetDim(1) != ropeHeadDim || ropeCos->GetViewShape().GetDim(1) != ropeHeadDim) {
+            OP_LOGE(ACLNN_ERR_PARAM_INVALID, "TH output and RoPE rows must be min(T,T/ratio+B).");
+            return ACLNN_ERR_PARAM_INVALID;
+        }
+    }
 
     if (x->IsEmpty() || cmpKvOut->IsEmpty()) {
         *workspaceSize = 0;

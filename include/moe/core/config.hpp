@@ -199,8 +199,8 @@ inline const char* AttentionPathName(AttentionPath path) {
 inline constexpr int64_t kCompressorStateBlocks = 4;
 inline constexpr int64_t kCompressorStateBlockSize = 8;
 inline constexpr int64_t kCompressorCoff = 1;
-inline constexpr int64_t kCompressorRotaryModeHalf = 0;
-inline constexpr int64_t kCompressorCacheModePaged = 0;
+inline constexpr int64_t kCompressorRotaryModeHalf = 1;
+inline constexpr int64_t kCompressorCacheModeCyclic = 2;
 
 // aclnnKvQuantSparseAttnSharedkv
 inline constexpr int64_t kSparseAttnTileSize = 64;      // must be a multiple of 16

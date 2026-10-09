@@ -743,8 +743,8 @@ void TestFullPipeline() {
         "the stage report states the mHC layout and that B_l comes from the fused HcPre kernel");
   Check(decode_report.find("sparse_attn_csa") != std::string::npos &&
             decode_report.find("sparse_attn_hca") != std::string::npos &&
-            decode_report.find("cmp_hold_csa") != std::string::npos,
-        "both compressed cores and the hold-step cadence stage appear in the planned graph");
+            decode_report.find("cmp_hold_csa") == std::string::npos,
+        "both compressed cores are planned without a zero-row HOLD executor");
   Check(counters.expert_slot_misses > 0 && counters.expert_slot_hits > 0,
         "the seeded routing produced both hits and misses across the swap engine");
   const auto& diag = pipeline.diagnostics();

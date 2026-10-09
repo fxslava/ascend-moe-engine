@@ -116,10 +116,31 @@ const OpDeclaration kDeclarations[] = {
 // libraries are DT_NEEDED of this binary (see CMakeLists.txt), so RTLD_DEFAULT
 // finds them without a dlopen; the fallback covers a build where a split
 // libopapi_* was dropped from the link line.
-void* ResolveSymbol(const char* symbol, std::string* provider) {
+void* ResolveSymbol(const char* symbol, std::string* provider, bool custom = false) {
   ::dlerror();
-  void* address = ::dlsym(RTLD_DEFAULT, symbol);
-  if (address == nullptr) {
+  void* address = nullptr;
+#ifndef ASCEND_MOCK_RUNTIME
+  if (custom) {
+    // CANN also exports Compressor, with a DIFFERENT C ABI. Never fall
+    // through to that symbol when the vendored implementation is absent.
+    static void* custom_library = ::dlopen("libcust_opapi.so", RTLD_NOW | RTLD_LOCAL);
+    if (custom_library != nullptr) {
+      address = ::dlsym(custom_library, symbol);
+      // dlsym(handle) also searches that library's dependencies. Reject an
+      // identically named toolkit export if this custom package lacks it.
+      Dl_info info{};
+      if (address != nullptr &&
+          (::dladdr(address, &info) == 0 || info.dli_fname == nullptr ||
+           std::string(info.dli_fname).find("libcust_opapi.so") == std::string::npos)) {
+        address = nullptr;
+      }
+    }
+  } else
+#endif
+  {
+    address = ::dlsym(RTLD_DEFAULT, symbol);
+  }
+  if (address == nullptr && !custom) {
     static const char* const kCandidates[] = {"libopapi.so", "libopapi_nn.so", "libopapi_transformer.so",
                                               "libopapi_math.so", "libcust_opapi.so"};
     for (const char* candidate : kCandidates) {
@@ -178,8 +199,9 @@ void OpTable::Resolve(OpId id, const char* name, const char* role, bool required
   entry.role = role;
   entry.required = required;
   const std::string plan_symbol = std::string(name) + "GetWorkspaceSize";
-  entry.plan = ResolveSymbol(plan_symbol.c_str(), &entry.provider);
-  entry.launch = ResolveSymbol(name, entry.plan == nullptr ? &entry.provider : nullptr);
+  const bool custom = id >= OpId::kMhcPre;
+  entry.plan = ResolveSymbol(plan_symbol.c_str(), &entry.provider, custom);
+  entry.launch = ResolveSymbol(name, entry.plan == nullptr ? &entry.provider : nullptr, custom);
 }
 
 void OpTable::ResolveBare(OpId id, const char* name, const char* role, bool required) {

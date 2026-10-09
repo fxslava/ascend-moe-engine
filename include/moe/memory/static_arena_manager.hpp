@@ -207,33 +207,27 @@ struct ArenaTensors {
   // then not planned either, so nothing reserves the ~GB of projection
   // weights a compressed layer needs. See StaticArenaManager::uses_compression.
   //
-  // The window ring is what makes the cadence work. `aclnnCompressor` pins
-  // cmpKvOut's row count at T / cmpRatio, so a single-token step (T = 1) can
-  // never close a window of 4 or 128 -- it plans a zero-byte, completely empty
-  // executor (hypotheses H3). The caller therefore HOLDS the window: each step
-  // copies that layer's h_in into slot (step % ratio) of its own window slice,
-  // and only the closing step launches the compressor over the full
-  // [ratio, 4096] view.
+  // Each step copies h_in to (position % ratio) in the device window.
+  // Only a full window launches Compressor; HOLD has no executor or empty
+  // descriptor. TH output storage includes one padding row.
   aclTensor* cmp_window_csa = nullptr;     // [4, 4096]   bf16, per-layer view
   aclTensor* cmp_window_hca = nullptr;     // [128, 4096] bf16, per-layer view
-  aclTensor* cmp_rope_sin_csa = nullptr;   // [4, 64]     bf16, view into the table
+  aclTensor* cmp_rope_sin_csa = nullptr;   // [2, 64] fp32, emitted row + padding
   aclTensor* cmp_rope_cos_csa = nullptr;
-  aclTensor* cmp_rope_sin_hca = nullptr;   // [128, 64]   bf16
+  aclTensor* cmp_rope_sin_hca = nullptr;   // [2, 64] fp32
   aclTensor* cmp_rope_cos_hca = nullptr;
-  aclTensor* cmp_state_cache = nullptr;    // [4, 8, 512] fp32 REF ring, per layer
+  aclTensor* cmp_kv_padded = nullptr;
+  aclTensor* cmp_rope_cos_row = nullptr;
+  aclTensor* cmp_rope_sin_row = nullptr;
+  aclTensor* index_metadata = nullptr;
+  aclTensor* index_seq_k = nullptr;
+  aclTensor* index_head_weights_bf16 = nullptr;
+  aclTensor* cmp_state_cache = nullptr;    // [4, 8, 1024] fp32 REF ring, per layer
   aclTensor* cmp_state_block_table = nullptr;  // [1, 4]   int32
-  aclTensor* cmp_cu_seqlens = nullptr;     // [1] int32
+  aclTensor* cmp_cu_seqlens = nullptr;     // [2] int32
   aclTensor* cmp_seqused = nullptr;        // [1] int32
   aclTensor* cmp_start_pos = nullptr;      // [1] int32
   aclTensor* cmp_kv_out = nullptr;         // [1, 512] bf16, the emitted row
-  // The deliberately EMPTY hold-step set: [0, 4096] x, [0, 64] rope tables and
-  // a [0, 512] destination, so IsEmpty() holds and the wrapper's empty-tensor
-  // early return is exercised rather than only documented. All four are zero
-  // ROWS, not a partial window: see the note in CreateCompressionDescriptors.
-  aclTensor* cmp_window_empty = nullptr;   // [0, 4096] bf16
-  aclTensor* cmp_rope_cos_empty = nullptr; // [0, 64] bf16
-  aclTensor* cmp_rope_sin_empty = nullptr; // [0, 64] bf16
-  aclTensor* cmp_kv_out_empty = nullptr;   // [0, 512] bf16
   // The paged hybrid cache, one Dsv4CompressedKvEntry per compressed slot.
   // Two views over the same bytes because the epilog and the attention core
   // disagree on rank/dtype spelling, never two allocations.
@@ -260,7 +254,7 @@ struct ArenaTensors {
   aclTensor* index_k_cache = nullptr;      // [blocks, block_size, 1, 128] fp8, same bytes
   aclTensor* index_k_dequant = nullptr;    // [blocks, block_size, 1] fp32, per layer
   aclTensor* index_q_dequant = nullptr;    // [1, 1, 64] fp32
-  aclTensor* index_head_weights = nullptr; // [1, 1, 64] bf16, per-layer weight view
+  aclTensor* index_head_weights = nullptr; // [1, 1, 64] fp32 cast output
   aclTensor* index_sparse_indices = nullptr;   // [1, 1, 1, 512] int32
   aclTensor* index_sparse_values_empty = nullptr;  // [0] fp32 placeholder
 
@@ -298,8 +292,8 @@ struct ArenaTensors {
   // Compressor and indexer weights, null on a SWA-only checkpoint. The
   // positional bias has one row per window position, so CSA and HCA need
   // different SHAPES of it, not just different addresses.
-  aclTensor* w_cmp_wkv = nullptr;          // [4096, 512] bf16
-  aclTensor* w_cmp_wgate = nullptr;        // [4096, 1] bf16
+  aclTensor* w_cmp_wkv = nullptr;          // [512, 4096] bf16
+  aclTensor* w_cmp_wgate = nullptr;        // [512, 4096] bf16
   aclTensor* w_cmp_ape_csa = nullptr;      // [4, 512] fp32
   aclTensor* w_cmp_ape_hca = nullptr;      // [128, 512] fp32
   aclTensor* w_cmp_norm_weight = nullptr;  // [512] fp32
@@ -364,8 +358,8 @@ struct BackboneWeights {
 
     // Compressor, reserved only on a build whose checkpoint marks some layer
     // CSA or HCA.
-    ArenaHandle cmp_wkv = kInvalidArenaHandle;          // [4096, 512] bf16
-    ArenaHandle cmp_wgate = kInvalidArenaHandle;        // [4096, 1] bf16
+    ArenaHandle cmp_wkv = kInvalidArenaHandle;          // [512, 4096] bf16
+    ArenaHandle cmp_wgate = kInvalidArenaHandle;        // [512, 4096] bf16
     ArenaHandle cmp_ape = kInvalidArenaHandle;          // [max_ratio, 512] fp32
     ArenaHandle cmp_norm_weight = kInvalidArenaHandle;  // [512] fp32
 

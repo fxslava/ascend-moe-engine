@@ -90,12 +90,14 @@ Dsv4Pipeline::Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, 
   // stack-lifetime problem.
   cmp_slot_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(1)));
   cmp_seq_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(1)));
-  cmp_window_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(3)));
+  cmp_window_mailbox_ = static_cast<int32_t*>(resources_.HostPinnedMalloc(Int32Bytes(5)));
   *cmp_slot_mailbox_ = 0;
   *cmp_seq_mailbox_ = 0;
   cmp_window_mailbox_[0] = 0;
   cmp_window_mailbox_[1] = 0;
   cmp_window_mailbox_[2] = 0;
+  cmp_window_mailbox_[3] = 0;
+  cmp_window_mailbox_[4] = 0;
 }
 
 Dsv4Pipeline::~Dsv4Pipeline() {
@@ -594,11 +596,19 @@ void Dsv4Pipeline::PlanCompressionStages() {
                      << " bytes as UINT8, so the epilog would write where the indexer does not read");
   }
 
-  // One compressor plan per ratio, plus one genuinely empty HOLD plan per
-  // ratio. The hold plan is what a partial window launches: zero tokens in,
-  // zero rows out, so the wrapper's `if (x->IsEmpty() || cmpKvOut->IsEmpty())`
-  // early return fires before any l0 call and the step writes nothing -- not
-  // into the compressed cache and not into the state ring (H3).
+  const auto plan_cast = [&](const char* name, const aclTensor* input, aclTensor* output) {
+    PipelineStage& entry = stages_.Add(name, OpId::kCast);
+    const uint64_t workspace = PlanAclnnOp<CastPlanFn>(ops_, entry.op, &executor, input,
+                                                     static_cast<aclDataType>(kAclFloat32), output);
+    adopt(entry, workspace, executor);
+  };
+  plan_cast("cmp_rope_cos_cast", t.rope_cos, t.cmp_rope_cos_row);
+  plan_cast("cmp_rope_sin_cast", t.rope_sin, t.cmp_rope_sin_row);
+  if (csa_planned_) {
+    plan_cast("index_head_cast", t.index_head_weights_bf16, t.index_head_weights);
+  }
+
+  // Only full windows have a retained compressor plan. HOLD is a ring copy.
   const auto plan_compressor = [&](const char* name, int64_t ratio, const aclTensor* ape,
                                    const aclTensor* window, const aclTensor* rope_sin,
                                    const aclTensor* rope_cos, const aclTensor* destination) {
@@ -607,21 +617,17 @@ void Dsv4Pipeline::PlanCompressionStages() {
         ops_, entry.op, &executor, window, t.w_cmp_wkv, t.w_cmp_wgate, t.cmp_state_cache, ape,
         t.w_cmp_norm_weight, rope_sin, rope_cos, t.cmp_state_block_table, t.cmp_cu_seqlens, t.cmp_seqused,
         t.cmp_start_pos, mla.qk_rope_head_dim, ratio, kCompressorCoff, kRmsNormEpsilon,
-        kCompressorRotaryModeHalf, kCompressorCacheModePaged, state_stride, destination);
+        kCompressorRotaryModeHalf, kCompressorCacheModeCyclic, state_stride, destination);
     adopt(entry, workspace, executor);
   };
 
   if (csa_planned_) {
     plan_compressor("cmp_emit_csa", kCompressRatioCsa, t.w_cmp_ape_csa, t.cmp_window_csa, t.cmp_rope_sin_csa,
-                    t.cmp_rope_cos_csa, t.cmp_kv_out);
-    plan_compressor("cmp_hold_csa", kCompressRatioCsa, t.w_cmp_ape_csa, t.cmp_window_empty,
-                    t.cmp_rope_sin_empty, t.cmp_rope_cos_empty, t.cmp_kv_out_empty);
+                    t.cmp_rope_cos_csa, t.cmp_kv_padded);
   }
   if (hca_planned_) {
     plan_compressor("cmp_emit_hca", kCompressRatioHca, t.w_cmp_ape_hca, t.cmp_window_hca, t.cmp_rope_sin_hca,
-                    t.cmp_rope_cos_hca, t.cmp_kv_out);
-    plan_compressor("cmp_hold_hca", kCompressRatioHca, t.w_cmp_ape_hca, t.cmp_window_empty,
-                    t.cmp_rope_sin_empty, t.cmp_rope_cos_empty, t.cmp_kv_out_empty);
+                    t.cmp_rope_cos_hca, t.cmp_kv_padded);
   }
 
   // The emitted BF16 row, quantized and scattered into its 604-byte slot.
@@ -689,8 +695,8 @@ void Dsv4Pipeline::PlanCompressionStages() {
       PipelineStage& entry = stages_.Add("indexer", OpId::kVllmQuantLightningIndexer);
       const uint64_t workspace = PlanAclnnOp<VllmQuantLightningIndexerPlanFn>(
           ops_, entry.op, &executor, t.index_q, t.index_k_cache, t.index_head_weights, t.index_q_dequant,
-          t.index_k_dequant, /*actualSeqLengthsQuery=*/nullptr, t.cmp_seq_k, t.cmp_block_table,
-          /*metadata=*/nullptr, kIndexerQuantModePerTokenHead, kIndexerQuantModePerTokenHead,
+          t.index_k_dequant, /*actualSeqLengthsQuery=*/nullptr, t.index_seq_k, t.cmp_block_table,
+          t.index_metadata, kIndexerQuantModePerTokenHead, kIndexerQuantModePerTokenHead,
           const_cast<char*>(kIndexerLayoutQuery), const_cast<char*>(kIndexerLayoutKeyPaged), kIndexTopK,
           kIndexerSparseModeCausal, INT64_MAX, INT64_MAX, kCompressRatioCsa, /*returnValues=*/false,
           DeriveDimensionStrideElements(t.index_k_cache, 0),
@@ -889,13 +895,16 @@ void Dsv4Pipeline::RunSlidingWindowAttention() { Launch(stages_.stage("attention
 // The compressor cadence. Returns true when this step closed a window and a
 // Dsv4CompressedKvEntry reached the paged cache.
 //
-// A PARTIAL WINDOW NEVER TOUCHES THE PAGED CACHE. The only state it advances
-// is the rolling ring buffer -- a plain D2D copy of this layer's h_in into
-// slot (position % ratio), no launch, no descriptor, no mapping -- and then
-// the hold stage, whose empty cmpKvOut makes the wrapper return before any l0
-// call. The ring is where the window lives because the operator cannot hold
-// it: cmpKvOut's row count is pinned at T / cmpRatio, so a one-token call can
-// never accumulate toward a window of 4 or 128 (hypotheses H3).
+// A PARTIAL WINDOW NEVER TOUCHES THE PAGED CACHE, AND IT NEVER REACHES THE
+// OPERATOR EITHER. The only state it advances is the rolling ring buffer -- a
+// plain D2D copy of this layer's h_in into slot (position % ratio) -- and
+// early-return. There is no hold stage any more: the former per-step call with
+// a [0, D] cmpKvOut is what the CANN runtime rejected with 161001
+// (RT_PARAM_INVALID) on a 950PR (hypothesis H3), so a partial window creates
+// no descriptor, no executor and no launch at all. The ring is where the
+// window lives because the operator cannot hold it: TH output rows are pinned
+// at min(T, T/cmpRatio + B), so a one-token call can never accumulate toward a
+// window of 4 or 128.
 bool Dsv4Pipeline::AdvanceCompressorCadence(int32_t layer, int64_t position, int64_t ratio,
                                             AttentionPath path) {
   ArenaTensors& t = arena_manager_.tensors();
@@ -917,18 +926,12 @@ bool Dsv4Pipeline::AdvanceCompressorCadence(int32_t layer, int64_t position, int
                        MemcpyKind::kDeviceToDevice, compute_stream_);
 
   const char* emit_stage = csa ? "cmp_emit_csa" : "cmp_emit_hca";
-  const char* hold_stage = csa ? "cmp_hold_csa" : "cmp_hold_hca";
   const aclTensor* window_descriptor = csa ? t.cmp_window_csa : t.cmp_window_hca;
 
   // 2. the cadence itself, exactly as the brief states it.
   const bool is_emission = ((position + 1) % ratio == 0);
   if (!is_emission) {
-    // The hold stage: a validated, completely EMPTY executor. The wrapper's
-    // empty-tensor early return fired at plan time, so it staged no kernel and
-    // registered no tensors -- which is why nothing is rebound here, not even
-    // the state ring. There is nothing in it to repoint, and nothing it can
-    // write: no allocation, no mapping, and no touch of the paged cache.
-    Launch(stages_.stage(hold_stage));
+    // The device-to-device copy above is the entire HOLD step.
     ++counters_.compressor_holds;
     return false;
   }
@@ -956,24 +959,27 @@ bool Dsv4Pipeline::AdvanceCompressorCadence(int32_t layer, int64_t position, int
   aclTensor* ape = csa ? t.w_cmp_ape_csa : t.w_cmp_ape_hca;
   emit.slot.SetAddress(slot::kCompressorApe, ape, arena.Address(layer_weights.cmp_ape));
 
-  // The window spans positions [position - ratio + 1, position], which are
-  // consecutive rows of the rope tables -- so the [ratio, rope] slice IS a
-  // view at the window's first row and no copy is needed.
+  // RoPE applies to the emitted compressed row at the closing token. The
+  // second TH output row is padding. Cast into preallocated FP32 storage.
   const int64_t window_start = position - ratio + 1;
-  uint8_t* cos_row = arena.AddressAs<uint8_t>(weights.rope_cos) + Bf16Bytes(window_start * mla.qk_rope_head_dim);
-  uint8_t* sin_row = arena.AddressAs<uint8_t>(weights.rope_sin) + Bf16Bytes(window_start * mla.qk_rope_head_dim);
-  emit.slot.SetAddress(slot::kCompressorRopeCos,
-                       csa ? t.cmp_rope_cos_csa : t.cmp_rope_cos_hca, cos_row);
-  emit.slot.SetAddress(slot::kCompressorRopeSin,
-                       csa ? t.cmp_rope_sin_csa : t.cmp_rope_sin_hca, sin_row);
+  auto& cos_cast = stages_.stage("cmp_rope_cos_cast");
+  auto& sin_cast = stages_.stage("cmp_rope_sin_cast");
+  cos_cast.slot.SetAddress(0, t.rope_cos, arena.AddressAs<uint8_t>(weights.rope_cos) +
+                          Bf16Bytes(position * mla.qk_rope_head_dim));
+  sin_cast.slot.SetAddress(0, t.rope_sin, arena.AddressAs<uint8_t>(weights.rope_sin) +
+                          Bf16Bytes(position * mla.qk_rope_head_dim));
+  Launch(cos_cast);
+  Launch(sin_cast);
 
-  // The window metadata and the destination slot: one 12-byte and two 4-byte
-  // H2D copies from pinned mailboxes, so nothing depends on a stack lifetime.
-  cmp_window_mailbox_[0] = static_cast<int32_t>(ratio);         // cuSeqlens
-  cmp_window_mailbox_[1] = static_cast<int32_t>(ratio);         // seqused
-  cmp_window_mailbox_[2] = static_cast<int32_t>(window_start);  // startPos
-  streams_.MemcpyAsync(arena.Address(weights.cmp_window_meta), Int32Bytes(3), cmp_window_mailbox_,
-                       Int32Bytes(3), MemcpyKind::kHostToDevice, compute_stream_);
+  // TH cumulative lengths include the leading zero. The indexer consumes
+  // the original (uncompressed) length and divides it by cmpRatio itself.
+  cmp_window_mailbox_[0] = 0;
+  cmp_window_mailbox_[1] = static_cast<int32_t>(ratio);
+  cmp_window_mailbox_[2] = static_cast<int32_t>(ratio);
+  cmp_window_mailbox_[3] = static_cast<int32_t>(window_start);
+  cmp_window_mailbox_[4] = static_cast<int32_t>(position + 1);
+  streams_.MemcpyAsync(arena.Address(weights.cmp_window_meta), Int32Bytes(5), cmp_window_mailbox_,
+                       Int32Bytes(5), MemcpyKind::kHostToDevice, compute_stream_);
   *cmp_slot_mailbox_ = static_cast<int32_t>(compressed_slot);
   *cmp_seq_mailbox_ = static_cast<int32_t>(compressed_length);
   streams_.MemcpyAsync(arena.Address(weights.cmp_slot_mapping), Int32Bytes(1), cmp_slot_mailbox_, Int32Bytes(1),
@@ -1030,8 +1036,9 @@ void Dsv4Pipeline::RunCompressedAttention(int32_t layer, int64_t position, Atten
         LayerSlice(weights.index_k_dequant, arena_manager_.IndexerKeyScaleLayerStrideBytes(), layer);
     indexer.slot.SetAddress(slot::kIndexerKey, t.index_k_cache, index_cache);
     indexer.slot.SetAddress(slot::kIndexerKeyDequantScale, t.index_k_dequant, index_scale);
-    indexer.slot.SetAddress(slot::kIndexerWeights, t.index_head_weights,
-                            arena.Address(layer_weights.index_head_weight));
+    auto& head_cast = stages_.stage("index_head_cast");
+    head_cast.slot.SetAddress(0, t.index_head_weights_bf16, arena.Address(layer_weights.index_head_weight));
+    Launch(head_cast);
     Launch(indexer);
     ++counters_.indexer_selections;
   }
@@ -1324,6 +1331,12 @@ std::string Dsv4Pipeline::DescribeStages() const {
         << kCompressedKvEntryBytes
         << "-byte claim as unsettled; the entry is the\n                host-side authority for the cache row, "
            "and the derived strides are what keep a\n                disagreement loud instead of silent.\n";
+    out << "  compressor:   HOLD copies into the device ring only; full windows replay one plan per ratio.\n"
+           "                TH outputs have two rows of storage; only the first row enters the KV cache.\n";
+    if (csa_planned_) {
+      out << "  indexer:      static INT32[1024] schedule assigns decode to LI core 0; no split reduction.\n"
+             "                FP32 head weights and RoPE are cast into preallocated buffers.\n";
+    }
     out << "  NOT BOUND:    the uncompressed (ori) half of the hybrid cache. "
            "aclnnKvQuantSparseAttnSharedkv wants\n                oriKv in FP8 E4M3 and this engine's paged "
            "latent cache is BF16, so a compressed layer\n                attends its compressed stream only. "
