@@ -76,12 +76,29 @@ struct ExpertSlotAddresses {
 // activation RMSNorm / attention / MoE are planned for, so it is bound to them
 // directly, with no squeeze, no unsqueeze and no second view.
 struct MhcRoundTensors {
-  aclTensor* h_in = nullptr;        // [1, 4096] bf16  (mhc_pre out, fed on as is)
+  aclTensor* h_in = nullptr;        // [1, 4096] bf16  (pre's y / hIn, fed on as is)
   aclTensor* h_post = nullptr;      // [1, 4]    fp32
-  aclTensor* h_res = nullptr;       // [1, 4, 4] fp32  (mhc_pre out, raw)
+  aclTensor* h_res = nullptr;       // [1, 4, 4] fp32  (mhc_pre's RAW map;
+                                    //  unused on the fused path, where the
+                                    //  kernel never materializes it)
   aclTensor* h_res_sink = nullptr;  // [1, 4, 4] fp32  (B_l, CONTIGUOUS)
   aclTensor* h_out = nullptr;       // [1, 4096] bf16  (a descriptor over the
                                     //  sub-block's own output buffer)
+
+  // The SAME four buffers with a unit leading axis, for `aclnnHcPost`.
+  //
+  // HcPre takes x as TND [bs, hc, d] and emits y / post / comb_frag at
+  // [1, 4096] / [1, 4] / [1, 4, 4] -- byte-identical to the TND set above, so
+  // y feeds RMSNorm with no reshape. HcPost, however, is strictly BSHD: x rank
+  // 3, residual / comb / y rank 4, post rank 3 (aclnn_hc_post.cpp kXDim = 3,
+  // kResidualDim = 4, kPostDim = 3). Its own header says how the two meet --
+  // "a TND token stream maps on as b = T, s = 1" -- so these are the same
+  // addresses, the same element counts and the same contiguous strides with a
+  // 1 prepended. Created once at Build; never a runtime squeeze or unsqueeze.
+  aclTensor* h_post_bshd = nullptr;  // [1, 1, 4]    fp32
+  aclTensor* b_l_bshd = nullptr;     // [1, 1, 4, 4] fp32
+  aclTensor* h_out_bshd = nullptr;   // [1, 1, 4096] bf16
+
   ArenaHandle h_h_in = kInvalidArenaHandle;  // for the window-ring copies
 };
 
@@ -95,6 +112,9 @@ struct ArenaTensors {
   // sub-blocks = 86 writes, so the finished stream lands back in slot 0 -- but
   // the pipeline tracks the parity rather than relying on that.
   aclTensor* residual_stream[2] = {nullptr, nullptr};
+  // The same two buffers as [1, 1, 4, 4096], for HcPost's rank-4 residual and
+  // y. Same addresses, a 1 prepended; see the note on MhcRoundTensors.
+  aclTensor* residual_stream_bshd[2] = {nullptr, nullptr};
   // The four streams of each buffer as [1, 4096] views, for the embedding
   // broadcast at the start of a step and the summation at the head.
   aclTensor* stream_slice[2][kNhcStreams] = {};

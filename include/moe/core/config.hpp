@@ -101,30 +101,57 @@ inline constexpr double kMhcHcEpsilon = 1e-6;
 inline constexpr size_t kMhcStreamRank = 3;
 inline constexpr size_t kMhcTokenRank = 2;
 
-// HOW B_l IS PRODUCED. `aclnnMhcSinkhorn` cannot be the answer on hardware:
-// the 950PR run refused a non-contiguous output outright (561103,
-// ACL_ERROR_INVALID_PARAM -- so the old "hand it a gapped view" workaround is
-// dead) and, with a CONTIGUOUS output, planned successfully but then failed
+// HOW B_l IS PRODUCED, AND WHY THE FUSED PATH IS THE DEFAULT
+// ----------------------------------------------------------
+// `aclnnMhcSinkhorn` cannot be the answer on hardware: the 950PR run refused a
+// non-contiguous output outright (561103, ACL_ERROR_INVALID_PARAM -- so the
+// old "hand it a gapped view" workaround is dead) and, with a CONTIGUOUS
+// output, planned successfully but then failed
 // `aclSetAclOpExecutorRepeatable` with 561000. The wrapper builds a dynamic
-// internal iteration graph that CANN will not mark repeatable, so a standalone
+// internal iteration graph CANN will not mark repeatable, so a standalone
 // Sinkhorn cannot hold a retained executor in StaticOpSlotTable at all.
 //
-//   kPerUsePlan      plan and launch the standalone operator once per use,
-//                    its executor consumed by its own launch. Correct today,
-//                    at the cost of one host plan per mHC round -- counted as
-//                    StepCounters::sinkhorn_replans so the price is visible.
-//   kFusedExternal   B_l arrives ALREADY doubly stochastic in the slot, from a
-//                    fused block that keeps the normalization interior to one
-//                    kernel; the pipeline then launches nothing for this link.
-//                    `aclnnHcPreSinkhorn` is the vendored operator that does
-//                    this (its `comb_frag` output IS B_l, and its own header
-//                    notes the normalization "never leaves the kernel, so no
-//                    such copy stage exists"); wiring it needs mHC's optional
-//                    hMix / invRms outputs, which is the deferred device-side
-//                    fusion. Selecting this mode without such a producer
-//                    leaves B_l at whatever the slot holds, so the stage
-//                    report says loudly when it is on.
-enum class MhcMixingMode { kPerUsePlan, kFusedExternal };
+// THE FUSED NORMALIZATION IS ALREADY IN THE VENDORED KERNEL. It did not need
+// writing, and re-writing it would be a regression. In
+// third_party/ops_dsv4/mhc/hc_pre/op_kernel/hc_pre_base_arch35.h:
+//
+//   * the whole file is `namespace HcPreSinkhorn`, guarded by
+//     HC_PRE_SINKHORN_RGEBASE_BASE_H -- the normalization IS the epilogue;
+//   * `VFProcessCombFragPacked` holds the 4x4 as FOUR `RegTensor<float>` rows
+//     (mix0..mix3) that never leave the vector registers between iterations,
+//     which is exactly the "already resides in UB / registers" premise;
+//   * `RowGroupSumBcast` is the intra-vector row reduction with broadcast, and
+//     `RowNormAccum` divides by the eps-guarded row sum while accumulating the
+//     column sum in the same pass;
+//   * the column normalization needs NO TRANSPOSE: with one row per register
+//     at matching lane offsets, the column sum is three vertical `Add`s across
+//     registers. A 4x4 shuffle/permute transpose -- the obvious way to write
+//     it -- would be strictly more work than the layout the vendor chose;
+//   * it is PACKED: `pack = VL_FP32 / R` matrices are normalized per
+//     instruction, so a batch of tokens goes through together rather than one
+//     4x4 at a time;
+//   * `hc_pre_tiling_arch35.h` already defaults `iterTimes` to 20, and
+//     `aclnnHcPre` bounds its `hcSinkhornIters` attribute to [1, 100].
+//
+// So the engine's job is to USE that kernel, not to reimplement it:
+//
+//   kFusedHcPre          (default) `aclnnHcPre` -> `aclnnHcPost`, two launches
+//                        per round. HcPre fuses the reciprocal RMS, the mixing
+//                        projection and the Sinkhorn into ONE kernel and emits
+//                        B_l as its `comb_frag` output, already doubly
+//                        stochastic. B_l never becomes a standalone tensor at
+//                        the aclnn layer, so neither the 561000 repeatability
+//                        refusal nor the manual-4.31 self-copy hazard can
+//                        arise: both executors are retained and replayed, and
+//                        the decode loop issues ZERO host plans.
+//   kStagedMhcSinkhorn   `aclnnMhcPre` -> standalone `aclnnMhcSinkhorn` ->
+//                        `aclnnMhcPost`: three launches AND one host plan per
+//                        round, because the middle operator has no repeatable
+//                        form. Kept selectable as the fallback if the fused
+//                        kernel needs its own bring-up, and counted as
+//                        StepCounters::sinkhorn_replans so the price of
+//                        choosing it is never invisible.
+enum class MhcMixingMode { kFusedHcPre, kStagedMhcSinkhorn };
 
 // ---------------------------------------------------------------------------
 // Token compression / sparse attention topology
@@ -448,9 +475,10 @@ struct RuntimeConfig {
   std::vector<int64_t> compress_ratios;
   GeometryProvenance compress_ratios_provenance = GeometryProvenance::kFamilyDefault;
 
-  // How the mHC residual map B_l is produced; see MhcMixingMode. kPerUsePlan
-  // is the only mode that computes it on this toolkit.
-  MhcMixingMode mhc_mixing_mode = MhcMixingMode::kPerUsePlan;
+  // How the mHC residual map B_l is produced; see MhcMixingMode. The fused
+  // kernel is the default because it is the only form with no host plan and no
+  // repeatability refusal; --mhc-mixing selects the staged fallback.
+  MhcMixingMode mhc_mixing_mode = MhcMixingMode::kFusedHcPre;
 
   // This layer's ratio, with the empty-vector default folded in.
   int64_t compress_ratio(int64_t layer) const {

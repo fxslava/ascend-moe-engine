@@ -1097,6 +1097,151 @@ void TestSinkhornInvariantAndAliasing(const Backend& backend) {
 // HYPOTHESIS 3 -- the compressor's sequence-ring cadence
 // ===========================================================================
 
+// ===========================================================================
+// HYPOTHESIS 5 -- the FUSED normalization, which is the one the engine ships
+// ===========================================================================
+//
+// H2 refuted the standalone operator's reusability, which leaves the one
+// question that actually decides the runtime: is the B_l that comes OUT of the
+// fused kernel doubly stochastic, and is THAT executor repeatable?
+// aclnnHcPre runs the Sinkhorn in its AIV vector epilogue and returns the
+// result as combFrag, so if both hold, the standalone operator is not needed
+// at all -- which is exactly what the engine's default mHC mode assumes.
+void TestFusedHcPreSinkhorn(const Backend& backend) {
+  Hypothesis(5, "aclnnHcPre's fused epilogue returns a doubly-stochastic combFrag, repeatably");
+  Assume("x = [1, 4, 4096] BF16 (TND), hcFn [24, 16384] FP32, hcScale [3] and hcBase [24] FP32");
+  Assume("hcMult = 4, hcSinkhornIters = 20, both epsilons 1e-6");
+  Assume("the outputs are y [1, 4096] BF16, post [1, 4] FP32 and combFrag [1, 4, 4] FP32");
+  Assume("combFrag is ALREADY doubly stochastic -- row and column sums 1.0 +/- 1e-5 -- with no "
+         "standalone Sinkhorn anywhere in the chain");
+  Assume("its executor IS repeatable: B_l never becomes a tensor at the aclnn layer, so the 561000 "
+         "refusal H2 recorded cannot arise here");
+
+  OpTable ops;
+  if (!ops.runtime_reachable()) {
+    Skip("the aclnn runtime is not on the loader path; no operator to question");
+    return;
+  }
+  if (!ops.available(OpId::kHcPre)) {
+    Skip("aclnnHcPre is not deployed in this opp package; the engine's default mHC mode needs it");
+    return;
+  }
+
+  DeviceArena arena(backend.allocator, 32ull << 20);
+  std::vector<Tensor> owned;
+  const auto track = [&owned](Tensor tensor) {
+    owned.push_back(tensor);
+    return tensor;
+  };
+
+  const Tensor x = track(arena.Make({kDecodeTokens, kNhc, kHiddenSize}, kDtBf16));
+  const Tensor hc_fn = track(arena.Make({kMixRows, kMixCols}, kDtFp32));
+  const Tensor hc_scale = track(arena.Make({3}, kDtFp32));
+  const Tensor hc_base = track(arena.Make({kMixRows}, kDtFp32));
+  const Tensor y = track(arena.Make({kDecodeTokens, kHiddenSize}, kDtBf16));
+  const Tensor post = track(arena.Make({kDecodeTokens, kNhc}, kDtFp32));
+  const Tensor comb_frag = track(arena.Make({kDecodeTokens, kNhc, kNhc}, kDtFp32));
+
+  Check(comb_frag.shape == std::vector<int64_t>({1, 4, 4}) && comb_frag.dtype == kDtFp32,
+        "combFrag is allocated at the B_l geometry the engine binds, " + comb_frag.text());
+  Check(comb_frag.strides == ContiguousStrides(comb_frag.shape),
+        "and CONTIGUOUS, which H2.1 showed is the only form this kernel family accepts (strides " +
+            ShapeText(comb_frag.strides) + ")");
+  Check(y.shape == std::vector<int64_t>({1, kHiddenSize}),
+        "y comes out at [1, 4096] -- the activation RMSNorm and the attention projections already take, "
+        "so the engine feeds it on with no reshape");
+
+  std::printf("\n-- H5.1 the fused plan, and whether it can be retained --\n");
+  PlanResult plan = RunPlan([&](aclOpExecutor** executor) {
+    // hcEps precedes normEps here, the reverse of aclnnMhcPre's order.
+    return PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, executor, x.handle, hc_fn.handle, hc_scale.handle,
+                                    hc_base.handle, kNhc, kSinkhornIters, kSinkhornEps, kRmsNormEpsilon,
+                                    y.handle, post.handle, comb_frag.handle);
+  });
+  if (!ExpectPlanned(plan, "hc_pre accepts the TND decode geometry at hcSinkhornIters = " +
+                               std::to_string(kSinkhornIters))) {
+    Destroy(&owned);
+    return;
+  }
+
+  StaticOpSlot slot;
+  void* workspace = nullptr;
+  DeviceStream stream = nullptr;
+  bool repeatable = false;
+  try {
+    slot.Adopt(OpId::kHcPre, "hypothesis/hc_pre", plan.workspace, plan.executor);
+    repeatable = slot.planned();
+  } catch (const std::exception& error) {
+    // Unlike H2's refutation this is a genuine FAILURE, not a recorded
+    // finding: the engine's default mode depends on this executor being
+    // retained, so if it is refused the default is unusable.
+    Check(false, std::string("aclSetAclOpExecutorRepeatable REFUSED the fused plan: ") +
+                     FirstLine(error.what()) +
+                     " -- kFusedHcPre depends on this, so the engine would have to fall back to "
+                     "kStagedMhcSinkhorn and its per-round host plan");
+    plan.executor = nullptr;
+  }
+  if (repeatable) {
+    Check(true, "the fused executor IS repeatable: one retained plan serves every token, so the decode "
+                "loop issues no host plan for the normalization");
+    workspace = plan.workspace > 0 ? backend.allocator->DeviceMalloc(plan.workspace) : nullptr;
+    stream = backend.streams->CreateStream();
+    slot.Launch(ops, workspace, stream);
+    // The decode loop's real access pattern: repoint x -- the ping-ponged
+    // residual stream -- and relaunch.
+    slot.SetAddress(0, x.handle, x.address);
+    slot.Launch(ops, workspace, stream);
+    Check(true, "the fused plan relaunched after aclSetTensorAddr on its stream input");
+  }
+
+  std::printf("\n-- H5.2 the Birkhoff invariant over the FUSED output --\n");
+  if (!backend.numerics_live) {
+    Skip("combFrag cannot be read back in this build (symbolic device memory); H2.4 fixes the reference "
+         "and the 1e-5 tolerance the on-device run applies to this output");
+  } else if (!repeatable) {
+    Skip("no retained fused executor to measure -- see the refusal above");
+  } else {
+    // Seed a strictly positive projection: Sinkhorn is only defined on a
+    // non-negative matrix with no all-zero row or column, and hcFn / hcBase
+    // are what the kernel builds its 4x4 from.
+    std::vector<float> fn_host(static_cast<size_t>(hc_fn.elements()), 0.0f);
+    for (size_t index = 0; index < fn_host.size(); ++index) {
+      fn_host[index] = 0.05f + 0.01f * static_cast<float>(index % 17);
+    }
+    std::vector<float> scale_host(3, 1.0f);
+    std::vector<float> base_host(static_cast<size_t>(kMixRows), 0.1f);
+    backend.streams->MemcpySync(hc_fn.address, hc_fn.bytes, fn_host.data(), fn_host.size() * sizeof(float),
+                                MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(hc_scale.address, hc_scale.bytes, scale_host.data(),
+                                scale_host.size() * sizeof(float), MemcpyKind::kHostToDevice);
+    backend.streams->MemcpySync(hc_base.address, hc_base.bytes, base_host.data(),
+                                base_host.size() * sizeof(float), MemcpyKind::kHostToDevice);
+
+    slot.Launch(ops, workspace, stream);
+    backend.streams->SynchronizeStream(stream);
+    std::vector<float> readback(static_cast<size_t>(comb_frag.elements()), 0.0f);
+    backend.streams->MemcpySync(readback.data(), readback.size() * sizeof(float), comb_frag.address,
+                                comb_frag.bytes, MemcpyKind::kDeviceToHost);
+    double worst = 0.0;
+    const bool holds = CheckBirkhoffInvariant(readback.data(), kDecodeTokens, kNhc, kBirkhoffTolerance,
+                                              &worst);
+    Check(holds, "the FUSED combFrag is doubly stochastic within 1e-5 (worst deviation " +
+                     Scientific(worst) + ") -- so aclnnMhcSinkhorn was never needed for CORRECTNESS, "
+                     "only its repeatability was ever the problem");
+  }
+
+  if (repeatable) {
+    slot.Reset();
+  }
+  if (stream != nullptr) {
+    backend.streams->DestroyStream(stream);
+  }
+  if (workspace != nullptr) {
+    backend.allocator->DeviceFree(workspace);
+  }
+  Destroy(&owned);
+}
+
 void TestCompressorRingCadence(const Backend& backend) {
   Hypothesis(3, "aclnnCompressor expresses a sequence-ring cadence at cmpRatio 4 (CSA)");
   Assume("compression ratio 4 (CSA), compressed width D = 512, ropeHeadDim = 64");
@@ -1518,6 +1663,7 @@ int main(int argc, char** argv) {
   };
   guard("1 (mhc_pre / mhc_post)", [&] { TestMhcPreAndPostContract(backend, &ReadCounters); });
   guard("2 (mhc_sinkhorn)", [&] { TestSinkhornInvariantAndAliasing(backend); });
+  guard("5 (fused hc_pre Sinkhorn)", [&] { TestFusedHcPreSinkhorn(backend); });
   guard("3 (compressor cadence)", [&] { TestCompressorRingCadence(backend); });
   guard("4 (lightning indexer)", [&] { TestIndexerTopKRange(backend); });
 

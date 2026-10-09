@@ -919,6 +919,9 @@ void StaticArenaManager::CreateMhcDescriptors() {
     // below a plain byte offset rather than a strided view.
     t.residual_stream[buffer] =
         arena_.CreateTensor(kStreamLabels[buffer], {tokens, kNhcStreams, kHiddenSize}, kAclBf16, base);
+    static const char* const kStreamBshdLabels[2] = {"mhc_stream_a.bshd", "mhc_stream_b.bshd"};
+    t.residual_stream_bshd[buffer] = arena_.CreateTensor(kStreamBshdLabels[buffer],
+                                                         {tokens, 1, kNhcStreams, kHiddenSize}, kAclBf16, base);
     for (int64_t stream = 0; stream < kNhcStreams; ++stream) {
       t.stream_slice[buffer][stream] =
           arena_.CreateTensor(kSliceLabels[buffer][static_cast<size_t>(stream)], {tokens, kHiddenSize}, kAclBf16,
@@ -932,6 +935,9 @@ void StaticArenaManager::CreateMhcDescriptors() {
     const char* h_res;
     const char* h_res_sink;
     const char* h_out;
+    const char* h_post_bshd;
+    const char* b_l_bshd;
+    const char* h_out_bshd;
     const char* h_in_reservation;
     const char* h_post_reservation;
     const char* h_res_reservation;
@@ -943,8 +949,10 @@ void StaticArenaManager::CreateMhcDescriptors() {
   };
   const RoundLabels rounds[2] = {
       {"mhc_attn_h_in", "mhc_attn_h_post", "mhc_attn_h_res", "mhc_attn_h_res_sink", "mhc_attn_h_out",
+       "mhc_attn_h_post.bshd", "mhc_attn_b_l.bshd", "mhc_attn_h_out.bshd",
        "mhc.attn_h_in", "mhc.attn_h_post", "mhc.attn_h_res", "mhc.attn_h_res_sink", "act.proj_out"},
       {"mhc_moe_h_in", "mhc_moe_h_post", "mhc_moe_h_res", "mhc_moe_h_res_sink", "mhc_moe_h_out",
+       "mhc_moe_h_post.bshd", "mhc_moe_b_l.bshd", "mhc_moe_h_out.bshd",
        "mhc.moe_h_in", "mhc.moe_h_post", "mhc.moe_h_res", "mhc.moe_h_res_sink", "moe.routed_out"},
   };
   MhcRoundTensors* targets[2] = {&t.mhc_attn, &t.mhc_moe};
@@ -966,6 +974,13 @@ void StaticArenaManager::CreateMhcDescriptors() {
                                          ReservationAddress(labels.h_res_sink_reservation));
     set.h_out = arena_.CreateTensor(labels.h_out, {tokens, kHiddenSize}, kAclBf16,
                                     ReservationAddress(labels.h_out_reservation));
+    // The BSHD relabels HcPost requires, over the very same addresses.
+    set.h_post_bshd = arena_.CreateTensor(labels.h_post_bshd, {tokens, 1, kNhcStreams}, kAclFloat32,
+                                          ReservationAddress(labels.h_post_reservation));
+    set.b_l_bshd = arena_.CreateTensor(labels.b_l_bshd, {tokens, 1, kNhcStreams, kNhcStreams}, kAclFloat32,
+                                       ReservationAddress(labels.h_res_sink_reservation));
+    set.h_out_bshd = arena_.CreateTensor(labels.h_out_bshd, {tokens, 1, kHiddenSize}, kAclBf16,
+                                         ReservationAddress(labels.h_out_reservation));
   }
 
   // Pointed at layer 0's attention round; repointed per layer and per round.

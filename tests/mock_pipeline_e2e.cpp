@@ -698,12 +698,12 @@ void TestFullPipeline() {
   Check(counters.mhc_rounds == static_cast<uint64_t>(2 * kNumLayers * kDecodeSteps),
         "every layer ran TWO mHC rounds per step (attention and MoE), " +
             std::to_string(2 * kNumLayers * kDecodeSteps) + " in total");
-  // The forced cost of Sinkhorn's non-repeatability: exactly one host plan per
-  // round, no more. If this ever exceeds mhc_rounds something is re-planning
-  // twice; if it is zero, the normalization silently stopped running.
-  Check(counters.sinkhorn_replans == counters.mhc_rounds,
-        "one single-use Sinkhorn plan per mHC round (" + std::to_string(counters.sinkhorn_replans) +
-            "): the 561000 repeatability refusal costs exactly one host plan each, and nothing more");
+  // The point of the fused path: the Sinkhorn runs inside HcPre's vector
+  // epilogue, so the decode loop issues NO host plans at all. On the staged
+  // fallback this would be one per round -- TestMhcFusedVsStaged measures both.
+  Check(counters.sinkhorn_replans == 0,
+        "the fused path issues ZERO host plans inside the decode loop: HcPre's kernel normalizes B_l in "
+        "registers, so there is no standalone Sinkhorn to re-plan");
 
   // ---- layer topology: the dispatch really followed compress_ratios ----
   Check(counters.swa_layers == static_cast<uint64_t>(kSwaLayers * kDecodeSteps) &&
@@ -738,8 +738,9 @@ void TestFullPipeline() {
 
   const std::string decode_report = pipeline.DescribeStages();
   Check(decode_report.find("pure TND") != std::string::npos &&
-            decode_report.find("kPerUsePlan") != std::string::npos,
-        "the stage report states the mHC layout and how B_l is produced");
+            decode_report.find("kFusedHcPre") != std::string::npos &&
+            decode_report.find("aclnnHcPre") != std::string::npos,
+        "the stage report states the mHC layout and that B_l comes from the fused HcPre kernel");
   Check(decode_report.find("sparse_attn_csa") != std::string::npos &&
             decode_report.find("sparse_attn_hca") != std::string::npos &&
             decode_report.find("cmp_hold_csa") != std::string::npos,
@@ -775,6 +776,101 @@ void TestFullPipeline() {
   std::printf("  slot-map index mismatches (derive-and-verify tally): %" PRIu64 "\n", stats.slot_map_mismatches);
   const size_t rss_kb = ReadResidentKb();
   Check(rss_kb < 512 * 1024, "physical RSS stayed under 512 MiB (read " + std::to_string(rss_kb) + " kB)");
+}
+
+// ---------------------------------------------------------------------------
+// The two ways B_l can be produced, measured against each other
+// ---------------------------------------------------------------------------
+//
+// This is the test that justifies the default. Both modes compute the same
+// doubly-stochastic residual map; they differ in what that costs per decode
+// step, and the difference is the whole reason the fused kernel is preferred:
+//
+//   kFusedHcPre         2 launches per round, 0 host plans
+//   kStagedMhcSinkhorn  3 launches per round, 1 host plan per round
+//
+// It also keeps the staged fallback from rotting. It is documented as the
+// escape hatch if the fused kernel needs its own bring-up, so it has to stay
+// dispatchable, not merely compilable.
+void TestMhcMixingModes() {
+  Section("mHC mixing: the fused HcPre kernel against the staged standalone Sinkhorn");
+  MockResetAllocatorForTest();
+  MockSetReportedHbm(64ull << 30);
+
+  OpTable ops;
+  if (!ops.runtime_reachable()) {
+    Check(false, "the operator table resolves from libopapi_mock");
+    return;
+  }
+  for (OpId id : {OpId::kHcPre, OpId::kHcPost, OpId::kMhcPre, OpId::kMhcSinkhorn, OpId::kMhcPost}) {
+    Check(ops.available(id), std::string("resolved: ") + OpName(id));
+  }
+
+  AclDeviceOps device(0);
+  const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
+
+  struct Measured {
+    uint64_t launches = 0;
+    uint64_t replans = 0;
+    uint64_t rounds = 0;
+    size_t stages = 0;
+  };
+  const auto measure = [&](MhcMixingMode mode) {
+    ExclusiveExpertManager::Options options;
+    // Full coverage: the key space is flat over layer x expert, so a subset
+    // would refuse the first layer outside it. The spans are symbolic, so the
+    // only real cost is the small resident slot pool.
+    options.routed_coverage = kTotalRoutedExperts;
+    options.device_slots = 64;
+    options.transfer_chunk_bytes = 512 * 1024;
+    options.host_available_bytes = 256ull << 30;
+    ExclusiveExpertManager experts(device, device, layout, options);
+
+    SymbolicWeightSource source(kNumLayers, kNumRoutedExperts);
+    RuntimeConfig config;
+    config.synthetic_weights = true;
+    config.block_size = 128;
+    config.max_context_len = 256;
+    config.mhc_mixing_mode = mode;
+    MoeRouterEngine router(device, device);
+    Dsv4Pipeline pipeline(device, device, ops, experts, router, config);
+    pipeline.Build(source);
+    experts.Ingest(source, {});
+
+    MockSetD2HSeed(&SeedDeviceToHost);
+    pipeline.DecodeStep(7, 0);
+    (void)pipeline.ReadArgmaxToken();
+    MockSetD2HSeed(nullptr);
+
+    Measured out;
+    out.launches = pipeline.counters().launches;
+    out.replans = pipeline.counters().sinkhorn_replans;
+    out.rounds = pipeline.counters().mhc_rounds;
+    // The LABELLED line, not a bare mention: the staged report also names
+    // kFusedHcPre when it explains why that mode is the default, so a plain
+    // substring search would match both.
+    out.stages = pipeline.DescribeStages().find("B_l SOURCE:   kFusedHcPre") != std::string::npos ? 1 : 0;
+    return out;
+  };
+
+  const Measured fused = measure(MhcMixingMode::kFusedHcPre);
+  const Measured staged = measure(MhcMixingMode::kStagedMhcSinkhorn);
+
+  const uint64_t rounds = static_cast<uint64_t>(2 * kNumLayers);
+  Check(fused.rounds == rounds && staged.rounds == rounds,
+        "both modes run the same " + std::to_string(rounds) + " mHC rounds per step, so the comparison "
+        "below is like for like");
+  Check(fused.replans == 0,
+        "kFusedHcPre issues NO host plan inside the decode loop: the Sinkhorn is interior to HcPre's kernel");
+  Check(staged.replans == rounds,
+        "kStagedMhcSinkhorn pays exactly one host plan per round (" + std::to_string(staged.replans) +
+            "), because aclnnMhcSinkhorn has no repeatable form");
+  Check(staged.launches == fused.launches + rounds,
+        "the staged path costs one EXTRA launch per round (" + std::to_string(fused.launches) + " fused vs " +
+            std::to_string(staged.launches) + " staged): HcPre folds the normalization into the launch that "
+            "produces hIn, instead of dispatching it separately");
+  Check(fused.stages == 1 && staged.stages == 0,
+        "each mode's stage report names the B_l source it actually used");
 }
 
 void TestDiagnosticsJson() {
@@ -831,6 +927,7 @@ int RunMain() {
     TestOperatorContracts();
     TestModelConfig();
     TestFullPipeline();
+    TestMhcMixingModes();
     TestDiagnosticsJson();
   } catch (const std::exception& error) {
     std::printf("\nunexpected exception: %s\n", error.what());

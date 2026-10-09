@@ -87,6 +87,12 @@ void PrintUsage() {
       "  --moe-path fused|decomposed   expert GEMM chain inside the standard aclnn block (default fused)\n"
       "  --moe-backend standard|lattice  IRoutedMoeBlock selection (default standard; the 2-bit\n"
       "                            Leech-lattice backend is a skeleton and refuses at plan time)\n"
+      "  --mhc-mixing fused|staged how the mHC residual map B_l is produced (default fused):\n"
+      "                            fused  = aclnnHcPre -> aclnnHcPost, 2 launches/round, 0 host plans;\n"
+      "                                     the 20-iteration Sinkhorn runs in HcPre's vector epilogue\n"
+      "                            staged = aclnnMhcPre -> aclnnMhcSinkhorn -> aclnnMhcPost; the middle\n"
+      "                                     operator has no repeatable form, so it costs one host plan\n"
+      "                                     per round. Fallback only\n"
       "  --compress-ratios <list>  comma-separated per-layer token-compression ratio, one per layer:\n"
       "                            0 or 1 = SWA, 4 = CSA (compressor 4:1 + indexer top-512 + shared-KV\n"
       "                            sparse attention), 128 = HCA (compressor 128:1 + direct shared-KV).\n"
@@ -209,6 +215,12 @@ Arguments ParseArguments(int argc, char** argv) {
         start = comma + 1;
       }
       config.compress_ratios_provenance = GeometryProvenance::kCommandLine;
+    } else if (flag == "--mhc-mixing") {
+      const std::string value = next("--mhc-mixing");
+      DSV4_REQUIRE(value == "fused" || value == "staged",
+                   "--mhc-mixing expects 'fused' or 'staged', got '" << value << "'");
+      config.mhc_mixing_mode =
+          value == "staged" ? MhcMixingMode::kStagedMhcSinkhorn : MhcMixingMode::kFusedHcPre;
     } else if (flag == "--gating-norm-type") {
       config.gating_norm_type = ParseInt(next("--gating-norm-type"), "--gating-norm-type");
     } else if (flag == "--dense-group-size") {

@@ -250,6 +250,24 @@ inline constexpr size_t kMhcPostHOut = 2;
 inline constexpr size_t kMhcPostHPost = 3;
 inline constexpr size_t kMhcPostOut = 4;
 
+// aclnnHcPre(x, hcFn, hcScale, hcBase, hcMult, hcSinkhornIters, hcEps,
+//            normEps, yOut, postOut, combFragOut). The four attributes are
+//            host scalars and are skipped.
+inline constexpr size_t kHcPreX = 0;
+inline constexpr size_t kHcPreHcFn = 1;
+inline constexpr size_t kHcPreHcScale = 2;
+inline constexpr size_t kHcPreHcBase = 3;
+inline constexpr size_t kHcPreY = 4;
+inline constexpr size_t kHcPrePost = 5;
+inline constexpr size_t kHcPreCombFrag = 6;
+
+// aclnnHcPost(x, residual, post, comb, y) -- no attributes at all.
+inline constexpr size_t kHcPostX = 0;
+inline constexpr size_t kHcPostResidual = 1;
+inline constexpr size_t kHcPostPost = 2;
+inline constexpr size_t kHcPostComb = 3;
+inline constexpr size_t kHcPostY = 4;
+
 // aclnnCompressor(x, wkv, wgate, stateCacheRef, ape, normWeight, ropeSin,
 //                 ropeCos, stateBlockTable, cuSeqlens, seqused, startPos,
 //                 ...attrs..., cmpKvOut)

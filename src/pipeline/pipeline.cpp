@@ -181,9 +181,17 @@ void Dsv4Pipeline::PlanStages() {
       OpId::kRmsNorm,       OpId::kRmsNormDynamicMxQuant, OpId::kDynamicMxQuant,
       OpId::kQuantMatmulV5, OpId::kApplyRotaryPosEmbV2,   OpId::kScatterPaKvCache,
       OpId::kInplaceAdd,    OpId::kSwiGlu,                OpId::kArgMax,
-      // mHC is the residual stream itself, so the trio is unconditional.
-      OpId::kMhcPre,        OpId::kMhcSinkhorn,           OpId::kMhcPost,
   };
+  // mHC is the residual stream itself, so one of the two families is always
+  // required -- but only the one the selected mode actually plans.
+  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedHcPre) {
+    required.push_back(OpId::kHcPre);
+    required.push_back(OpId::kHcPost);
+  } else {
+    required.push_back(OpId::kMhcPre);
+    required.push_back(OpId::kMhcSinkhorn);
+    required.push_back(OpId::kMhcPost);
+  }
   if (swa_planned_) {
     required.push_back(OpId::kFusedInferAttentionScoreV5);
   }
@@ -427,11 +435,18 @@ void Dsv4Pipeline::PlanStages() {
 // normalized into B_l, the sub-block runs, and `aclnnMhcPost` folds its output
 // back as `x_next = B_l^T x + hOut * hPost`.
 //
-// Pre and Post hold RETAINED, repeatable executors -- the 950PR run confirmed
-// Repeatable=true for both at exactly these TND shapes. The normalization in
-// between does NOT: see the MhcMixingMode note in config.hpp. On kPerUsePlan
-// the Sinkhorn stage is only PROBED here, to measure its workspace and prove
-// the geometry is accepted; the decode loop plans and launches it per use.
+// On kFusedHcPre -- the default -- a round is TWO retained executors and no
+// host work: `aclnnHcPre` fuses the reciprocal RMS, the mixing projection and
+// the 20-iteration Sinkhorn into one kernel whose `comb_frag` output IS B_l,
+// already doubly stochastic, and `aclnnHcPost` folds the sub-block output back
+// in. B_l never exists as a standalone tensor at the aclnn layer, so there is
+// nothing for aclSetAclOpExecutorRepeatable to refuse.
+//
+// On kStagedMhcSinkhorn the mhc_* trio is planned instead. Pre and Post hold
+// retained executors there too (the 950PR run confirmed Repeatable=true for
+// both at these TND shapes), but the Sinkhorn stage can only be PROBED here --
+// to measure its workspace and prove the geometry is accepted -- because the
+// operator has no repeatable form; the decode loop plans it per use.
 void Dsv4Pipeline::PlanMhcStages() {
   ArenaTensors& t = arena_manager_.tensors();
   StaticMemoryArena& arena = arena_manager_.arena();
@@ -447,6 +462,33 @@ void Dsv4Pipeline::PlanMhcStages() {
       {"mhc_pre_attn", "mhc_sinkhorn_attn", "mhc_post_attn", &t.mhc_attn},
       {"mhc_pre_moe", "mhc_sinkhorn_moe", "mhc_post_moe", &t.mhc_moe},
   };
+
+  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedHcPre) {
+    for (const RoundPlan& round : rounds) {
+      const MhcRoundTensors& set = *round.tensors;
+      {
+        PipelineStage& entry = stages_.Add(round.pre, OpId::kHcPre);
+        // Attribute order is hcEps THEN normEps -- the reverse of aclnnMhcPre,
+        // which its own header warns about. Passing them the other way round
+        // would silently swap the Sinkhorn guard with the RMS floor.
+        const uint64_t workspace = PlanAclnnOp<HcPrePlanFn>(
+            ops_, entry.op, &executor, t.residual_stream[0], t.w_mhc_phi, t.w_mhc_alpha, t.w_mhc_bias,
+            kNhcStreams, kMhcSinkhornIters, kMhcHcEpsilon, kRmsNormEpsilon, set.h_in, set.h_post,
+            set.h_res_sink);
+        entry.slot.Adopt(entry.op, entry.name, workspace, executor);
+        arena.NoteWorkspace(workspace);
+      }
+      {
+        PipelineStage& entry = stages_.Add(round.post, OpId::kHcPost);
+        const uint64_t workspace =
+            PlanAclnnOp<HcPostPlanFn>(ops_, entry.op, &executor, set.h_out_bshd, t.residual_stream_bshd[0],
+                                      set.h_post_bshd, set.b_l_bshd, t.residual_stream_bshd[1]);
+        entry.slot.Adopt(entry.op, entry.name, workspace, executor);
+        arena.NoteWorkspace(workspace);
+      }
+    }
+    return;
+  }
 
   for (const RoundPlan& round : rounds) {
     const MhcRoundTensors& set = *round.tensors;
@@ -685,6 +727,22 @@ void Dsv4Pipeline::RunMhcPre(const MhcRound& round, const MhcRoundTensors& tenso
   StaticMemoryArena& arena = arena_manager_.arena();
   PipelineStage& pre = stages_.stage(round.pre);
 
+  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedHcPre) {
+    // ONE launch, and B_l comes out of it already doubly stochastic: the
+    // kernel's own vector epilogue ran the 20 Sinkhorn iterations in registers
+    // (see the MhcMixingMode note in config.hpp). hcFn / hcScale / hcBase are
+    // the same per-layer phi / alpha / bias tensors the staged path binds;
+    // HcPre takes no gamma, so that reservation is read only on the staged
+    // path.
+    pre.slot.SetAddress(slot::kHcPreX, t.residual_stream[0],
+                        arena.Address(t.h_residual_stream[stream_parity_]));
+    pre.slot.SetAddress(slot::kHcPreHcFn, t.w_mhc_phi, arena.Address(weights.phi));
+    pre.slot.SetAddress(slot::kHcPreHcScale, t.w_mhc_alpha, arena.Address(weights.alpha));
+    pre.slot.SetAddress(slot::kHcPreHcBase, t.w_mhc_bias, arena.Address(weights.bias));
+    Launch(pre);
+    return;
+  }
+
   // This round's weights and the live stream buffer.
   pre.slot.SetAddress(slot::kMhcPreX, t.residual_stream[0], arena.Address(t.h_residual_stream[stream_parity_]));
   pre.slot.SetAddress(slot::kMhcPrePhi, t.w_mhc_phi, arena.Address(weights.phi));
@@ -693,16 +751,11 @@ void Dsv4Pipeline::RunMhcPre(const MhcRound& round, const MhcRoundTensors& tenso
   pre.slot.SetAddress(slot::kMhcPreGamma, t.w_mhc_gamma, arena.Address(weights.gamma));
   Launch(pre);
 
-  // B_l. On kFusedExternal the slot is expected to already hold a doubly
-  // stochastic map from a fused producer, so nothing is launched here.
-  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedExternal) {
-    return;
-  }
-  // kPerUsePlan: plan and launch the standalone operator, its executor
+  // kStagedMhcSinkhorn: plan and launch the standalone operator, its executor
   // consumed by its own launch. This is a HOST PLAN INSIDE THE DECODE LOOP,
   // which the rest of this engine goes to some length to avoid -- see the
-  // MhcMixingMode note in config.hpp for why there is no alternative on this
-  // toolkit, and `sinkhorn_replans` for the count.
+  // MhcMixingMode note in config.hpp for why the fused path exists, and
+  // `sinkhorn_replans` for the count this mode pays.
   const PipelineStage& sinkhorn = stages_.stage(round.sinkhorn);
   aclOpExecutor* executor = nullptr;
   const uint64_t workspace =
@@ -723,8 +776,18 @@ void Dsv4Pipeline::RunMhcPost(const MhcRound& round) {
   // own input, so the executor stays reusable across all 86 rounds of a step.
   const size_t source = stream_parity_;
   const size_t destination = 1 - stream_parity_;
-  post.slot.SetAddress(slot::kMhcPostX, t.residual_stream[0], arena.Address(t.h_residual_stream[source]));
-  post.slot.SetAddress(slot::kMhcPostOut, t.residual_stream[1], arena.Address(t.h_residual_stream[destination]));
+  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedHcPre) {
+    // HcPost's residual and y are the rank-4 BSHD relabels of the same two
+    // stream buffers, so the ping-pong is the same two addresses.
+    post.slot.SetAddress(slot::kHcPostResidual, t.residual_stream_bshd[0],
+                         arena.Address(t.h_residual_stream[source]));
+    post.slot.SetAddress(slot::kHcPostY, t.residual_stream_bshd[1],
+                         arena.Address(t.h_residual_stream[destination]));
+  } else {
+    post.slot.SetAddress(slot::kMhcPostX, t.residual_stream[0], arena.Address(t.h_residual_stream[source]));
+    post.slot.SetAddress(slot::kMhcPostOut, t.residual_stream[1],
+                         arena.Address(t.h_residual_stream[destination]));
+  }
   Launch(post);
   stream_parity_ = destination;
   ++counters_.mhc_rounds;
@@ -1196,22 +1259,32 @@ std::string Dsv4Pipeline::DescribeStages() const {
   out << "                x [1, " << kNhcStreams << ", " << kHiddenSize << "] BF16, hRes/B_l [1, "
       << kNhcStreams << ", " << kNhcStreams << "] FP32, hIn/hOut [1, " << kHiddenSize << "] BF16, hPost [1, "
       << kNhcStreams << "] FP32 -- no rank mixing, and hIn feeds RMSNorm as is\n";
-  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedExternal) {
-    out << "  B_l SOURCE:   kFusedExternal -- the pipeline launches NOTHING for the Sinkhorn link and takes\n"
-           "                whatever the B_l slot holds. This is only correct with a fused producer wired in\n"
-           "                (aclnnHcPreSinkhorn is the vendored candidate); with none, B_l is whatever was\n"
-           "                last written there.\n";
+  if (config_.mhc_mixing_mode == MhcMixingMode::kFusedHcPre) {
+    out << "  B_l SOURCE:   kFusedHcPre -- aclnnHcPre -> aclnnHcPost, 2 launches per round, ZERO host plans.\n"
+           "                HcPre fuses the reciprocal RMS, the mixing projection and the "
+        << kMhcSinkhornIters
+        << "-iteration Sinkhorn\n                into one kernel and returns B_l as combFrag, already doubly "
+           "stochastic. The\n                normalization runs in the AIV vector epilogue with the 4x4 held as "
+           "four RegTensor\n                rows that never leave the registers, and the column sums taken as "
+           "vertical adds\n                ACROSS those registers -- so no transpose, and no round trip to GM "
+           "for a 64-byte\n                matrix (hc_pre_base_arch35.h, namespace HcPreSinkhorn). Because B_l "
+           "is never a\n                standalone tensor at the aclnn layer, the 561000 repeatability refusal "
+           "and the\n                manual-4.31 self-copy hazard cannot arise: both executors are retained and "
+           "replayed.\n";
+    out << "                HcPre is TND ([1, " << kNhcStreams << ", " << kHiddenSize
+        << "] -> y [1, " << kHiddenSize << "]) so y feeds RMSNorm as is;\n"
+           "                HcPost is strictly BSHD, and takes unit-leading-axis relabels of the SAME\n"
+           "                addresses -- descriptors built once, never a runtime squeeze or unsqueeze.\n";
   } else {
-    out << "  B_l SOURCE:   kPerUsePlan -- aclnnMhcSinkhorn is planned and launched once per mHC round, its\n"
-           "                executor consumed by its own launch. FORCED: on a 950PR\n"
+    out << "  B_l SOURCE:   kStagedMhcSinkhorn -- aclnnMhcSinkhorn is planned and launched once per mHC\n"
+           "                round, its executor consumed by its own launch. On a 950PR\n"
            "                aclSetAclOpExecutorRepeatable fails this operator with 561000 (the wrapper builds a\n"
            "                dynamic internal iteration graph CANN will not mark reusable), and a\n"
            "                non-contiguous output -- once the documented workaround -- is refused outright with\n"
-           "                561103. So it cannot hold a retained executor at all, and this engine pays "
+           "                561103. So it cannot hold a retained executor at all, and this mode pays "
         << 2 * kNumLayers
-        << " host\n                plans per step for it. Removing that cost needs the normalization fused into a\n"
-           "                kernel that never materializes B_l at the aclnn layer; aclnnHcPreSinkhorn does\n"
-           "                exactly that and would be driven from mHC's optional hMix / invRms outputs.\n";
+        << " host\n                plans per step for it. kFusedHcPre is the default precisely because it pays "
+           "none.\n";
   }
   if (!arena_manager_.backbone().mhc_weights_populated) {
     out << "  WARNING: the mHC projection weights (hc.phi / alpha / bias / gamma) were NOT populated by the\n"
