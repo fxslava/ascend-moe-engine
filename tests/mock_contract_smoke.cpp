@@ -39,6 +39,7 @@
 #include "moe/core/error.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/config.hpp"
+#include "moe/core/kv_cache_layout.hpp"
 #include "moe/core/device_ops.hpp"
 #include "moe/core/model_config.hpp"
 #include "moe/memory/exclusive_staging.hpp"
@@ -997,6 +998,97 @@ void TestModelConfigContract() {
         "the slot layout computed from the PARSED geometry equals the compiled one");
 }
 
+// ---------------------------------------------------------------------------
+// The per-layer compression schedule: parsing, validation, and the gating
+// ---------------------------------------------------------------------------
+
+void TestCompressionSchedule() {
+  Section("compress_ratios: the checkpoint field that selects each layer's attention path");
+
+  // One ratio per layer, from a config.json, with the three admissible kinds.
+  std::string schedule = "[";
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    const int64_t ratio = layer < 21 ? 1 : (layer < 41 ? 4 : 128);
+    schedule += (layer == 0 ? "" : ",") + std::to_string(ratio);
+  }
+  schedule += "]";
+  const std::string json =
+      "{\"num_hidden_layers\":43,\"n_routed_experts\":256,\"num_experts_per_tok\":6,"
+      "\"hidden_size\":4096,\"moe_intermediate_size\":2048,\"routed_scaling_factor\":1.5,"
+      "\"topk_method\":\"noaux_tc\",\"scoring_func\":\"sqrtsoftplus\",\"norm_topk_prob\":true,"
+      "\"compress_ratios\":" + schedule + "}";
+  const ModelConfig model = ModelConfig::FromJsonText(json, "fixture config.json");
+  Check(static_cast<int64_t>(model.compress_ratios.size()) == kNumLayers,
+        "compress_ratios parses to one entry per layer");
+  Check(AttentionPathForRatio(model.compress_ratios[0]) == AttentionPath::kSlidingWindow &&
+            AttentionPathForRatio(model.compress_ratios[21]) == AttentionPath::kCompressedSparse &&
+            AttentionPathForRatio(model.compress_ratios[42]) == AttentionPath::kHyperCompressed,
+        "ratio 1 selects SWA, 4 selects CSA and 128 selects HCA");
+
+  // A schedule this binary could not dispatch must not reach the device: the
+  // deployed compressor kernel admits cmpRatio 4 and 128 only.
+  const auto with_ratios = [](const std::string& ratios) {
+    return "{\"num_hidden_layers\":43,\"n_routed_experts\":256,\"num_experts_per_tok\":6,"
+           "\"hidden_size\":4096,\"moe_intermediate_size\":2048,\"routed_scaling_factor\":1.5,"
+           "\"topk_method\":\"noaux_tc\",\"scoring_func\":\"sqrtsoftplus\","
+           "\"norm_topk_prob\":true,\"compress_ratios\":" + ratios + "}";
+  };
+  CheckRefuses([&] { ModelConfig::FromJsonText(with_ratios("[4,4,4]"), "t"); },
+               "a schedule shorter than num_hidden_layers (one ratio per layer is required)");
+  std::string eight = "[";
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    eight += (layer == 0 ? "" : ",") + std::string(layer == 7 ? "8" : "1");
+  }
+  eight += "]";
+  CheckRefuses([&] { ModelConfig::FromJsonText(with_ratios(eight), "t"); },
+               "cmpRatio 8, which the deployed compressor kernel refuses");
+  CheckRefuses([&] { ModelConfig::FromJsonText(with_ratios("\"4\""), "t"); },
+               "a compress_ratios that is not an array");
+
+  // THE GATING. A SWA-only schedule must cost nothing: no compressor or
+  // indexer reservation, and -- because the pipeline plans a path only when
+  // some layer selects it -- no descriptors or executors for them either.
+  const MlaGeometry mla;
+  const size_t swa_only = StaticArenaManager::BackboneDeviceBytes(mla, 128, 8192);
+  const size_t with_empty = StaticArenaManager::BackboneDeviceBytes(mla, 128, 8192, {});
+  Check(swa_only == with_empty,
+        "an empty compress_ratios is identical to no schedule at all: every layer is SWA");
+  std::vector<int64_t> csa_only(static_cast<size_t>(kNumLayers), kCompressRatioCsa);
+  const size_t with_csa = StaticArenaManager::BackboneDeviceBytes(mla, 128, 8192, csa_only);
+  Check(with_csa > swa_only,
+        "a CSA schedule enlarges the backbone by the compressor and indexer projections (" +
+            std::to_string((with_csa - swa_only) >> 20) + " MiB), so the slot planner subtracts them");
+  std::vector<int64_t> hca_only(static_cast<size_t>(kNumLayers), kCompressRatioHca);
+  const size_t with_hca = StaticArenaManager::BackboneDeviceBytes(mla, 128, 8192, hca_only);
+  Check(with_hca > swa_only && with_hca < with_csa,
+        "an HCA schedule costs the compressor but NOT the indexer, so it sits between the two");
+
+  // The 604-byte entry, held to its own arithmetic rather than to a literal.
+  Check(sizeof(Dsv4CompressedKvEntry) == 604 && kCompressedKvEntryBytes == 604,
+        "Dsv4CompressedKvEntry is exactly 604 bytes");
+  Check(kCompressedKvNopeChannels + kCompressedKvRopeChannels == mla.kv_lora_rank,
+        "its two halves (" + std::to_string(kCompressedKvNopeChannels) + " nope + " +
+            std::to_string(kCompressedKvRopeChannels) + " rope) sum to kv_lora_rank " +
+            std::to_string(mla.kv_lora_rank));
+  Check(kCompressedKvRopeChannels == mla.qk_rope_head_dim,
+        "its rope half is exactly qk_rope_head_dim wide");
+  Check(kCompressedKvScaleBlock == 64 &&
+            kCompressedKvNopeChannels == kCompressedKvScaleCount * kCompressedKvScaleBlock,
+        "one UE8M0 block scale covers exactly 64 nope channels, with none left over");
+  Check(offsetof(Dsv4CompressedKvEntry, rope_bf16) == 476,
+        "the rope half starts at byte 476, after the quantized half and its padding");
+
+  // The HCA path's identity selection must never name a slot the cache does
+  // not have: the attention core gathers at these indices without a bounds
+  // check of its own. At a short reserved context kIndexTopK (512) exceeds one
+  // layer's slot count, so the vector has to clamp rather than ramp.
+  const int64_t short_slots = DivideUp(256, 128) * 128;  // a 2-block reservation
+  Check(kIndexTopK > short_slots,
+        "top-k " + std::to_string(kIndexTopK) + " really does exceed the " +
+            std::to_string(short_slots) + " compressed slots a short context reserves, so the clamp is "
+            "load-bearing rather than theoretical");
+}
+
 void TestMoeBlockSlotContract() {
   Section("IRoutedMoeBlock: slot byte contracts");
   const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
@@ -1036,6 +1128,7 @@ int RunMain() {
     TestVendorSharedKvArena();
     TestBackboneSizing();
     TestModelConfigContract();
+    TestCompressionSchedule();
     TestMoeBlockSlotContract();
     TestOperatorTable();
   } catch (const std::exception& error) {

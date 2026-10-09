@@ -1449,6 +1449,27 @@ class StaticOpSlot {
   // executor repeatable.
   void Adopt(OpId id, const char* label, uint64_t workspace_size, aclOpExecutor* executor);
 
+  // The same bookkeeping for an operator that CANNOT hold a repeatable
+  // executor, so the stage has to be planned afresh for every use.
+  //
+  // `aclnnMhcSinkhorn` is the case this exists for: on a 950PR,
+  // `aclSetAclOpExecutorRepeatable` fails it with 561000 -- the wrapper builds
+  // a dynamic internal iteration graph that CANN will not mark reusable -- and
+  // a non-contiguous output, once the documented workaround, is now refused
+  // outright with 561103. So there is no retained-executor form of this
+  // operator to hold, and pretending otherwise would abort the run on the
+  // first launch.
+  //
+  // `NoteSingleUse` records the id, the label and the workspace high-water
+  // mark measured by a probe plan at Build, so the stage still appears in the
+  // report and still contributes to the shared workspace. `LaunchSingleUse`
+  // then takes a freshly planned executor, launches it, and does NOT destroy
+  // it on success: a non-repeatable executor is consumed by its own launch.
+  void NoteSingleUse(OpId id, const char* label, uint64_t workspace_size);
+  void LaunchSingleUse(const OpTable& table, void* workspace, void* stream, aclOpExecutor* executor,
+                       uint64_t workspace_size) const;
+  bool single_use() const { return single_use_; }
+
   // Repoint input/output slot `index` of the retained executor at `address`.
   void SetAddress(size_t index, aclTensor* tensor, void* address) const;
   void SetTensorListAddress(size_t ir_index, size_t relative_index, aclTensorList* tensors, void* address) const;
@@ -1457,7 +1478,9 @@ class StaticOpSlot {
 
   uint64_t workspace_size() const { return workspace_size_; }
   aclOpExecutor* executor() const { return executor_; }
-  bool planned() const { return executor_ != nullptr; }
+  // True once the stage can be launched: it holds a retained executor, or it
+  // is a single-use stage whose workspace has been measured.
+  bool planned() const { return executor_ != nullptr || single_use_; }
   const char* label() const { return label_; }
   OpId id() const { return id_; }
 
@@ -1467,6 +1490,7 @@ class StaticOpSlot {
   uint64_t workspace_size_ = 0;
   aclOpExecutor* executor_ = nullptr;
   OpExecutorGuard executor_guard_;
+  bool single_use_ = false;
 };
 
 const char* OpName(OpId id);

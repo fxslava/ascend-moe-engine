@@ -35,6 +35,12 @@
 //       executor for a non-contiguous output view AND for the contiguous one
 //       the DSV4 patch targets, and its result is doubly stochastic -- every
 //       row sum and every column sum 1.0 +/- 1e-5 (the Birkhoff invariant).
+//       REFUTED ON HARDWARE, BOTH HALVES OF THE REUSE CLAIM. The 950PR run
+//       refused the non-contiguous plan outright with 561103, and failed
+//       aclSetAclOpExecutorRepeatable on the contiguous plan with 561000. The
+//       Birkhoff half stands. See the [refuted] verdict below for what the
+//       engine does instead; the claims are kept stated rather than rewritten
+//       so this file still records what was believed and what disproved it.
 //   H3  aclnnCompressor expresses a sequence-ring cadence at cmpRatio 4 (CSA):
 //       an incomplete window emits nothing at all, and the window-closing step
 //       emits exactly one compressed row.
@@ -62,6 +68,14 @@
 //   [ ok ]   the hypothesis holds as stated
 //   [FAIL]   the hypothesis is FALSE -- the runtime design that assumed it
 //            needs changing before any fusion work starts
+//   [refuted] the hypothesis is FALSE, the 950PR run is what established it,
+//            and the engine ALREADY encodes the consequence. Recorded, not
+//            scored: it cannot be a [FAIL] without making a correct engine
+//            report a red suite forever, and it cannot be an [ ok ] either.
+//            The symbolic backend also cannot reproduce these refusals -- it
+//            has no kernel to reject a stride and no CANN to reject a
+//            repeatable executor -- so the two builds could never agree on a
+//            pass/fail line here.
 //   [note]   a measured fact worth recording; never a pass/fail verdict
 //   [SKIP]   not decidable in this build (no device, or the operator's opp
 //            package is not deployed)
@@ -71,6 +85,7 @@
 // opp package deployed, which is what the compiled binary is for.
 
 #include <cinttypes>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +99,7 @@
 #include "moe/core/config.hpp"
 #include "moe/core/device_ops.hpp"
 #include "moe/core/error.hpp"
+#include "moe/core/kv_cache_layout.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/ops/aclnn_dsv4_vendor_ops.h"
 
@@ -104,6 +120,7 @@ namespace {
 int g_checks = 0;
 int g_failures = 0;
 int g_skips = 0;
+int g_refutations = 0;
 
 void Check(bool condition, const std::string& what) {
   ++g_checks;
@@ -120,6 +137,23 @@ void Note(const std::string& what) { std::printf("  [note] %s\n", what.c_str());
 void Skip(const std::string& what) {
   ++g_skips;
   std::printf("  [SKIP] %s\n", what.c_str());
+}
+
+// A claim the 950PR run has ALREADY settled as false, and that the engine has
+// already been changed to accommodate. It is recorded, not scored.
+//
+// This is a third verdict on purpose. A [FAIL] means "the runtime design that
+// assumed this needs revisiting"; a [refuted] means "it was revisited, this is
+// the finding it was revisited for". Scoring these as failures would make a
+// correct engine report a red suite forever; hiding them would lose the one
+// record of why the engine looks the way it does. They also cannot be [FAIL]
+// lines for a mechanical reason: the symbolic backend has no kernel to reject
+// a stride and no CANN to reject a repeatable executor, so it accepts what
+// hardware refuses, and the two builds would disagree on a pass/fail line.
+void Refuted(const std::string& claim, const std::string& finding) {
+  ++g_refutations;
+  std::printf("  [refuted] %s\n", claim.c_str());
+  std::printf("            FINDING: %s\n", finding.c_str());
 }
 
 void Hypothesis(int index, const char* title) {
@@ -822,11 +856,15 @@ void TestMhcPreAndPostContract(const Backend& backend, const DmaCounters& (*coun
 // ===========================================================================
 
 void TestSinkhornInvariantAndAliasing(const Backend& backend) {
-  Hypothesis(2, "aclnnMhcSinkhorn: Birkhoff invariant and the CANN 4.31 aliasing guard");
+  Hypothesis(2, "aclnnMhcSinkhorn: Birkhoff invariant, and whether it can be replayed at all");
   Assume("input hRes = [1, 4, 4] FP32, numIters = 20, eps = 1e-6");
   Assume("output B = [1, 4, 4] FP32, doubly stochastic: row and column sums 1.0 +/- 1e-5");
   Assume("a NON-CONTIGUOUS output view keeps the executor configurable with "
          "aclSetAclOpExecutorRepeatable (the stated workaround for the 4.31 ViewCopy(src, src) hazard)");
+  Assume("a CONTIGUOUS output can be made repeatable, so one retained executor serves every token");
+  Note("BOTH of those last two were REFUTED by the 950PR run -- 561103 for the non-contiguous view, 561000 "
+       "from aclSetAclOpExecutorRepeatable for the contiguous one. They are stated here as the assumptions "
+       "the engine was originally built on, and the [refuted] lines below are what replaced them.");
 
   OpTable ops;
   if (!ops.runtime_reachable()) {
@@ -849,38 +887,40 @@ void TestSinkhornInvariantAndAliasing(const Backend& backend) {
         "the probe's second output really is a non-contiguous view (strides " + ShapeText(gapped_out.strides) +
             " against contiguous " + ShapeText(ContiguousStrides(gapped_out.shape)) + ")");
 
-  // ---- H2.1  the non-contiguous output the hypothesis names ---------------
+  // ---- H2.1  the non-contiguous output the hypothesis named ---------------
+  //
+  // REFUTED ON HARDWARE. The 950PR run returned 561103
+  // (ACL_ERROR_INVALID_PARAM) from the plan: the vendor kernel rejects
+  // non-contiguous view strides outright. So the "hand it a gapped view"
+  // workaround the CANN manual-4.31 note recommended is not merely expensive,
+  // it is unavailable -- which is why the engine's B_l slot is contiguous and
+  // StaticArenaManager says so where it creates it.
   std::printf("\n-- H2.1 the non-contiguous output view --\n");
   const Ledger gapped_before = ReadLedger();
   PlanResult gapped = RunPlan([&](aclOpExecutor** executor) {
     return PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, executor, input.handle, kSinkhornEps,
                                           kSinkhornIters, gapped_out.handle, nullptr, nullptr);
   });
-  if (ExpectPlanned(gapped, "mhc_sinkhorn accepts a non-contiguous [1, 4, 4] FP32 output view")) {
-    StaticOpSlot slot;
-    slot.Adopt(OpId::kMhcSinkhorn, "hypothesis/mhc_sinkhorn.gapped", gapped.workspace, gapped.executor);
-    Check(slot.planned(),
-          "aclSetAclOpExecutorRepeatable succeeded on the non-contiguous plan -- the executor is reusable");
-    void* workspace = gapped.workspace > 0 ? backend.allocator->DeviceMalloc(gapped.workspace) : nullptr;
-    DeviceStream stream = backend.streams->CreateStream();
-    slot.Launch(ops, workspace, stream);
-    // Output slot 1 of the captured IR order; rebinding it and relaunching is
-    // the decode loop's actual access pattern.
-    slot.SetAddress(1, gapped_out.handle, gapped_out.address);
-    slot.Launch(ops, workspace, stream);
-    Check(true, "the non-contiguous plan relaunched after aclSetTensorAddr on its output slot");
+  if (gapped.planned) {
+    // The symbolic backend has no kernel to reject the stride, so it plans.
+    // Record what hardware does instead of scoring a line the two builds
+    // cannot agree on.
+    Refuted("mhc_sinkhorn accepts a non-contiguous [1, 4, 4] FP32 output view",
+            "on a 950PR this plan fails with 561103 (ACL_ERROR_INVALID_PARAM) -- the kernel rejects "
+            "non-contiguous view strides. This backend planned it, so the refusal is not reproducible here; "
+            "the engine binds a CONTIGUOUS B_l either way.");
     const Ledger gapped_after = ReadLedger();
     if (gapped_after.available) {
       Check(gapped_after.self_copy_hazards == gapped_before.self_copy_hazards,
             "no same-address ViewCopy was planned: Contiguous() allocated a distinct temp, so src != dst");
-      Check(gapped_after.sinkhorn_elisions == gapped_before.sinkhorn_elisions,
-            "nothing was elided on this path -- the trailing ViewCopy is real work, one extra launch per token");
     }
-    slot.Reset();
-    backend.streams->DestroyStream(stream);
-    if (workspace != nullptr) {
-      backend.allocator->DeviceFree(workspace);
-    }
+    aclDestroyAclOpExecutor(gapped.executor);
+  } else if (gapped.contract_verdict) {
+    Check(true, "mhc_sinkhorn REFUSES a non-contiguous [1, 4, 4] FP32 output view, as the 950PR run found "
+                "(" + FirstLine(gapped.detail) + ")");
+  } else {
+    Skip("whether a non-contiguous Sinkhorn output is refused is not decidable here (status " +
+         std::to_string(gapped.status) + ")");
   }
 
   // ---- H2.2  the contiguous output, which is what the patch is for --------
@@ -893,29 +933,77 @@ void TestSinkhornInvariantAndAliasing(const Backend& backend) {
   StaticOpSlot contiguous_slot;
   void* contiguous_workspace = nullptr;
   DeviceStream contiguous_stream = nullptr;
+  bool contiguous_repeatable = false;
+  // Kept alive for the numeric section below when the executor could NOT be
+  // made repeatable: it is then launched exactly once, from this plan.
+  aclOpExecutor* single_use_executor = nullptr;
+  uint64_t single_use_workspace = 0;
+
   if (ExpectPlanned(contiguous, "mhc_sinkhorn accepts a contiguous [1, 4, 4] FP32 output")) {
-    contiguous_slot.Adopt(OpId::kMhcSinkhorn, "hypothesis/mhc_sinkhorn", contiguous.workspace,
-                          contiguous.executor);
-    Check(contiguous_slot.planned(),
-          "aclSetAclOpExecutorRepeatable succeeded on the CONTIGUOUS plan too -- the DSV4 patch holds");
     contiguous_workspace =
         contiguous.workspace > 0 ? backend.allocator->DeviceMalloc(contiguous.workspace) : nullptr;
     contiguous_stream = backend.streams->CreateStream();
-    contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
-    contiguous_slot.SetAddress(1, contiguous_out.handle, contiguous_out.address);
-    contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
-    Check(true, "the contiguous plan relaunched after aclSetTensorAddr on its output slot");
-    const Ledger contiguous_after = ReadLedger();
-    if (contiguous_after.available) {
-      Check(contiguous_after.self_copy_hazards == contiguous_before.self_copy_hazards,
-            "no same-address ViewCopy on the contiguous path either -- the patch elides it instead of issuing it");
-      Check(contiguous_after.sinkhorn_elisions == contiguous_before.sinkhorn_elisions + 1,
-            "the patched wrapper elided exactly one trailing ViewCopy (kernelOut == output)");
+    // THE DECISIVE PROBE, AND THE REASON THIS TEST USED TO STOP HERE.
+    //
+    // `StaticOpSlot::Adopt` calls aclSetAclOpExecutorRepeatable, which on a
+    // 950PR fails this operator with 561000 and used to escape as an AclError
+    // -- taking Hypotheses 3 and 4 with it. It is caught now: the finding is
+    // recorded and the suite carries on, which is the only way the compressor
+    // and indexer hypotheses ever get measured on hardware.
+    try {
+      contiguous_slot.Adopt(OpId::kMhcSinkhorn, "hypothesis/mhc_sinkhorn", contiguous.workspace,
+                            contiguous.executor);
+      contiguous_repeatable = contiguous_slot.planned();
+    } catch (const AclError& error) {
+      Refuted("a contiguous-output mhc_sinkhorn plan can be made repeatable with "
+              "aclSetAclOpExecutorRepeatable",
+              std::string("aclSetAclOpExecutorRepeatable REFUSED the executor: ") + FirstLine(error.what()) +
+                  ". On a 950PR this is status 561000: the wrapper builds a dynamic internal iteration graph "
+                  "that CANN will not mark reusable. CONSEQUENCE: a standalone aclnnMhcSinkhorn cannot hold a "
+                  "retained executor in StaticOpSlotTable at all, so it cannot be replayed inside a "
+                  "zero-allocation decode loop. It must be planned once per use (what the engine does today, "
+                  "counted as StepCounters::sinkhorn_replans), fused into a kernel that never materializes B_l "
+                  "at the aclnn layer (aclnnHcPreSinkhorn), or replaced by a custom AIV normalization block.");
+      // Adopt threw after taking ownership, so the slot holds nothing and the
+      // plan is already released; the numeric section re-plans below.
+      contiguous.executor = nullptr;
+    } catch (const Dsv4Error& error) {
+      Refuted("a contiguous-output mhc_sinkhorn plan can be made repeatable",
+              std::string("the adoption was refused: ") + FirstLine(error.what()));
+      contiguous.executor = nullptr;
+    }
+
+    if (contiguous_repeatable) {
+      Check(true, "aclSetAclOpExecutorRepeatable succeeded on the CONTIGUOUS plan on this backend");
+      contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
+      contiguous_slot.SetAddress(1, contiguous_out.handle, contiguous_out.address);
+      contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
+      Check(true, "the contiguous plan relaunched after aclSetTensorAddr on its output slot");
+      const Ledger contiguous_after = ReadLedger();
+      if (contiguous_after.available) {
+        Check(contiguous_after.self_copy_hazards == contiguous_before.self_copy_hazards,
+              "no same-address ViewCopy on the contiguous path -- the patch elides it instead of issuing it");
+        Check(contiguous_after.sinkhorn_elisions == contiguous_before.sinkhorn_elisions + 1,
+              "the patched wrapper elided exactly one trailing ViewCopy (kernelOut == output)");
+      }
+    } else {
+      // No retained executor, so the numeric section gets a fresh single-use
+      // plan. This is exactly the shape the engine's kPerUsePlan mode has.
+      PlanResult fresh = RunPlan([&](aclOpExecutor** executor) {
+        return PlanAclnnOp<MhcSinkhornPlanFn>(ops, OpId::kMhcSinkhorn, executor, input.handle, kSinkhornEps,
+                                              kSinkhornIters, contiguous_out.handle, nullptr, nullptr);
+      });
+      if (fresh.planned) {
+        single_use_executor = fresh.executor;
+        single_use_workspace = fresh.workspace;
+        Check(true, "a single-use (non-repeatable) contiguous plan is still available, so the operator is "
+                    "usable at one plan per invocation");
+      }
     }
   }
-  Note("BOTH output forms yield a repeatable executor, so a non-contiguous view is not required as a "
-       "workaround -- and it is the more expensive of the two, since it reinstates the ViewCopy the patch "
-       "removes. The runtime should bind a CONTIGUOUS Sinkhorn output.");
+  Note("The contiguous output is the only admissible form: H2.1 shows the non-contiguous view is refused on "
+       "hardware, and this section shows the contiguous one cannot be made repeatable. The runtime therefore "
+       "binds a CONTIGUOUS B_l and plans the operator per use.");
 
   // ---- H2.3  the attribute bounds the wrapper enforces --------------------
   std::printf("\n-- H2.3 numIters and eps bounds --\n");
@@ -954,14 +1042,28 @@ void TestSinkhornInvariantAndAliasing(const Backend& backend) {
   if (!backend.numerics_live) {
     Skip("the operator's own output cannot be read back in this build (symbolic device memory); the check "
          "above fixes the reference and the tolerance the on-device run applies");
-  } else if (!contiguous_slot.planned()) {
+  } else if (!contiguous_repeatable && single_use_executor == nullptr) {
     Skip("no planned Sinkhorn executor to measure -- see the refusal above");
   } else {
-    // Seed the operator's input, relaunch the retained plan, read the output
-    // back and hold it to the same invariant as the reference.
+    // Seed the operator's input, run it, read the output back and hold it to
+    // the same invariant as the reference. Which launch path depends on what
+    // the hardware allowed: the retained executor if it could be made
+    // repeatable, otherwise the single-use plan. The NUMERICS are the same
+    // question either way, so the refutation above must not cost us the
+    // measurement.
     backend.streams->MemcpySync(input.address, input.bytes, host.data(), host.size() * sizeof(float),
                                 MemcpyKind::kHostToDevice);
-    contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
+    if (contiguous_repeatable) {
+      contiguous_slot.Launch(ops, contiguous_workspace, contiguous_stream);
+    } else {
+      void* workspace = single_use_workspace > 0 ? contiguous_workspace : nullptr;
+      const int launch_status = ops.launch_fn(OpId::kMhcSinkhorn)(workspace, single_use_workspace,
+                                                                  single_use_executor, contiguous_stream);
+      // Consumed by its own launch, success or not: the plan is gone either way.
+      single_use_executor = nullptr;
+      Check(launch_status == 0, "the single-use contiguous plan launched (status " +
+                                    std::to_string(launch_status) + ")");
+    }
     backend.streams->SynchronizeStream(contiguous_stream);
     std::vector<float> readback(host.size(), 0.0f);
     backend.streams->MemcpySync(readback.data(), readback.size() * sizeof(float), contiguous_out.address,
@@ -973,8 +1075,14 @@ void TestSinkhornInvariantAndAliasing(const Backend& backend) {
                             Scientific(device_worst) + ")");
   }
 
-  if (contiguous_slot.planned()) {
+  if (contiguous_repeatable) {
     contiguous_slot.Reset();
+  }
+  if (single_use_executor != nullptr) {
+    // Planned but never launched (the numeric section was skipped), so this
+    // one really does have to be destroyed.
+    aclDestroyAclOpExecutor(single_use_executor);
+    single_use_executor = nullptr;
   }
   if (contiguous_stream != nullptr) {
     backend.streams->DestroyStream(contiguous_stream);
@@ -1092,13 +1200,37 @@ void TestCompressorRingCadence(const Backend& backend) {
       Check(cmp_kv_out.bytes == static_cast<size_t>(entry_bytes),
             "the emitted entry is " + std::to_string(entry_bytes) + " bytes (D = " +
                 std::to_string(kCompressedDim) + " x " + DataTypeName(cmp_kv_out.dtype) + ")");
+
+      // THE MEASURED RECORD LAYOUT, read back off the descriptors the kernel
+      // was actually handed rather than recomputed. This is the record the
+      // on-device run exists to produce: the engine sizes its paged cache from
+      // Dsv4CompressedKvEntry and derives every stride attribute from the
+      // bound view, so these three numbers are what a disagreement would show
+      // up in.
+      const int64_t out_row_stride = DeriveDimensionStrideElements(cmp_kv_out.handle, 0);
+      const size_t out_row_bytes = DeriveDimensionStrideBytes(cmp_kv_out.handle, 0);
+      const int64_t ring_stride = DeriveDimensionStrideElements(state_cache.handle, 0);
+      const size_t ring_bytes = DeriveDimensionStrideBytes(state_cache.handle, 0);
+      Note("MEASURED LAYOUT: cmpKvOut row stride " + std::to_string(out_row_stride) + " elements = " +
+           std::to_string(out_row_bytes) + " bytes (" + DataTypeName(cmp_kv_out.dtype) + " x " +
+           std::to_string(kCompressedDim) + "); stateCacheRef axis-0 stride " + std::to_string(ring_stride) +
+           " elements = " + std::to_string(ring_bytes) + " bytes. Both were DERIVED from the bound view with "
+           "aclGetViewStrides, which is the only way the runtime is allowed to learn a stride attribute.");
+      Check(out_row_bytes == static_cast<size_t>(entry_bytes),
+            "the derived byte stride of one emitted row agrees with D x sizeof(dtype) -- the destination view "
+            "really is contiguous rows, so a cache sized on that stride addresses it correctly");
       if (entry_bytes != kBriefCompressedEntryBytes) {
         Note("UNRESOLVED: the brief states a " + std::to_string(kBriefCompressedEntryBytes) +
-             "-byte compressed entry. No (width, dtype) pair in this geometry produces that: BF16 x 512 = " +
+             "-byte compressed entry, and the kernel's own cmpKvOut row is " + std::to_string(entry_bytes) +
+             " bytes. No (width, dtype) pair in this geometry produces " +
+             std::to_string(kBriefCompressedEntryBytes) + ": BF16 x 512 = " +
              std::to_string(kCompressedDim * 2) + ", FP8 x 512 = " + std::to_string(kCompressedDim) +
              ", FP8 x (512 + 64 rope) = " + std::to_string(kCompressedDim + kRopeHeadDim) +
-             ". The on-device run should settle which width the deployed kernel writes; this probe asserts "
-             "the derived one.");
+             ". The " + std::to_string(kBriefCompressedEntryBytes) +
+             "-byte figure is a PACKED CACHE ENTRY (448 nope FP8 + 7 UE8M0 scales + 21 pad + 64 rope BF16), "
+             "which is what aclnnKvCompressEpilog produces FROM this row -- not what the compressor emits. "
+             "Dsv4CompressedKvEntry in kv_cache_layout.hpp holds that packing to the byte; this probe "
+             "asserts the compressor's own row width, which is the number its destination view must match.");
       }
     }
     emitted_total += emitted;
@@ -1364,23 +1496,43 @@ int main(int argc, char** argv) {
 #endif
   std::printf("device backend: %s\n", backend.name);
 
+  // EACH HYPOTHESIS IS ISOLATED, and that is the point of this loop rather
+  // than one try block around all four.
+  //
+  // The 950PR run of this suite died inside Hypothesis 2 -- aclnnMhcSinkhorn's
+  // aclSetAclOpExecutorRepeatable failed with 561000 and the AclError escaped
+  // -- so Hypotheses 3 and 4 were never executed on the device at all. The
+  // compressor cadence and the indexer's index range are independent
+  // questions about different operators; one operator refusing a call it was
+  // asked to refuse must not cost us the answers to the others.
   int status = 0;
-  try {
-    TestMhcPreAndPostContract(backend, &ReadCounters);
-    TestSinkhornInvariantAndAliasing(backend);
-    TestCompressorRingCadence(backend);
-    TestIndexerTopKRange(backend);
-  } catch (const std::exception& error) {
-    std::printf("\n[FATAL] the harness itself failed: %s\n", error.what());
-    status = 1;
-  }
+  const auto guard = [&status](const char* name, const std::function<void()>& body) {
+    try {
+      body();
+    } catch (const std::exception& error) {
+      ++g_failures;
+      status = 1;
+      std::printf("\n  [FAIL] hypothesis %s aborted: %s\n", name, error.what());
+      std::printf("         the remaining hypotheses still run -- they question different operators.\n");
+    }
+  };
+  guard("1 (mhc_pre / mhc_post)", [&] { TestMhcPreAndPostContract(backend, &ReadCounters); });
+  guard("2 (mhc_sinkhorn)", [&] { TestSinkhornInvariantAndAliasing(backend); });
+  guard("3 (compressor cadence)", [&] { TestCompressorRingCadence(backend); });
+  guard("4 (lightning indexer)", [&] { TestIndexerTopKRange(backend); });
 
   std::printf("\n=============================================================\n");
-  std::printf("%d checks, %d failures, %d skipped\n", g_checks, g_failures, g_skips);
+  std::printf("%d checks, %d failures, %d skipped, %d refuted-and-encoded\n", g_checks, g_failures, g_skips,
+              g_refutations);
   if (g_failures == 0 && status == 0) {
     std::printf("every decidable hypothesis holds at the DSV4-Flash geometry.\n");
   } else {
     std::printf("a hypothesis was REFUTED -- the runtime design that assumed it needs revisiting.\n");
+  }
+  if (g_refutations > 0) {
+    std::printf("\n%d claim(s) were refuted by the 950PR run and are ALREADY encoded in the engine; they are\n",
+                g_refutations);
+    std::printf("recorded above as [refuted] and do not fail this suite. See the B_l note in config.hpp.\n");
   }
   std::printf("=============================================================\n");
   return (g_failures == 0 && status == 0) ? 0 : 1;

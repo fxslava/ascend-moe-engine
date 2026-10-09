@@ -560,6 +560,18 @@ size_t ReadResidentKb() {
   return kb;
 }
 
+// The layer topology this test dispatches, as three contiguous runs. Spelled
+// once so the expected per-path counters below are arithmetic on these names
+// rather than three magic numbers.
+constexpr int64_t kSwaLayers = 21;
+constexpr int64_t kCsaLayers = 20;
+constexpr int64_t kHcaLayers = kNumLayers - kSwaLayers - kCsaLayers;  // 2
+// Four decode steps, so position 3 closes one CSA window (ratio 4) and the
+// emission half of the cadence is really executed, not just the hold half.
+// HCA at ratio 128 cannot close inside a test this short, which is itself
+// worth asserting: its layers must hold on every step and write nothing.
+constexpr int64_t kDecodeSteps = 4;
+
 void TestFullPipeline() {
   Section("the 43-layer decode graph: build, plan, decode, residency (full 11,008 coverage)");
   MockResetAllocatorForTest();
@@ -583,7 +595,22 @@ void TestFullPipeline() {
   TestMoeBlockSeam(device, device, seam_config);
 
   const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
-  const size_t backbone_bytes = Dsv4Pipeline::BackboneDeviceBytes(MlaGeometry(), 128, 256);
+  // The ratios matter here: a CSA layer's compressor and indexer projections
+  // are part of the backbone the slot planner has to subtract.
+  std::vector<int64_t> planning_ratios(static_cast<size_t>(kNumLayers), kCompressRatioSwa);
+  for (int64_t layer = kSwaLayers; layer < kSwaLayers + kCsaLayers; ++layer) {
+    planning_ratios[static_cast<size_t>(layer)] = kCompressRatioCsa;
+  }
+  for (int64_t layer = kSwaLayers + kCsaLayers; layer < kNumLayers; ++layer) {
+    planning_ratios[static_cast<size_t>(layer)] = kCompressRatioHca;
+  }
+  const size_t backbone_bytes =
+      Dsv4Pipeline::BackboneDeviceBytes(MlaGeometry(), 128, 256, planning_ratios);
+  const size_t swa_only_bytes = Dsv4Pipeline::BackboneDeviceBytes(MlaGeometry(), 128, 256);
+  Check(backbone_bytes > swa_only_bytes,
+        "the compressed schedule enlarges the backbone the slot planner subtracts (" +
+            std::to_string((backbone_bytes - swa_only_bytes) >> 20) + " MiB of compressor and indexer "
+            "projections), so K is chosen against what will really be resident");
   const int64_t slots = ExclusiveExpertManager::PlanDeviceSlots(
       64ull << 30, backbone_bytes, layout.slot_num_bytes(), kTotalRoutedExperts, kDeviceReserveBytes,
       kTransferChunkBytes, kNumExpertsPerTok, -1);
@@ -605,6 +632,17 @@ void TestFullPipeline() {
   config.synthetic_weights = true;
   config.block_size = 128;
   config.max_context_len = 256;
+  // A schedule that exercises ALL THREE attention paths in one graph, laid out
+  // in contiguous runs so the per-path counters below are checkable by hand:
+  // 21 SWA, then 20 CSA (4:1), then 2 HCA (128:1).
+  config.compress_ratios.assign(static_cast<size_t>(kNumLayers), kCompressRatioSwa);
+  for (int64_t layer = kSwaLayers; layer < kSwaLayers + kCsaLayers; ++layer) {
+    config.compress_ratios[static_cast<size_t>(layer)] = kCompressRatioCsa;
+  }
+  for (int64_t layer = kSwaLayers + kCsaLayers; layer < kNumLayers; ++layer) {
+    config.compress_ratios[static_cast<size_t>(layer)] = kCompressRatioHca;
+  }
+  config.compress_ratios_provenance = GeometryProvenance::kCommandLine;
   // The router is the runner's shared dependency now: the pipeline and the
   // injected MoE block both consume it.
   MoeRouterEngine router(device, device);
@@ -634,36 +672,94 @@ void TestFullPipeline() {
   std::printf("%s", pipeline.DescribeStages().c_str());
 
   MockSetD2HSeed(&SeedDeviceToHost);
-  pipeline.DecodeStep(7, 0);   // prompt token 7 at position 0
-  const int32_t token = pipeline.ReadArgmaxToken();
-  Check(token >= 0 && token < kVocabSize, "a seeded readback returns a valid greedy token id");
-  pipeline.DecodeStep(token, 1);  // one decode step at position 1
-  const int32_t next = pipeline.ReadArgmaxToken();
-  Check(next >= 0 && next < kVocabSize, "the second readback is valid too");
+  int32_t token = 7;  // prompt token 7 at position 0
+  for (int64_t position = 0; position < kDecodeSteps; ++position) {
+    pipeline.DecodeStep(token, position);
+    token = pipeline.ReadArgmaxToken();
+    Check(token >= 0 && token < kVocabSize,
+          "the position-" + std::to_string(position) + " readback returns a valid greedy token id");
+  }
   MockSetD2HSeed(nullptr);
 
   experts.ValidateResidency();
-  Check(true, "the exclusive residency invariant holds after two 43-layer steps");
+  Check(true, "the exclusive residency invariant holds after every 43-layer step");
 
   const StepCounters& counters = pipeline.counters();
-  Check(counters.steps == 2 && counters.layers == 2 * kNumLayers,
-        "two decode steps covered all 43 layers each (86 layer executions)");
+  Check(counters.steps == static_cast<uint64_t>(kDecodeSteps) &&
+            counters.layers == static_cast<uint64_t>(kDecodeSteps * kNumLayers),
+        std::to_string(kDecodeSteps) + " decode steps covered all 43 layers each (" +
+            std::to_string(kDecodeSteps * kNumLayers) + " layer executions)");
   Check(counters.device_allocations_in_step == 0, "zero device allocations inside a step");
   Check(counters.descriptors_built_in_step == 0, "zero descriptors built inside a step");
-  Check(counters.host_synchronizations == 2 * (kNumLayers + 1),
+  Check(counters.host_synchronizations == static_cast<uint64_t>(kDecodeSteps * (kNumLayers + 1)),
         "exactly the forced one-per-MoE-layer readback plus one per step");
+
+  // ---- mHC: two hyper-connections per layer, every layer, every step ----
+  Check(counters.mhc_rounds == static_cast<uint64_t>(2 * kNumLayers * kDecodeSteps),
+        "every layer ran TWO mHC rounds per step (attention and MoE), " +
+            std::to_string(2 * kNumLayers * kDecodeSteps) + " in total");
+  // The forced cost of Sinkhorn's non-repeatability: exactly one host plan per
+  // round, no more. If this ever exceeds mhc_rounds something is re-planning
+  // twice; if it is zero, the normalization silently stopped running.
+  Check(counters.sinkhorn_replans == counters.mhc_rounds,
+        "one single-use Sinkhorn plan per mHC round (" + std::to_string(counters.sinkhorn_replans) +
+            "): the 561000 repeatability refusal costs exactly one host plan each, and nothing more");
+
+  // ---- layer topology: the dispatch really followed compress_ratios ----
+  Check(counters.swa_layers == static_cast<uint64_t>(kSwaLayers * kDecodeSteps) &&
+            counters.csa_layers == static_cast<uint64_t>(kCsaLayers * kDecodeSteps) &&
+            counters.hca_layers == static_cast<uint64_t>(kHcaLayers * kDecodeSteps),
+        "the attention cores dispatched per compress_ratios: " + std::to_string(counters.swa_layers) +
+            " SWA, " + std::to_string(counters.csa_layers) + " CSA, " + std::to_string(counters.hca_layers) +
+            " HCA layer executions");
+
+  // ---- the compressor cadence ------------------------------------------
+  // Positions 0..3. A CSA layer (ratio 4) closes its window exactly once, at
+  // position 3; an HCA layer (ratio 128) cannot close at all in four steps.
+  const int64_t compressed_layers = kCsaLayers + kHcaLayers;
+  const int64_t expected_emissions = kCsaLayers;  // one window per CSA layer
+  const int64_t expected_holds = compressed_layers * kDecodeSteps - expected_emissions;
+  Check(counters.compressor_emissions == static_cast<uint64_t>(expected_emissions),
+        "exactly one window closed per CSA layer over " + std::to_string(kDecodeSteps) +
+            " steps at ratio 4 (" + std::to_string(counters.compressor_emissions) +
+            " emissions), and no HCA window closed at ratio 128");
+  Check(counters.compressor_holds == static_cast<uint64_t>(expected_holds),
+        "every other compressed-layer step was a HOLD (" + std::to_string(counters.compressor_holds) +
+            "): a partial window launches the empty-descriptor plan and writes nothing");
+  // The invariant the cadence exists to guarantee: a hold step must never
+  // reach the paged cache, so entries written and windows closed are equal.
+  Check(counters.compressed_entries_written == counters.compressor_emissions,
+        "the paged compressed cache was written exactly once per closed window (" +
+            std::to_string(counters.compressed_entries_written) +
+            "), so no partial window ever touched it");
+  Check(counters.indexer_selections == static_cast<uint64_t>(kCsaLayers * kDecodeSteps),
+        "the lightning indexer ran on every CSA layer of every step (" +
+            std::to_string(counters.indexer_selections) + " top-512 selections), HCA layers skipping it");
+
+  const std::string decode_report = pipeline.DescribeStages();
+  Check(decode_report.find("pure TND") != std::string::npos &&
+            decode_report.find("kPerUsePlan") != std::string::npos,
+        "the stage report states the mHC layout and how B_l is produced");
+  Check(decode_report.find("sparse_attn_csa") != std::string::npos &&
+            decode_report.find("sparse_attn_hca") != std::string::npos &&
+            decode_report.find("cmp_hold_csa") != std::string::npos,
+        "both compressed cores and the hold-step cadence stage appear in the planned graph");
   Check(counters.expert_slot_misses > 0 && counters.expert_slot_hits > 0,
         "the seeded routing produced both hits and misses across the swap engine");
   const auto& diag = pipeline.diagnostics();
-  Check(diag.decoded_steps == 2 && diag.moe_cache.total_expert_requests == 2 * 43 * 6 &&
+  Check(diag.decoded_steps == static_cast<uint64_t>(kDecodeSteps) &&
+            diag.moe_cache.total_expert_requests ==
+                static_cast<uint64_t>(kDecodeSteps * kNumLayers * kNumExpertsPerTok) &&
             diag.moe_cache.hbm_slot_hits == counters.expert_slot_hits &&
             diag.moe_cache.host_promotions == counters.expert_slot_misses &&
             diag.moe_cache.evictions_to_host == diag.moe_cache.host_promotions,
-        "DecodeStep snapshots exact cache telemetry for two full layers-of-experts sweeps");
-  Check(diag.paged_attention.active_context_tokens == 2 && diag.paged_attention.block_size == 128 &&
-            diag.paged_attention.kv_cache_utilization == 2.0 / 256.0 &&
+        "DecodeStep snapshots exact cache telemetry for every layers-of-experts sweep");
+  Check(diag.paged_attention.active_context_tokens == static_cast<uint64_t>(kDecodeSteps) &&
+            diag.paged_attention.block_size == 128 &&
+            diag.paged_attention.kv_cache_utilization == static_cast<double>(kDecodeSteps) / 256.0 &&
             !diag.attention.attention_entropy && diag.attention.sparsity_ratio == 0.0,
-        "KV utilization reflects active tokens; dense attention does not invent entropy or sparsity");
+        "KV utilization reflects active tokens; neither core reports an entropy or sparsity it never "
+        "measured");
 
   const MockMemoryStats& stats = MockMemoryStatistics();
   Check(stats.rejected_operations == 0,

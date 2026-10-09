@@ -87,6 +87,10 @@ void PrintUsage() {
       "  --moe-path fused|decomposed   expert GEMM chain inside the standard aclnn block (default fused)\n"
       "  --moe-backend standard|lattice  IRoutedMoeBlock selection (default standard; the 2-bit\n"
       "                            Leech-lattice backend is a skeleton and refuses at plan time)\n"
+      "  --compress-ratios <list>  comma-separated per-layer token-compression ratio, one per layer:\n"
+      "                            0 or 1 = SWA, 4 = CSA (compressor 4:1 + indexer top-512 + shared-KV\n"
+      "                            sparse attention), 128 = HCA (compressor 128:1 + direct shared-KV).\n"
+      "                            Overrides the checkpoint; omitted leaves every layer on SWA\n"
       "  --gating-norm-type <n>    aclnnMoeGatingTopKV2 normType (default -1: scores arrive pre-normalized\n"
       "                            from the decomposed aclnnSoftplus -> aclnnSqrt sqrtsoftplus chain)\n"
       "  --dense-group-size <n>    aclnnQuantMatmulV5 groupSize (default 0, UNVERIFIED)\n"
@@ -189,6 +193,22 @@ Arguments ParseArguments(int argc, char** argv) {
       DSV4_REQUIRE(value == "standard" || value == "lattice",
                    "--moe-backend expects 'standard' or 'lattice', got '" << value << "'");
       config.moe_backend = value == "lattice" ? MoeBackend::kLattice24 : MoeBackend::kStandardAclnn;
+    } else if (flag == "--compress-ratios") {
+      // A comma-separated ratio per layer, selecting that layer's attention
+      // path (<=1 SWA, 4 CSA, 128 HCA). Overrides the checkpoint, the same
+      // all-or-nothing way --kv-lora-rank overrides its geometry.
+      config.compress_ratios.clear();
+      const std::string value = next("--compress-ratios");
+      size_t start = 0;
+      while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        const std::string field = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        DSV4_REQUIRE(!field.empty(), "--compress-ratios has an empty entry");
+        config.compress_ratios.push_back(ParseInt(field.c_str(), "--compress-ratios"));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+      config.compress_ratios_provenance = GeometryProvenance::kCommandLine;
     } else if (flag == "--gating-norm-type") {
       config.gating_norm_type = ParseInt(next("--gating-norm-type"), "--gating-norm-type");
     } else if (flag == "--dense-group-size") {
@@ -301,6 +321,14 @@ int Run(int argc, char** argv) {
   if (config.mla.provenance != GeometryProvenance::kCommandLine) {
     config.mla = model.mla;
   }
+  // The per-layer compression schedule, same precedence. An empty schedule
+  // from both sources leaves every layer on the SWA path; nothing guesses an
+  // interleave (see RuntimeConfig::compress_ratios).
+  if (config.compress_ratios_provenance != GeometryProvenance::kCommandLine &&
+      !model.compress_ratios.empty()) {
+    config.compress_ratios = model.compress_ratios;
+    config.compress_ratios_provenance = GeometryProvenance::kCheckpointConfig;
+  }
 
   // The slot planner runs from the PARSED geometry, not the compiled
   // constants (they agree: AssertMatchesBinaryContract just proved it).
@@ -349,7 +377,8 @@ int Run(int argc, char** argv) {
   size_t total_hbm = 0;
   DSV4_REQUIRE(device.QueryDeviceMemory(&free_hbm, &total_hbm), "aclrtGetMemInfo(ACL_HBM_MEM) failed");
   const size_t backbone_bytes =
-      Dsv4Pipeline::BackboneDeviceBytes(config.mla, config.block_size, config.max_context_len);
+      Dsv4Pipeline::BackboneDeviceBytes(config.mla, config.block_size, config.max_context_len,
+                                        config.compress_ratios);
   const int64_t slots = ExclusiveExpertManager::PlanDeviceSlots(
       free_hbm, backbone_bytes, layout.slot_num_bytes(), config.routed_coverage, kDeviceReserveBytes,
       kTransferChunkBytes, model.num_experts_per_tok, config.vram_slots);

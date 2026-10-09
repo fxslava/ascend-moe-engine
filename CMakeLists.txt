@@ -110,6 +110,7 @@ set(MOE_ENGINE_SOURCES
   src/core/device_ops.cpp
   src/memory/expert_layout.cpp
   src/core/model_config.cpp
+  src/core/kv_cache_layout.cpp
   src/core/weight_source.cpp
   src/diagnostics/inference_stats.cpp
   src/memory/exclusive_staging.cpp

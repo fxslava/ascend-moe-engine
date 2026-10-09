@@ -33,6 +33,7 @@
 #include "moe/core/config.hpp"
 #include "moe/core/device_allocator.hpp"
 #include "moe/core/device_types.hpp"
+#include "moe/core/kv_cache_layout.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/weight_source.hpp"
 #include "moe/memory/expert_layout.hpp"
@@ -64,9 +65,43 @@ struct ExpertSlotAddresses {
   void* down_scale[kNumExpertsPerTok] = {};
 };
 
+// One mHC round's tensor set: everything `aclnnMhcPre` ->
+// `aclnnMhcSinkhorn` -> `aclnnMhcPost` needs for ONE sub-block. There are two
+// of these per layer (attention and MoE), because each sub-block gets its own
+// hyper-connection.
+//
+// PURE TND, AS THE 950PR RUN SETTLED IT (see the kMhcStreamRank note in
+// config.hpp). Rank 3 for the stream tensors, rank 2 for the per-token ones,
+// and no mixing anywhere -- which also means `h_in` at [1, 4096] IS the
+// activation RMSNorm / attention / MoE are planned for, so it is bound to them
+// directly, with no squeeze, no unsqueeze and no second view.
+struct MhcRoundTensors {
+  aclTensor* h_in = nullptr;        // [1, 4096] bf16  (mhc_pre out, fed on as is)
+  aclTensor* h_post = nullptr;      // [1, 4]    fp32
+  aclTensor* h_res = nullptr;       // [1, 4, 4] fp32  (mhc_pre out, raw)
+  aclTensor* h_res_sink = nullptr;  // [1, 4, 4] fp32  (B_l, CONTIGUOUS)
+  aclTensor* h_out = nullptr;       // [1, 4096] bf16  (a descriptor over the
+                                    //  sub-block's own output buffer)
+  ArenaHandle h_h_in = kInvalidArenaHandle;  // for the window-ring copies
+};
+
 // Every activation descriptor the graph uses. Created once, in
 // CreateDescriptors; the stages only ever repoint addresses.
 struct ArenaTensors {
+  // ---- mHC residual stream ---------------------------------------------
+  //
+  // Two [1, 4, 4096] BF16 buffers, ping-ponged: every `aclnnMhcPost` reads one
+  // and writes the other, so no call ever aliases its own input. 43 layers x 2
+  // sub-blocks = 86 writes, so the finished stream lands back in slot 0 -- but
+  // the pipeline tracks the parity rather than relying on that.
+  aclTensor* residual_stream[2] = {nullptr, nullptr};
+  // The four streams of each buffer as [1, 4096] views, for the embedding
+  // broadcast at the start of a step and the summation at the head.
+  aclTensor* stream_slice[2][kNhcStreams] = {};
+  ArenaHandle h_residual_stream[2] = {kInvalidArenaHandle, kInvalidArenaHandle};
+  MhcRoundTensors mhc_attn;
+  MhcRoundTensors mhc_moe;
+
   // activations
   aclTensor* hidden = nullptr;            // [1, 4096] bf16
   aclTensor* normed = nullptr;           // [1, 4096] bf16
@@ -146,6 +181,69 @@ struct ArenaTensors {
   aclTensor* rope_cos = nullptr;
   aclTensor* rope_sin = nullptr;
 
+  // ---- token compression (CSA / HCA) -----------------------------------
+  //
+  // Null throughout when no layer selects a compressed path: the stages are
+  // then not planned either, so nothing reserves the ~GB of projection
+  // weights a compressed layer needs. See StaticArenaManager::uses_compression.
+  //
+  // The window ring is what makes the cadence work. `aclnnCompressor` pins
+  // cmpKvOut's row count at T / cmpRatio, so a single-token step (T = 1) can
+  // never close a window of 4 or 128 -- it plans a zero-byte, completely empty
+  // executor (hypotheses H3). The caller therefore HOLDS the window: each step
+  // copies that layer's h_in into slot (step % ratio) of its own window slice,
+  // and only the closing step launches the compressor over the full
+  // [ratio, 4096] view.
+  aclTensor* cmp_window_csa = nullptr;     // [4, 4096]   bf16, per-layer view
+  aclTensor* cmp_window_hca = nullptr;     // [128, 4096] bf16, per-layer view
+  aclTensor* cmp_rope_sin_csa = nullptr;   // [4, 64]     bf16, view into the table
+  aclTensor* cmp_rope_cos_csa = nullptr;
+  aclTensor* cmp_rope_sin_hca = nullptr;   // [128, 64]   bf16
+  aclTensor* cmp_rope_cos_hca = nullptr;
+  aclTensor* cmp_state_cache = nullptr;    // [4, 8, 512] fp32 REF ring, per layer
+  aclTensor* cmp_state_block_table = nullptr;  // [1, 4]   int32
+  aclTensor* cmp_cu_seqlens = nullptr;     // [1] int32
+  aclTensor* cmp_seqused = nullptr;        // [1] int32
+  aclTensor* cmp_start_pos = nullptr;      // [1] int32
+  aclTensor* cmp_kv_out = nullptr;         // [1, 512] bf16, the emitted row
+  // The deliberately EMPTY hold-step set: [0, 4096] x, [0, 64] rope tables and
+  // a [0, 512] destination, so IsEmpty() holds and the wrapper's empty-tensor
+  // early return is exercised rather than only documented. All four are zero
+  // ROWS, not a partial window: see the note in CreateCompressionDescriptors.
+  aclTensor* cmp_window_empty = nullptr;   // [0, 4096] bf16
+  aclTensor* cmp_rope_cos_empty = nullptr; // [0, 64] bf16
+  aclTensor* cmp_rope_sin_empty = nullptr; // [0, 64] bf16
+  aclTensor* cmp_kv_out_empty = nullptr;   // [0, 512] bf16
+  // The paged hybrid cache, one Dsv4CompressedKvEntry per compressed slot.
+  // Two views over the same bytes because the epilog and the attention core
+  // disagree on rank/dtype spelling, never two allocations.
+  aclTensor* cmp_kv_cache = nullptr;       // [blocks, block_size, 604] fp8, per layer
+  aclTensor* cmp_slot_mapping = nullptr;   // [1] int32
+  aclTensor* cmp_block_table = nullptr;    // [1, blocks] int32
+  aclTensor* cmp_seq_k = nullptr;          // [1] int32, compressed context length
+  // 0..kIndexTopK-1, written once at Build. The HCA path has no indexer, but
+  // the attention core still requires an INT32 index vector for a bound
+  // cmpKv, so "attend everything in the compressed stream" is spelled as the
+  // identity selection.
+  aclTensor* cmp_sparse_indices_dense = nullptr;  // [1, 1, 1, 512] int32
+  aclTensor* sparse_q = nullptr;           // [1, 1, 64, 512] bf16 view of act.q_b
+  aclTensor* sparse_attn_out = nullptr;    // [1, 1, 64, 512] bf16 view of act.attn_out
+  aclTensor* sparse_lse_empty = nullptr;   // [0] fp32 placeholder
+
+  // ---- quantized lightning indexer (CSA only) --------------------------
+  aclTensor* index_q_bf16 = nullptr;       // [1, 8192] bf16 (64 heads x 128)
+  aclTensor* index_q_fp8 = nullptr;        // [1, 8192] fp8 e4m3
+  aclTensor* index_q_mx_scale = nullptr;   // [1, 256]  e8m0 (discarded, see report)
+  aclTensor* index_q = nullptr;            // [1, 1, 64, 128] fp8 view of index_q_fp8
+  aclTensor* index_k_bf16 = nullptr;       // [1, 128] bf16
+  aclTensor* index_k_cache_u8 = nullptr;   // [blocks, block_size, 128] uint8, per layer
+  aclTensor* index_k_cache = nullptr;      // [blocks, block_size, 1, 128] fp8, same bytes
+  aclTensor* index_k_dequant = nullptr;    // [blocks, block_size, 1] fp32, per layer
+  aclTensor* index_q_dequant = nullptr;    // [1, 1, 64] fp32
+  aclTensor* index_head_weights = nullptr; // [1, 1, 64] bf16, per-layer weight view
+  aclTensor* index_sparse_indices = nullptr;   // [1, 1, 1, 512] int32
+  aclTensor* index_sparse_values_empty = nullptr;  // [0] fp32 placeholder
+
   // per-layer weights, repointed by aclSetTensorAddr
   aclTensor* w_input_norm = nullptr;
   aclTensor* w_q_a = nullptr;
@@ -167,6 +265,26 @@ struct ArenaTensors {
   aclTensor* w_shared_down_scale = nullptr;
   aclTensor* w_final_norm = nullptr;
   aclTensor* w_lm_head = nullptr;
+
+  // mHC weights. One descriptor set, repointed per layer AND per sub-block
+  // round -- each round is its own stage with its own executor, so the shared
+  // descriptors are rebound on both, exactly as w_post_norm already is for
+  // post_norm_quant and post_norm.
+  aclTensor* w_mhc_phi = nullptr;    // [24, 16384] fp32
+  aclTensor* w_mhc_alpha = nullptr;  // [3] fp32
+  aclTensor* w_mhc_bias = nullptr;   // [24] fp32
+  aclTensor* w_mhc_gamma = nullptr;  // [4, 4096] fp32
+
+  // Compressor and indexer weights, null on a SWA-only checkpoint. The
+  // positional bias has one row per window position, so CSA and HCA need
+  // different SHAPES of it, not just different addresses.
+  aclTensor* w_cmp_wkv = nullptr;          // [4096, 512] bf16
+  aclTensor* w_cmp_wgate = nullptr;        // [4096, 1] bf16
+  aclTensor* w_cmp_ape_csa = nullptr;      // [4, 512] fp32
+  aclTensor* w_cmp_ape_hca = nullptr;      // [128, 512] fp32
+  aclTensor* w_cmp_norm_weight = nullptr;  // [512] fp32
+  aclTensor* w_index_q = nullptr;          // [1024, 8192] bf16 ([K, N] for Matmul)
+  aclTensor* w_index_k = nullptr;          // [512, 128] bf16
 
   // the six active experts, repointed per layer
   std::vector<aclTensor*> expert_gate_up;
@@ -211,6 +329,30 @@ struct BackboneWeights {
     ArenaHandle shared_gate_up_scale = kInvalidArenaHandle;
     ArenaHandle shared_down_weight = kInvalidArenaHandle;
     ArenaHandle shared_down_scale = kInvalidArenaHandle;
+
+    // mHC: one hyper-connection per sub-block, so two independent weight sets
+    // per layer. phi is [24, 16384] FP32 -- 1.5 MiB each, 129 MiB over the
+    // model -- which is why it is reserved rather than rebuilt.
+    struct MhcWeights {
+      ArenaHandle phi = kInvalidArenaHandle;    // [24, 16384] fp32
+      ArenaHandle alpha = kInvalidArenaHandle;  // [3] fp32
+      ArenaHandle bias = kInvalidArenaHandle;   // [24] fp32
+      ArenaHandle gamma = kInvalidArenaHandle;  // [4, 4096] fp32
+    };
+    MhcWeights mhc_attn;
+    MhcWeights mhc_moe;
+
+    // Compressor, reserved only on a build whose checkpoint marks some layer
+    // CSA or HCA.
+    ArenaHandle cmp_wkv = kInvalidArenaHandle;          // [4096, 512] bf16
+    ArenaHandle cmp_wgate = kInvalidArenaHandle;        // [4096, 1] bf16
+    ArenaHandle cmp_ape = kInvalidArenaHandle;          // [max_ratio, 512] fp32
+    ArenaHandle cmp_norm_weight = kInvalidArenaHandle;  // [512] fp32
+
+    // Lightning indexer, reserved only when some layer is CSA.
+    ArenaHandle index_q_weight = kInvalidArenaHandle;     // [1024, 8192] bf16
+    ArenaHandle index_k_weight = kInvalidArenaHandle;     // [512, 128] bf16
+    ArenaHandle index_head_weight = kInvalidArenaHandle;  // [64] bf16
   };
   std::vector<Layer> layers;
   ArenaHandle embed_tokens = kInvalidArenaHandle;
@@ -222,7 +364,28 @@ struct BackboneWeights {
   ArenaHandle kv_rope_cache = kInvalidArenaHandle;
   ArenaHandle block_table = kInvalidArenaHandle;
   ArenaHandle slot_mapping = kInvalidArenaHandle;
+
+  // Compression-side reservations, one slice per layer carved out of each.
+  ArenaHandle cmp_window = kInvalidArenaHandle;
+  ArenaHandle cmp_state_cache = kInvalidArenaHandle;
+  ArenaHandle cmp_kv_cache = kInvalidArenaHandle;
+  ArenaHandle cmp_block_table = kInvalidArenaHandle;
+  ArenaHandle cmp_slot_mapping = kInvalidArenaHandle;
+  ArenaHandle cmp_window_meta = kInvalidArenaHandle;
+  ArenaHandle cmp_seq_k = kInvalidArenaHandle;
+  ArenaHandle cmp_state_block_table = kInvalidArenaHandle;
+  ArenaHandle cmp_sparse_indices_dense = kInvalidArenaHandle;
+  ArenaHandle index_k_cache = kInvalidArenaHandle;
+  ArenaHandle index_k_dequant = kInvalidArenaHandle;
+  ArenaHandle index_q_dequant = kInvalidArenaHandle;
+  ArenaHandle index_sparse_indices = kInvalidArenaHandle;
+
   bool rope_tables_populated = false;
+  // False when the checkpoint supplied no mHC projection weights. phi / alpha
+  // / bias then read as zero and `aclnnMhcPre` folds the four streams into a
+  // zero layer input -- a wrong answer with no symptom, so every report says
+  // so, exactly as it does for the rope tables.
+  bool mhc_weights_populated = false;
 };
 
 class StaticArenaManager {
@@ -237,7 +400,14 @@ class StaticArenaManager {
 
   // The memory the backbone needs, so the slot planner can subtract it from
   // free HBM before choosing K. Pure arithmetic; no allocation.
-  static size_t BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size, int64_t max_context_len);
+  //
+  // `compress_ratios` is the checkpoint's per-layer schedule: an empty list
+  // means no layer compresses, so the compressor and indexer projections are
+  // neither reserved nor counted. Passing it matters -- a CSA layer's indexer
+  // query projection alone is 16 MiB, and under-reporting the backbone would
+  // let the slot planner choose a K that does not fit.
+  static size_t BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size, int64_t max_context_len,
+                                    const std::vector<int64_t>& compress_ratios = {});
 
   // ---- phase 1: RESERVE -------------------------------------------------
   void ReserveActivations();
@@ -262,7 +432,37 @@ class StaticArenaManager {
   const BackboneWeights& backbone() const { return *backbone_; }
   int64_t num_blocks() const { return num_blocks_; }
 
+  // Which compressed paths this checkpoint actually asks for. The pipeline
+  // plans a path's stages iff the answer here is yes, so a SWA-only
+  // checkpoint pays nothing for CSA/HCA -- not reservations, not descriptors,
+  // not executors.
+  bool uses_csa() const { return uses_csa_; }
+  bool uses_hca() const { return uses_hca_; }
+  bool uses_compression() const { return uses_csa_ || uses_hca_; }
+  // The widest window any layer holds; 1 when nothing compresses.
+  int64_t max_compress_ratio() const { return max_compress_ratio_; }
+  // How many compressed entries one layer's paged cache can hold.
+  int64_t compressed_slots() const { return num_blocks_ * config_.block_size; }
+
+  // Byte stride between consecutive layers' slices of a shared reservation.
+  // Host-side pointer arithmetic only; the strides the OPERATORS receive all
+  // come from DeriveDimensionStrideElements on the bound descriptor.
+  size_t CompressedWindowLayerStrideBytes() const;
+  size_t CompressedStateLayerStrideBytes() const;
+  size_t CompressedKvLayerStrideBytes() const;
+  size_t IndexerKeyLayerStrideBytes() const;
+  size_t IndexerKeyScaleLayerStrideBytes() const;
+
  private:
+  void ReserveMhc();
+  void ReserveCompression();
+  void CreateMhcDescriptors();
+  void CreateCompressionDescriptors();
+  // Writes the constants the compressed paths need once and only once: the
+  // identity block tables and the identity top-k selection.
+  void SeedStaticTables();
+  void* ReservationAddress(const char* name) const;
+
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
   RuntimeConfig config_;
@@ -271,6 +471,9 @@ class StaticArenaManager {
   std::unique_ptr<BackboneWeights> backbone_;
   int64_t num_blocks_ = 0;
   int64_t heads_ = kNumAttentionHeads;
+  bool uses_csa_ = false;
+  bool uses_hca_ = false;
+  int64_t max_compress_ratio_ = 1;
 };
 
 }  // namespace ascend_moe

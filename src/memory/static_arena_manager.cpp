@@ -198,12 +198,60 @@ StaticArenaManager::StaticArenaManager(IDeviceAllocator& allocator, IStreamEngin
   tensors_ = std::make_unique<ArenaTensors>();
   backbone_ = std::make_unique<BackboneWeights>();
   backbone_->layers.resize(static_cast<size_t>(kNumLayers));
+
+  // The compression schedule decides what gets reserved at all, so it is
+  // resolved before any reservation rather than per layer.
+  uses_csa_ = config_.any_layer_uses(AttentionPath::kCompressedSparse);
+  uses_hca_ = config_.any_layer_uses(AttentionPath::kHyperCompressed);
+  max_compress_ratio_ = kCompressRatioSwa;
+  for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+    max_compress_ratio_ = std::max(max_compress_ratio_, config_.compress_ratio(layer));
+  }
+  // The compressed hybrid entry is only coherent if its two halves really are
+  // this checkpoint's two halves. Checked here, before a single byte is
+  // reserved against it, because kCompressedKvEntryBytes sizes the cache and
+  // the attention core addresses it with that stride.
+  if (uses_compression()) {
+    DSV4_REQUIRE(kCompressedKvNopeChannels + kCompressedKvRopeChannels == config_.mla.kv_lora_rank,
+                 "the " << kCompressedKvEntryBytes << "-byte compressed KV entry packs "
+                        << kCompressedKvNopeChannels << " nope + " << kCompressedKvRopeChannels
+                        << " rope channels, which is " << (kCompressedKvNopeChannels + kCompressedKvRopeChannels)
+                        << ", but this checkpoint's kv_lora_rank is " << config_.mla.kv_lora_rank
+                        << ". Dsv4CompressedKvEntry in kv_cache_layout.hpp has to be re-derived for that "
+                           "geometry before any compressed layer can run.");
+    DSV4_REQUIRE(kCompressedKvRopeChannels == config_.mla.qk_rope_head_dim,
+                 "the compressed KV entry keeps " << kCompressedKvRopeChannels
+                                                  << " rope channels at BF16 but this checkpoint's "
+                                                     "qk_rope_head_dim is "
+                                                  << config_.mla.qk_rope_head_dim);
+  }
+}
+
+size_t StaticArenaManager::CompressedWindowLayerStrideBytes() const {
+  return Bf16Bytes(max_compress_ratio_ * kHiddenSize);
+}
+
+size_t StaticArenaManager::CompressedStateLayerStrideBytes() const {
+  return Fp32Bytes(kCompressorStateBlocks * kCompressorStateBlockSize * config_.mla.kv_lora_rank);
+}
+
+size_t StaticArenaManager::CompressedKvLayerStrideBytes() const {
+  return static_cast<size_t>(compressed_slots()) * static_cast<size_t>(kCompressedKvEntryBytes);
+}
+
+size_t StaticArenaManager::IndexerKeyLayerStrideBytes() const {
+  return static_cast<size_t>(compressed_slots()) * static_cast<size_t>(kIndexHeadDim);
+}
+
+size_t StaticArenaManager::IndexerKeyScaleLayerStrideBytes() const {
+  return Fp32Bytes(compressed_slots());
 }
 
 StaticArenaManager::~StaticArenaManager() = default;
 
 size_t StaticArenaManager::BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size,
-                                               int64_t max_context_len) {
+                                               int64_t max_context_len,
+                                               const std::vector<int64_t>& compress_ratios) {
   const int64_t kv_row = mla.kv_row_elements();
   const int64_t q_b_width = kNumAttentionHeads * kv_row;          // folded q_b output
   const int64_t o_input = kNumAttentionHeads * mla.kv_lora_rank;  // folded o_proj input
@@ -228,6 +276,33 @@ size_t StaticArenaManager::BackboneDeviceBytes(const MlaGeometry& mla, int64_t b
   per_layer += Fp8Bytes(2 * shared_inter * DenseScaleCols(kHiddenSize)); // shared gate/up scale
   per_layer += Fp8Bytes(kHiddenSize * shared_inter);                     // shared down
   per_layer += Fp8Bytes(kHiddenSize * DenseScaleCols(shared_inter));     // shared down scale
+  // mHC, unconditional: two hyper-connections per layer (attention, MoE).
+  per_layer += 2 * (Fp32Bytes(kMhcMixRows * kMhcMixCols) + Fp32Bytes(kMhcAlphaElements) +
+                    Fp32Bytes(kMhcMixRows) + Fp32Bytes(kNhcStreams * kHiddenSize));
+
+  // The compression schedule, resolved the same way the manager resolves it.
+  bool uses_csa = false;
+  bool uses_hca = false;
+  int64_t max_ratio = kCompressRatioSwa;
+  for (const int64_t ratio : compress_ratios) {
+    switch (AttentionPathForRatio(ratio)) {
+      case AttentionPath::kCompressedSparse: uses_csa = true; break;
+      case AttentionPath::kHyperCompressed: uses_hca = true; break;
+      default: break;
+    }
+    max_ratio = std::max(max_ratio, ratio);
+  }
+  if (uses_csa || uses_hca) {
+    per_layer += Bf16Bytes(kHiddenSize * mla.kv_lora_rank);  // compressor wkv
+    per_layer += Bf16Bytes(kHiddenSize);                     // compressor wgate
+    per_layer += Fp32Bytes(max_ratio * mla.kv_lora_rank);    // positional bias
+    per_layer += Fp32Bytes(mla.kv_lora_rank);                // compressor norm gain
+  }
+  if (uses_csa) {
+    per_layer += Bf16Bytes(kQLoraRank * kIndexNumHeads * kIndexHeadDim);  // indexer q
+    per_layer += Bf16Bytes(mla.kv_lora_rank * kIndexHeadDim);             // indexer k
+    per_layer += Bf16Bytes(kIndexNumHeads);                               // indexer head gains
+  }
 
   const int64_t blocks = DivideUp(max_context_len, block_size);
   size_t total = per_layer * static_cast<size_t>(kNumLayers);
@@ -237,6 +312,20 @@ size_t StaticArenaManager::BackboneDeviceBytes(const MlaGeometry& mla, int64_t b
   // Paged MLA cache: one latent row and one rope row per token slot, per layer.
   total += Bf16Bytes(blocks * block_size * mla.kv_lora_rank) * kNumLayers;
   total += Bf16Bytes(blocks * block_size * mla.qk_rope_head_dim) * kNumLayers;
+  if (uses_csa || uses_hca) {
+    // One Dsv4CompressedKvEntry per slot per layer, plus the window ring and
+    // the compressor's recurrent pooling state.
+    total += static_cast<size_t>(blocks * block_size) *
+             static_cast<size_t>(kCompressedKvEntryBytes) * static_cast<size_t>(kNumLayers);
+    total += Bf16Bytes(max_ratio * kHiddenSize) * static_cast<size_t>(kNumLayers);
+    total += Fp32Bytes(kCompressorStateBlocks * kCompressorStateBlockSize * mla.kv_lora_rank) *
+             static_cast<size_t>(kNumLayers);
+  }
+  if (uses_csa) {
+    total += static_cast<size_t>(blocks * block_size) * static_cast<size_t>(kIndexHeadDim) *
+             static_cast<size_t>(kNumLayers);                                  // indexer key cache
+    total += Fp32Bytes(blocks * block_size) * static_cast<size_t>(kNumLayers);  // its dequant scales
+  }
   return total;
 }
 
@@ -298,6 +387,74 @@ void StaticArenaManager::ReserveActivations() {
   backbone_->block_table = arena_.Reserve("kv.block_table", Int32Bytes(kTokensPerStep * num_blocks_));
   t.h_slot_mapping = arena_.Reserve("kv.slot_mapping", Int32Bytes(kTokensPerStep));
   backbone_->slot_mapping = t.h_slot_mapping;
+
+  ReserveMhc();
+  ReserveCompression();
+}
+
+// The mHC residual stream and the two per-sub-block rounds. Unconditional:
+// DSV4-Flash carries four streams in every layer, so this is the activation
+// path, not an option.
+void StaticArenaManager::ReserveMhc() {
+  ArenaTensors& t = *tensors_;
+  const int64_t stream_elements = kTokensPerStep * kNhcStreams * kHiddenSize;
+  t.h_residual_stream[0] = arena_.Reserve("mhc.stream_a", Bf16Bytes(stream_elements));
+  t.h_residual_stream[1] = arena_.Reserve("mhc.stream_b", Bf16Bytes(stream_elements));
+
+  t.mhc_attn.h_h_in = arena_.Reserve("mhc.attn_h_in", Bf16Bytes(kTokensPerStep * kHiddenSize));
+  arena_.Reserve("mhc.attn_h_post", Fp32Bytes(kTokensPerStep * kNhcStreams));
+  arena_.Reserve("mhc.attn_h_res", Fp32Bytes(kTokensPerStep * kNhcStreams * kNhcStreams));
+  arena_.Reserve("mhc.attn_h_res_sink", Fp32Bytes(kTokensPerStep * kNhcStreams * kNhcStreams));
+
+  t.mhc_moe.h_h_in = arena_.Reserve("mhc.moe_h_in", Bf16Bytes(kTokensPerStep * kHiddenSize));
+  arena_.Reserve("mhc.moe_h_post", Fp32Bytes(kTokensPerStep * kNhcStreams));
+  arena_.Reserve("mhc.moe_h_res", Fp32Bytes(kTokensPerStep * kNhcStreams * kNhcStreams));
+  arena_.Reserve("mhc.moe_h_res_sink", Fp32Bytes(kTokensPerStep * kNhcStreams * kNhcStreams));
+}
+
+// Nothing here is reserved on a SWA-only checkpoint: `uses_compression()` is
+// false, the pipeline plans no compressed stages, and the ~GB of compressor
+// and indexer projections never exists.
+void StaticArenaManager::ReserveCompression() {
+  if (!uses_compression()) {
+    return;
+  }
+  const int64_t compressed_width = config_.mla.kv_lora_rank;
+  BackboneWeights& b = *backbone_;
+
+  b.cmp_window = arena_.Reserve("cmp.window", CompressedWindowLayerStrideBytes() *
+                                                  static_cast<size_t>(kNumLayers));
+  b.cmp_state_cache = arena_.Reserve("cmp.state_cache", CompressedStateLayerStrideBytes() *
+                                                            static_cast<size_t>(kNumLayers));
+  // The hybrid cache is sized from Dsv4CompressedKvEntry, never from a
+  // (width, dtype) product computed here.
+  b.cmp_kv_cache =
+      arena_.Reserve("cmp.kv_cache", CompressedKvLayerStrideBytes() * static_cast<size_t>(kNumLayers));
+  b.cmp_state_block_table = arena_.Reserve("cmp.state_block_table", Int32Bytes(kCompressorStateBlocks));
+  b.cmp_block_table = arena_.Reserve("cmp.block_table", Int32Bytes(kTokensPerStep * num_blocks_));
+  b.cmp_slot_mapping = arena_.Reserve("cmp.slot_mapping", Int32Bytes(kTokensPerStep));
+  b.cmp_seq_k = arena_.Reserve("cmp.seq_k", Int32Bytes(kTokensPerStep));
+  // cuSeqlens / seqused / startPos live in ONE three-entry reservation with a
+  // [1] view each, so the emitting step writes all three in a single 12-byte
+  // H2D instead of three.
+  b.cmp_window_meta = arena_.Reserve("cmp.window_meta", Int32Bytes(3));
+  arena_.Reserve("cmp.kv_out", Bf16Bytes(kTokensPerStep * compressed_width));
+  b.cmp_sparse_indices_dense = arena_.Reserve("cmp.sparse_indices_dense", Int32Bytes(kIndexTopK));
+
+  if (!uses_csa_) {
+    return;
+  }
+  const int64_t indexer_width = kIndexNumHeads * kIndexHeadDim;
+  arena_.Reserve("idx.q_bf16", Bf16Bytes(kTokensPerStep * indexer_width));
+  arena_.Reserve("idx.q_fp8", Fp8Bytes(kTokensPerStep * indexer_width));
+  arena_.Reserve("idx.q_mx_scale", Fp8Bytes(kTokensPerStep * MxScaleCols(indexer_width)));
+  arena_.Reserve("idx.k_bf16", Bf16Bytes(kTokensPerStep * kIndexHeadDim));
+  b.index_k_cache =
+      arena_.Reserve("idx.k_cache", IndexerKeyLayerStrideBytes() * static_cast<size_t>(kNumLayers));
+  b.index_k_dequant =
+      arena_.Reserve("idx.k_dequant", IndexerKeyScaleLayerStrideBytes() * static_cast<size_t>(kNumLayers));
+  b.index_q_dequant = arena_.Reserve("idx.q_dequant", Fp32Bytes(kTokensPerStep * kIndexNumHeads));
+  b.index_sparse_indices = arena_.Reserve("idx.sparse_indices", Int32Bytes(kIndexTopK));
 }
 
 void StaticArenaManager::ReserveBackbone() {
@@ -340,6 +497,32 @@ void StaticArenaManager::ReserveBackbone() {
     layer.shared_down_weight = arena_.Reserve("w.layer.shared_down", Fp8Bytes(kHiddenSize * shared_inter));
     layer.shared_down_scale =
         arena_.Reserve("w.layer.shared_down_scale", Fp8Bytes(kHiddenSize * DenseScaleCols(shared_inter)));
+
+    // Two independent hyper-connections per layer, one per sub-block.
+    const auto reserve_mhc = [this](BackboneWeights::Layer::MhcWeights* weights, const char* phi_name,
+                                    const char* alpha_name, const char* bias_name, const char* gamma_name) {
+      weights->phi = arena_.Reserve(phi_name, Fp32Bytes(kMhcMixRows * kMhcMixCols));
+      weights->alpha = arena_.Reserve(alpha_name, Fp32Bytes(kMhcAlphaElements));
+      weights->bias = arena_.Reserve(bias_name, Fp32Bytes(kMhcMixRows));
+      weights->gamma = arena_.Reserve(gamma_name, Fp32Bytes(kNhcStreams * kHiddenSize));
+    };
+    reserve_mhc(&layer.mhc_attn, "w.layer.mhc_attn_phi", "w.layer.mhc_attn_alpha", "w.layer.mhc_attn_bias",
+                "w.layer.mhc_attn_gamma");
+    reserve_mhc(&layer.mhc_moe, "w.layer.mhc_moe_phi", "w.layer.mhc_moe_alpha", "w.layer.mhc_moe_bias",
+                "w.layer.mhc_moe_gamma");
+
+    if (uses_compression()) {
+      layer.cmp_wkv = arena_.Reserve("w.layer.cmp_wkv", Bf16Bytes(kHiddenSize * mla.kv_lora_rank));
+      layer.cmp_wgate = arena_.Reserve("w.layer.cmp_wgate", Bf16Bytes(kHiddenSize));
+      layer.cmp_ape = arena_.Reserve("w.layer.cmp_ape", Fp32Bytes(max_compress_ratio_ * mla.kv_lora_rank));
+      layer.cmp_norm_weight = arena_.Reserve("w.layer.cmp_norm_weight", Fp32Bytes(mla.kv_lora_rank));
+    }
+    if (uses_csa_) {
+      layer.index_q_weight =
+          arena_.Reserve("w.layer.index_q", Bf16Bytes(kQLoraRank * kIndexNumHeads * kIndexHeadDim));
+      layer.index_k_weight = arena_.Reserve("w.layer.index_k", Bf16Bytes(mla.kv_lora_rank * kIndexHeadDim));
+      layer.index_head_weight = arena_.Reserve("w.layer.index_head_weight", Bf16Bytes(kIndexNumHeads));
+    }
   }
 }
 
@@ -400,6 +583,12 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
   ingest(backbone_->lm_head, "lm_head.weight", true);
   ingest(backbone_->final_norm, "model.norm.weight", true);
 
+  // "Populated" has to mean ALL of them: a checkpoint that ships phi but not
+  // alpha would mix the streams with a zero gain, which is not a partial
+  // result, it is a wrong one.
+  bool mhc_present = false;
+  bool mhc_missing = false;
+
   for (int64_t index = 0; index < kNumLayers; ++index) {
     const BackboneWeights::Layer& layer = backbone_->layers[static_cast<size_t>(index)];
     const Binding bindings[] = {
@@ -425,6 +614,52 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
     for (const Binding& binding : bindings) {
       ingest(binding.handle, LayerTensorName(binding.pattern, index), true);
     }
+
+    // mHC is NOT required of the checkpoint: a conversion that predates the
+    // hyper-connection export would otherwise be unloadable, and the report
+    // below says plainly when the weights are missing.
+    const Binding mhc_bindings[] = {
+        {layer.mhc_attn.phi, "model.layers.{L}.self_attn.hc.phi"},
+        {layer.mhc_attn.alpha, "model.layers.{L}.self_attn.hc.alpha"},
+        {layer.mhc_attn.bias, "model.layers.{L}.self_attn.hc.bias"},
+        {layer.mhc_attn.gamma, "model.layers.{L}.self_attn.hc.gamma"},
+        {layer.mhc_moe.phi, "model.layers.{L}.mlp.hc.phi"},
+        {layer.mhc_moe.alpha, "model.layers.{L}.mlp.hc.alpha"},
+        {layer.mhc_moe.bias, "model.layers.{L}.mlp.hc.bias"},
+        {layer.mhc_moe.gamma, "model.layers.{L}.mlp.hc.gamma"},
+    };
+    for (const Binding& binding : mhc_bindings) {
+      if (ingest(binding.handle, LayerTensorName(binding.pattern, index), false)) {
+        mhc_present = true;
+      } else {
+        mhc_missing = true;
+      }
+    }
+
+    // The compressor and indexer projections, on the other hand, ARE required
+    // of a checkpoint that marks this layer compressed: it asked for the path,
+    // so the weights that path reads have to be there.
+    if (uses_compression()) {
+      const Binding cmp_bindings[] = {
+          {layer.cmp_wkv, "model.layers.{L}.self_attn.compressor.wkv.weight"},
+          {layer.cmp_wgate, "model.layers.{L}.self_attn.compressor.wgate.weight"},
+          {layer.cmp_ape, "model.layers.{L}.self_attn.compressor.ape"},
+          {layer.cmp_norm_weight, "model.layers.{L}.self_attn.compressor.norm.weight"},
+      };
+      for (const Binding& binding : cmp_bindings) {
+        ingest(binding.handle, LayerTensorName(binding.pattern, index), false);
+      }
+    }
+    if (uses_csa_) {
+      const Binding index_bindings[] = {
+          {layer.index_q_weight, "model.layers.{L}.self_attn.indexer.wq.weight"},
+          {layer.index_k_weight, "model.layers.{L}.self_attn.indexer.wk.weight"},
+          {layer.index_head_weight, "model.layers.{L}.self_attn.indexer.weights_proj.weight"},
+      };
+      for (const Binding& binding : index_bindings) {
+        ingest(binding.handle, LayerTensorName(binding.pattern, index), false);
+      }
+    }
   }
 
   // The rope tables are derived, not stored. A checkpoint that ships them is
@@ -434,8 +669,16 @@ void StaticArenaManager::IngestBackbone(WeightByteSource& source) {
   const bool cos = ingest(backbone_->rope_cos, "model.rotary_emb.cos_cached", false);
   const bool sin = ingest(backbone_->rope_sin, "model.rotary_emb.sin_cached", false);
   backbone_->rope_tables_populated = cos && sin;
+  backbone_->mhc_weights_populated = mhc_present && !mhc_missing;
+}
 
-
+void* StaticArenaManager::ReservationAddress(const char* name) const {
+  for (size_t index = 0; index < arena_.reservations().size(); ++index) {
+    if (std::strcmp(arena_.reservations()[index].name, name) == 0) {
+      return arena_.Address(index);
+    }
+  }
+  throw Dsv4Error(std::string("no arena reservation named ") + name);
 }
 
 void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const ExpertSlotAddresses& experts) {
@@ -453,14 +696,7 @@ void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const 
   // Reservations are looked up by name here rather than threaded through as
   // handles: every buffer is created exactly once and the name is the same
   // string literal the reservation used.
-  auto address = [&](const char* name) -> void* {
-    for (size_t index = 0; index < arena_.reservations().size(); ++index) {
-      if (std::strcmp(arena_.reservations()[index].name, name) == 0) {
-        return arena_.Address(index);
-      }
-    }
-    throw Dsv4Error(std::string("no arena reservation named ") + name);
-  };
+  auto address = [&](const char* name) -> void* { return ReservationAddress(name); };
 
   uint8_t* q_b_base = static_cast<uint8_t*>(address("act.q_b"));
   uint8_t* kv_a_base = static_cast<uint8_t*>(address("act.kv_a"));
@@ -653,6 +889,349 @@ void StaticArenaManager::CreateDescriptors(const ExpertSlotLayout& slots, const 
   t.expert_gate_up_scale_list = arena_.CreateTensorList("expert_gate_up_scale_list", t.expert_gate_up_scale);
   t.expert_down_list = arena_.CreateTensorList("expert_down_list", t.expert_down);
   t.expert_down_scale_list = arena_.CreateTensorList("expert_down_scale_list", t.expert_down_scale);
+
+  CreateMhcDescriptors();
+  CreateCompressionDescriptors();
+  SeedStaticTables();
+}
+
+// ---------------------------------------------------------------------------
+// mHC descriptors: the uniform BSND spelling
+// ---------------------------------------------------------------------------
+//
+// Pure TND, at the ranks the 950PR run proved Repeatable=true for both
+// `aclnnMhcPre` and `aclnnMhcPost`: rank 3 for x / hRes / B_l / out, rank 2
+// for hIn / hOut / hPost. Nothing is mixed, and nothing is reshaped -- hIn
+// comes out at [1, 4096], which is exactly what RMSNorm, the attention
+// projections and the MoE router take, so it is handed to them as it is.
+void StaticArenaManager::CreateMhcDescriptors() {
+  ArenaTensors& t = *tensors_;
+  const int64_t tokens = kTokensPerStep;
+
+  static const char* const kStreamLabels[2] = {"mhc_stream_a", "mhc_stream_b"};
+  static const char* const kSliceLabels[2][kNhcStreams] = {
+      {"mhc_stream_a.s0", "mhc_stream_a.s1", "mhc_stream_a.s2", "mhc_stream_a.s3"},
+      {"mhc_stream_b.s0", "mhc_stream_b.s1", "mhc_stream_b.s2", "mhc_stream_b.s3"},
+  };
+  for (size_t buffer = 0; buffer < 2; ++buffer) {
+    uint8_t* base = arena_.AddressAs<uint8_t>(t.h_residual_stream[buffer]);
+    // [T, n, D], contiguous -- which is also what makes each stream slice
+    // below a plain byte offset rather than a strided view.
+    t.residual_stream[buffer] =
+        arena_.CreateTensor(kStreamLabels[buffer], {tokens, kNhcStreams, kHiddenSize}, kAclBf16, base);
+    for (int64_t stream = 0; stream < kNhcStreams; ++stream) {
+      t.stream_slice[buffer][stream] =
+          arena_.CreateTensor(kSliceLabels[buffer][static_cast<size_t>(stream)], {tokens, kHiddenSize}, kAclBf16,
+                              base + Bf16Bytes(stream * kHiddenSize));
+    }
+  }
+
+  struct RoundLabels {
+    const char* h_in;
+    const char* h_post;
+    const char* h_res;
+    const char* h_res_sink;
+    const char* h_out;
+    const char* h_in_reservation;
+    const char* h_post_reservation;
+    const char* h_res_reservation;
+    const char* h_res_sink_reservation;
+    // The sub-block output buffer h_out describes: the attention round folds
+    // back o_proj's output, the MoE round folds back the routed + shared sum.
+    // Neither is copied -- h_out is a descriptor over bytes that already exist.
+    const char* h_out_reservation;
+  };
+  const RoundLabels rounds[2] = {
+      {"mhc_attn_h_in", "mhc_attn_h_post", "mhc_attn_h_res", "mhc_attn_h_res_sink", "mhc_attn_h_out",
+       "mhc.attn_h_in", "mhc.attn_h_post", "mhc.attn_h_res", "mhc.attn_h_res_sink", "act.proj_out"},
+      {"mhc_moe_h_in", "mhc_moe_h_post", "mhc_moe_h_res", "mhc_moe_h_res_sink", "mhc_moe_h_out",
+       "mhc.moe_h_in", "mhc.moe_h_post", "mhc.moe_h_res", "mhc.moe_h_res_sink", "moe.routed_out"},
+  };
+  MhcRoundTensors* targets[2] = {&t.mhc_attn, &t.mhc_moe};
+  for (size_t round = 0; round < 2; ++round) {
+    const RoundLabels& labels = rounds[round];
+    MhcRoundTensors& set = *targets[round];
+    set.h_in = arena_.CreateTensor(labels.h_in, {tokens, kHiddenSize}, kAclBf16,
+                                   ReservationAddress(labels.h_in_reservation));
+    set.h_post = arena_.CreateTensor(labels.h_post, {tokens, kNhcStreams}, kAclFloat32,
+                                     ReservationAddress(labels.h_post_reservation));
+    set.h_res = arena_.CreateTensor(labels.h_res, {tokens, kNhcStreams, kNhcStreams}, kAclFloat32,
+                                    ReservationAddress(labels.h_res_reservation));
+    // CONTIGUOUS, and that is now the ONLY admissible form: the 950PR run
+    // refused a non-contiguous Sinkhorn output with 561103, so the gapped-view
+    // workaround the CANN 4.31 note once recommended is simply unavailable.
+    // CreateTensor emits contiguous strides, which for [1, 4, 4] FP32 is
+    // [16, 4, 1].
+    set.h_res_sink = arena_.CreateTensor(labels.h_res_sink, {tokens, kNhcStreams, kNhcStreams}, kAclFloat32,
+                                         ReservationAddress(labels.h_res_sink_reservation));
+    set.h_out = arena_.CreateTensor(labels.h_out, {tokens, kHiddenSize}, kAclBf16,
+                                    ReservationAddress(labels.h_out_reservation));
+  }
+
+  // Pointed at layer 0's attention round; repointed per layer and per round.
+  const BackboneWeights::Layer::MhcWeights& first = backbone_->layers[0].mhc_attn;
+  t.w_mhc_phi = arena_.CreateTensor("w_mhc_phi", {kMhcMixRows, kMhcMixCols}, kAclFloat32,
+                                    arena_.Address(first.phi));
+  t.w_mhc_alpha = arena_.CreateTensor("w_mhc_alpha", {kMhcAlphaElements}, kAclFloat32,
+                                      arena_.Address(first.alpha));
+  t.w_mhc_bias = arena_.CreateTensor("w_mhc_bias", {kMhcMixRows}, kAclFloat32, arena_.Address(first.bias));
+  t.w_mhc_gamma = arena_.CreateTensor("w_mhc_gamma", {kNhcStreams, kHiddenSize}, kAclFloat32,
+                                      arena_.Address(first.gamma));
+}
+
+// ---------------------------------------------------------------------------
+// Compression and sparse-attention descriptors
+// ---------------------------------------------------------------------------
+//
+// Every per-layer tensor is created over LAYER 0's slice and repointed by the
+// decode loop, exactly like the dense weights. The paged caches get two
+// descriptors over one allocation where two operators disagree on the
+// spelling -- the hybrid KV cache is FP8 [blocks, block_size, 604] for both
+// the epilog and the attention core, the indexer key cache is UINT8
+// [blocks, block_size, 128] for its epilog and FP8 [blocks, block_size, 1,
+// 128] for the indexer -- so no byte is ever copied to change rank or dtype.
+void StaticArenaManager::CreateCompressionDescriptors() {
+  if (!uses_compression()) {
+    return;
+  }
+  ArenaTensors& t = *tensors_;
+  BackboneWeights& b = *backbone_;
+  const int64_t tokens = kTokensPerStep;
+  const int64_t width = config_.mla.kv_lora_rank;
+  const int64_t rope = config_.mla.qk_rope_head_dim;
+  const int64_t slots = compressed_slots();
+
+  uint8_t* window_base = arena_.AddressAs<uint8_t>(b.cmp_window);
+  uint8_t* rope_cos_base = arena_.AddressAs<uint8_t>(b.rope_cos);
+  uint8_t* rope_sin_base = arena_.AddressAs<uint8_t>(b.rope_sin);
+  // Window-length views. The compressor takes x as [T, H] with ropeSin /
+  // ropeCos at the rank of x, so these are the rank-2 TND spelling -- the
+  // operator admits no rank-4 x (mock and wrapper both cap it at [B, S, H]),
+  // which is why the mHC graph's BSND rule stops at the mHC boundary.
+  if (uses_csa_) {
+    t.cmp_window_csa =
+        arena_.CreateTensor("cmp_window_csa", {kCompressRatioCsa, kHiddenSize}, kAclBf16, window_base);
+    t.cmp_rope_cos_csa = arena_.CreateTensor("cmp_rope_cos_csa", {kCompressRatioCsa, rope}, kAclBf16,
+                                             rope_cos_base);
+    t.cmp_rope_sin_csa = arena_.CreateTensor("cmp_rope_sin_csa", {kCompressRatioCsa, rope}, kAclBf16,
+                                             rope_sin_base);
+  }
+  if (uses_hca_) {
+    t.cmp_window_hca =
+        arena_.CreateTensor("cmp_window_hca", {kCompressRatioHca, kHiddenSize}, kAclBf16, window_base);
+    t.cmp_rope_cos_hca = arena_.CreateTensor("cmp_rope_cos_hca", {kCompressRatioHca, rope}, kAclBf16,
+                                             rope_cos_base);
+    t.cmp_rope_sin_hca = arena_.CreateTensor("cmp_rope_sin_hca", {kCompressRatioHca, rope}, kAclBf16,
+                                             rope_sin_base);
+  }
+
+  t.cmp_state_cache = arena_.CreateTensor("cmp_state_cache",
+                                          {kCompressorStateBlocks, kCompressorStateBlockSize, width},
+                                          kAclFloat32, arena_.Address(b.cmp_state_cache));
+  t.cmp_state_block_table = arena_.CreateTensor("cmp_state_block_table", {tokens, kCompressorStateBlocks},
+                                                kAclInt32, arena_.Address(b.cmp_state_block_table));
+  uint8_t* meta_base = static_cast<uint8_t*>(ReservationAddress("cmp.window_meta"));
+  t.cmp_cu_seqlens = arena_.CreateTensor("cmp_cu_seqlens", {tokens}, kAclInt32, meta_base);
+  t.cmp_seqused = arena_.CreateTensor("cmp_seqused", {tokens}, kAclInt32, meta_base + Int32Bytes(1));
+  t.cmp_start_pos = arena_.CreateTensor("cmp_start_pos", {tokens}, kAclInt32, meta_base + Int32Bytes(2));
+
+  // The genuinely EMPTY window, for the hold-step stage: zero tokens, so
+  // cmpKvOut's pinned row count (T / cmpRatio) is also zero and the wrapper's
+  // empty-tensor early return fires. A PARTIAL window cannot be used here --
+  // the wrapper ties cmpKvOut's rows to x's token count, so a 1-, 2- or
+  // 3-token x would need its own plan every step, which is exactly the
+  // in-loop re-planning Seal() exists to forbid. The ring buffer carries the
+  // partial window instead; this stage is the no-op the cadence launches
+  // while it fills.
+  t.cmp_window_empty = arena_.CreateTensor("cmp_window_empty", {0, kHiddenSize}, kAclBf16, window_base);
+  t.cmp_rope_cos_empty = arena_.CreateTensor("cmp_rope_cos_empty", {0, rope}, kAclBf16, rope_cos_base);
+  t.cmp_rope_sin_empty = arena_.CreateTensor("cmp_rope_sin_empty", {0, rope}, kAclBf16, rope_sin_base);
+
+  void* kv_out_base = ReservationAddress("cmp.kv_out");
+  t.cmp_kv_out = arena_.CreateTensor("cmp_kv_out", {tokens, width}, kAclBf16, kv_out_base);
+  // THE EMPTY DESTINATION. Zero rows, so IsEmpty() holds and the vendored
+  // wrapper's `if (x->IsEmpty() || cmpKvOut->IsEmpty()) { workspace = 0;
+  // return; }` fires before any l0 call -- no kernel, no ViewCopy into the
+  // compressed cache and no in-place update of the state ring (H3). It shares
+  // cmp_kv_out's address because a zero-element view reads and writes nothing;
+  // giving it a reservation of its own would reserve a byte to never touch.
+  t.cmp_kv_out_empty = arena_.CreateTensor("cmp_kv_out_empty", {0, width}, kAclBf16, kv_out_base);
+
+  uint8_t* kv_cache_base = arena_.AddressAs<uint8_t>(b.cmp_kv_cache);
+  // The third axis counts BYTES of one Dsv4CompressedKvEntry, viewed as FP8
+  // because that is the dtype both the epilog and the attention core demand of
+  // this cache. Its axis-0 stride -- which is what every stride attribute is
+  // derived from -- is therefore block_size * 604 elements by construction.
+  t.cmp_kv_cache = arena_.CreateTensor("cmp_kv_cache",
+                                       {num_blocks_, config_.block_size, kCompressedKvEntryBytes},
+                                       kAclFloat8E4m3Fn, kv_cache_base);
+  t.cmp_slot_mapping =
+      arena_.CreateTensor("cmp_slot_mapping", {tokens}, kAclInt32, arena_.Address(b.cmp_slot_mapping));
+  t.cmp_block_table =
+      arena_.CreateTensor("cmp_block_table", {tokens, num_blocks_}, kAclInt32, arena_.Address(b.cmp_block_table));
+  t.cmp_seq_k = arena_.CreateTensor("cmp_seq_k", {tokens}, kAclInt32, arena_.Address(b.cmp_seq_k));
+  t.cmp_sparse_indices_dense = arena_.CreateTensor("cmp_sparse_indices_dense", {tokens, 1, 1, kIndexTopK},
+                                                   kAclInt32, arena_.Address(b.cmp_sparse_indices_dense));
+
+  // The sparse attention core's q and out, as rank-4 BSND views over the
+  // buffers the dense path already uses: q_b's leading heads x kv_lora block
+  // and act.attn_out. Byte-identical to the q_latent / attn_out descriptors
+  // the SWA path binds, so both cores read and write the same activations and
+  // `attn_quant` -> `o_proj` needs no variant.
+  t.sparse_q = arena_.CreateTensor("sparse_q", {tokens, 1, heads_, width}, kAclBf16,
+                                   ReservationAddress("act.q_b"));
+  t.sparse_attn_out = arena_.CreateTensor("sparse_attn_out", {tokens, 1, heads_, width}, kAclBf16,
+                                          ReservationAddress("act.attn_out"));
+  // returnSoftmaxLse = false is signalled by a [0] placeholder, which the
+  // wrapper reads as "issue no copy for that output".
+  t.sparse_lse_empty = arena_.CreateTensor("sparse_lse_empty", {0}, kAclFloat32,
+                                           ReservationAddress("act.softmax_lse"));
+
+  // Compressor weights, pointed at layer 0 and repointed per layer.
+  const BackboneWeights::Layer& first = b.layers[0];
+  t.w_cmp_wkv = arena_.CreateTensor("w_cmp_wkv", {kHiddenSize, width}, kAclBf16, arena_.Address(first.cmp_wkv));
+  t.w_cmp_wgate = arena_.CreateTensor("w_cmp_wgate", {kHiddenSize, 1}, kAclBf16, arena_.Address(first.cmp_wgate));
+  t.w_cmp_norm_weight = arena_.CreateTensor("w_cmp_norm_weight", {width}, kAclFloat32,
+                                            arena_.Address(first.cmp_norm_weight));
+  if (uses_csa_) {
+    t.w_cmp_ape_csa = arena_.CreateTensor("w_cmp_ape_csa", {kCompressRatioCsa, width}, kAclFloat32,
+                                          arena_.Address(first.cmp_ape));
+  }
+  if (uses_hca_) {
+    t.w_cmp_ape_hca = arena_.CreateTensor("w_cmp_ape_hca", {kCompressRatioHca, width}, kAclFloat32,
+                                          arena_.Address(first.cmp_ape));
+  }
+
+  if (!uses_csa_) {
+    return;
+  }
+  const int64_t indexer_width = kIndexNumHeads * kIndexHeadDim;
+  void* q_fp8_base = ReservationAddress("idx.q_fp8");
+  t.index_q_bf16 =
+      arena_.CreateTensor("index_q_bf16", {tokens, indexer_width}, kAclBf16, ReservationAddress("idx.q_bf16"));
+  t.index_q_fp8 = arena_.CreateTensor("index_q_fp8", {tokens, indexer_width}, kAclFloat8E4m3Fn, q_fp8_base);
+  t.index_q_mx_scale = arena_.CreateTensor("index_q_mx_scale", {tokens, MxScaleCols(indexer_width)}, kScaleDtype,
+                                           ReservationAddress("idx.q_mx_scale"));
+  // The indexer's own BSND spelling of the same FP8 bytes: [B, S, N1, D].
+  t.index_q = arena_.CreateTensor("index_q", {tokens, 1, kIndexNumHeads, kIndexHeadDim}, kAclFloat8E4m3Fn,
+                                  q_fp8_base);
+  t.index_k_bf16 =
+      arena_.CreateTensor("index_k_bf16", {tokens, kIndexHeadDim}, kAclBf16, ReservationAddress("idx.k_bf16"));
+
+  uint8_t* index_cache_base = arena_.AddressAs<uint8_t>(b.index_k_cache);
+  t.index_k_cache_u8 = arena_.CreateTensor("index_k_cache_u8", {num_blocks_, config_.block_size, kIndexHeadDim},
+                                           kAclUint8, index_cache_base);
+  t.index_k_cache = arena_.CreateTensor("index_k_cache",
+                                        {num_blocks_, config_.block_size, 1, kIndexHeadDim}, kAclFloat8E4m3Fn,
+                                        index_cache_base);
+  t.index_k_dequant = arena_.CreateTensor("index_k_dequant", {num_blocks_, config_.block_size, 1}, kAclFloat32,
+                                          arena_.Address(b.index_k_dequant));
+  t.index_q_dequant = arena_.CreateTensor("index_q_dequant", {tokens, 1, kIndexNumHeads}, kAclFloat32,
+                                          arena_.Address(b.index_q_dequant));
+  t.index_sparse_indices = arena_.CreateTensor("index_sparse_indices", {tokens, 1, 1, kIndexTopK}, kAclInt32,
+                                               arena_.Address(b.index_sparse_indices));
+  t.index_sparse_values_empty = arena_.CreateTensor("index_sparse_values_empty", {0}, kAclFloat32,
+                                                    arena_.Address(b.index_q_dequant));
+  // [1, 1, 64] BF16, the learned per-head scoring gain, viewed over the
+  // layer's flat [64] reservation at the rank the indexer takes.
+  t.index_head_weights = arena_.CreateTensor("index_head_weights", {tokens, 1, kIndexNumHeads}, kAclBf16,
+                                             arena_.Address(first.index_head_weight));
+  // [K, N] for aclnnMatmul, which has no transpose flag.
+  t.w_index_q = arena_.CreateTensor("w_index_q", {kQLoraRank, indexer_width}, kAclBf16,
+                                    arena_.Address(first.index_q_weight));
+  t.w_index_k = arena_.CreateTensor("w_index_k", {width, kIndexHeadDim}, kAclBf16,
+                                    arena_.Address(first.index_k_weight));
+  (void)slots;
+}
+
+// ---------------------------------------------------------------------------
+// The constants the graph reads but never computes
+// ---------------------------------------------------------------------------
+//
+// Written here, once, at descriptor time -- not inside a decode step, and not
+// left as the zeros Commit() memset. A zero block table makes every paged read
+// address block 0, which is a wrong answer with no symptom; the engine's
+// paging is one contiguous run of blocks per sequence, so the identity IS the
+// table.
+void StaticArenaManager::SeedStaticTables() {
+  const BackboneWeights& b = *backbone_;
+  ResourceScope staging_scope(allocator_, streams_);
+
+  const auto upload = [&](ArenaHandle handle, const std::vector<int32_t>& values) {
+    const size_t bytes = Int32Bytes(static_cast<int64_t>(values.size()));
+    DSV4_REQUIRE(arena_.Bytes(handle) >= bytes,
+                 "a static table of " << values.size() << " entries does not fit its "
+                                      << arena_.Bytes(handle) << "-byte reservation");
+    int32_t* staging = static_cast<int32_t*>(staging_scope.HostPinnedMalloc(bytes));
+    DSV4_REQUIRE(staging != nullptr, "the static-table staging buffer could not be pinned");
+    std::copy(values.begin(), values.end(), staging);
+    streams_.MemcpySync(arena_.Address(handle), bytes, staging, bytes, MemcpyKind::kHostToDevice);
+  };
+  const auto identity = [](int64_t count) {
+    std::vector<int32_t> values(static_cast<size_t>(count));
+    for (int64_t index = 0; index < count; ++index) {
+      values[static_cast<size_t>(index)] = static_cast<int32_t>(index);
+    }
+    return values;
+  };
+
+  // The dense paged cache's block table. Previously left zeroed, which pointed
+  // every FIA V5 block lookup at block 0.
+  upload(b.block_table, identity(num_blocks_));
+  if (!uses_compression()) {
+    return;
+  }
+  upload(b.cmp_block_table, identity(num_blocks_));
+  upload(b.cmp_state_block_table, identity(kCompressorStateBlocks));
+  // The HCA path has no indexer, but a bound cmpKv still requires an INT32
+  // selection, so "attend the whole compressed stream" is spelled as the
+  // identity top-k.
+  //
+  // CLAMPED, not a plain 0..k-1 ramp. kIndexTopK is 512 while one layer's
+  // compressed cache holds `compressed_slots()` entries, which is smaller
+  // whenever the reserved context is short (256 at a 2-block reservation). A
+  // raw identity would then hand the attention core indices past the end of
+  // the cache, and it gathers at these indices with no bounds check of its own
+  // -- the same out-of-bounds read H4's range checker exists to rule out. Past
+  // the last real slot the vector repeats it, which for an "attend everything"
+  // selection over a stream shorter than k re-reads one entry instead of
+  // reading memory that is not the cache. The live length still bounds the
+  // kernel through cmp_seq_k; this is the floor under that.
+  {
+    const int64_t last = compressed_slots() - 1;
+    std::vector<int32_t> dense(static_cast<size_t>(kIndexTopK));
+    for (int64_t index = 0; index < kIndexTopK; ++index) {
+      dense[static_cast<size_t>(index)] = static_cast<int32_t>(std::min(index, last));
+    }
+    upload(b.cmp_sparse_indices_dense, dense);
+  }
+
+  if (!uses_csa_) {
+    return;
+  }
+  // The indexer's two FP32 dequant-scale streams, set to unit scale.
+  //
+  // NAMED DEVIATION, reported by Dsv4Pipeline::DescribeStages: nothing in this
+  // graph can produce them. The operator documents them as per-token-head FP32
+  // (queryDequantScale matching `weights`, keyDequantScale matching the key
+  // layout without D), and the only quantizers this engine has --
+  // aclnnDynamicMxQuant and aclnnRmsNormDynamicMxQuant -- emit OCP E8M0
+  // block-32 microscales, a different quantity in a different dtype at a
+  // different granularity. aclnnIndexerCompressEpilogV2, which writes the
+  // indexer key cache, has no scale output at all. So the indexer RUNS and its
+  // top-k is real, but with a unit scale the score ORDERING is only correct
+  // once a per-token-head scale producer exists. Unit scale is the honest
+  // placeholder: it is the identity, not a guess at a magnitude.
+  const size_t query_scale_bytes = Fp32Bytes(kTokensPerStep * kIndexNumHeads);
+  const size_t key_scale_bytes = IndexerKeyScaleLayerStrideBytes() * static_cast<size_t>(kNumLayers);
+  const size_t scale_bytes = std::max(query_scale_bytes, key_scale_bytes);
+  float* scale_staging = static_cast<float*>(staging_scope.HostPinnedMalloc(scale_bytes));
+  DSV4_REQUIRE(scale_staging != nullptr, "the indexer scale staging buffer could not be pinned");
+  std::fill(scale_staging, scale_staging + scale_bytes / sizeof(float), 1.0f);
+  streams_.MemcpySync(arena_.Address(b.index_q_dequant), query_scale_bytes, scale_staging, query_scale_bytes,
+                      MemcpyKind::kHostToDevice);
+  streams_.MemcpySync(arena_.Address(b.index_k_dequant), key_scale_bytes, scale_staging, key_scale_bytes,
+                      MemcpyKind::kHostToDevice);
 }
 
 void StaticArenaManager::CommitWorkspace() { arena_.CommitWorkspace(); }

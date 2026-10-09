@@ -54,16 +54,29 @@
 //    excluded by 3 -- or routing the next layer one layer early. Both are
 //    named in README.md.
 //
-// 2. THE LIGHTNING INDEXER IS NOT APPLIED.
+// 2. ONE HOST PLAN PER mHC ROUND, BECAUSE SINKHORN CANNOT BE REPEATABLE.
 //
-//    DSV4 Flash selects `index_topk = 512` keys per query with a compressed
-//    indexer. The brief's operator mapping (3.1) specifies
-//    `aclnnFusedInferAttentionScoreV5` for the attention stage, which is the
-//    *dense* paged MLA decode; the sparse selection belongs to
-//    `aclnnSparseFlashMla` (+ `...Metadata`), which the mapping does not list.
-//    This pipeline therefore attends the full context, as specified, and says
-//    so in its report. It is a functional difference from the model, not a
-//    performance one.
+//    Every sub-block is wrapped by an mHC round: `aclnnMhcPre` mixes the four
+//    residual streams into the layer input, the 4x4 mixing map is normalized
+//    into B_l, and `aclnnMhcPost` folds the sub-block's output back. Pre and
+//    Post hold retained, repeatable executors -- the 950PR run confirmed
+//    Repeatable=true for both at this engine's TND shapes. The normalization
+//    between them cannot: `aclSetAclOpExecutorRepeatable` fails
+//    `aclnnMhcSinkhorn` with 561000, and the non-contiguous-output workaround
+//    the CANN 4.31 note once recommended is now refused outright with 561103.
+//
+//    So the standalone operator is planned and launched once per round, its
+//    executor consumed by its own launch: 86 host plans per step, counted as
+//    `StepCounters::sinkhorn_replans` and printed. Removing them needs the
+//    normalization fused into a kernel that never materializes B_l at the
+//    aclnn layer -- `aclnnHcPreSinkhorn` is the vendored operator that does
+//    this, and `MhcMixingMode::kFusedExternal` is the seam it plugs into.
+//
+//    THE LIGHTNING INDEXER, by contrast, IS now applied: a CSA layer runs the
+//    compressor, `aclnnVllmQuantLightningIndexer` at top-512 and
+//    `aclnnKvQuantSparseAttnSharedkv`. What remains unresolved there is the
+//    indexer's per-token-head dequant scales, which no operator in this graph
+//    produces; the report says so.
 //
 // 3. THE COMBINE IS A [1, 6] x [6, hidden] MATMUL, NOT MoeTokenUnpermute.
 //
@@ -108,6 +121,27 @@ struct StepCounters {
   uint64_t descriptors_built_in_step = 0;   // must stay 0
   uint64_t expert_slot_hits = 0;
   uint64_t expert_slot_misses = 0;
+  // mHC rounds executed: two per layer per step (attention, MoE).
+  uint64_t mhc_rounds = 0;
+  // Host plans issued inside the decode loop because `aclnnMhcSinkhorn`
+  // cannot hold a repeatable executor on a 950PR (561000). One per mHC round
+  // on MhcMixingMode::kPerUsePlan, zero on kFusedExternal. This is a FORCED
+  // violation of the engine's zero-host-work-in-the-loop rule, so it is
+  // counted and printed rather than hidden.
+  uint64_t sinkhorn_replans = 0;
+  // Compressor cadence. `compressor_holds` counts the no-op launches on
+  // partial windows and `compressor_emissions` the windows that closed and
+  // wrote a Dsv4CompressedKvEntry; `compressed_entries_written` must equal
+  // the emissions exactly, because a hold step must never reach the cache.
+  uint64_t compressor_holds = 0;
+  uint64_t compressor_emissions = 0;
+  uint64_t compressed_entries_written = 0;
+  uint64_t indexer_selections = 0;
+  // Per-path layer executions, so a report can show the dispatch really
+  // followed `compress_ratios`.
+  uint64_t swa_layers = 0;
+  uint64_t csa_layers = 0;
+  uint64_t hca_layers = 0;
 };
 
 // Which tensor index inside an op's retained executor each swappable address
@@ -189,6 +223,63 @@ inline constexpr size_t kGmmWeightList = 1;
 inline constexpr size_t kGmmV5ScaleList = 3;
 inline constexpr size_t kGmmSwigluScaleList = 2;
 
+// aclnnInplaceAdd(selfRef, other, alpha): alpha is a host scalar and is
+// skipped, so `other` is tensor index 1.
+inline constexpr size_t kInplaceAddSelf = 0;
+inline constexpr size_t kInplaceAddOther = 1;
+
+// aclnnMhcPre(x, phi, alpha, bias, gammaOptional, normEps, hcEps,
+//             hInOut, hPostOut, hResOut, invRmsOut, hMixOut, hPreOut).
+// The two epsilons are host doubles and are skipped; the three trailing
+// optional outputs are bound null but still occupy their indices.
+inline constexpr size_t kMhcPreX = 0;
+inline constexpr size_t kMhcPrePhi = 1;
+inline constexpr size_t kMhcPreAlpha = 2;
+inline constexpr size_t kMhcPreBias = 3;
+inline constexpr size_t kMhcPreGamma = 4;
+
+// aclnnMhcSinkhorn(x, eps, numIters, output, normOut, sumOut). H2 rebinds
+// index 1 and relaunches, which is what confirms this numbering empirically.
+inline constexpr size_t kMhcSinkhornX = 0;
+inline constexpr size_t kMhcSinkhornOut = 1;
+
+// aclnnMhcPost(x, hRes, hOut, hPost, out)
+inline constexpr size_t kMhcPostX = 0;
+inline constexpr size_t kMhcPostHRes = 1;
+inline constexpr size_t kMhcPostHOut = 2;
+inline constexpr size_t kMhcPostHPost = 3;
+inline constexpr size_t kMhcPostOut = 4;
+
+// aclnnCompressor(x, wkv, wgate, stateCacheRef, ape, normWeight, ropeSin,
+//                 ropeCos, stateBlockTable, cuSeqlens, seqused, startPos,
+//                 ...attrs..., cmpKvOut)
+inline constexpr size_t kCompressorX = 0;
+inline constexpr size_t kCompressorWkv = 1;
+inline constexpr size_t kCompressorWgate = 2;
+inline constexpr size_t kCompressorStateCache = 3;
+inline constexpr size_t kCompressorApe = 4;
+inline constexpr size_t kCompressorNormWeight = 5;
+inline constexpr size_t kCompressorRopeSin = 6;
+inline constexpr size_t kCompressorRopeCos = 7;
+inline constexpr size_t kCompressorCmpKvOut = 12;
+
+// aclnnKvCompressEpilog(kvCompressCacheRef, x, slotMapping, ...attrs...) and
+// aclnnIndexerCompressEpilogV2(indexerCompressCacheRef, x, slotMapping, ...).
+// Both leading parameters are REF: input and output in one slot.
+inline constexpr size_t kCompressEpilogCacheRef = 0;
+
+// aclnnVllmQuantLightningIndexer(query, key, weights, queryDequantScale,
+//                                keyDequantScale, actualSeqLenQ,
+//                                actualSeqLenK, blockTable, metadata, ...)
+inline constexpr size_t kIndexerKey = 1;
+inline constexpr size_t kIndexerWeights = 2;
+inline constexpr size_t kIndexerKeyDequantScale = 4;
+
+// aclnnKvQuantSparseAttnSharedkv(q, oriKv, cmpKv, oriSparseIndices,
+//                                cmpSparseIndices, oriBlockTable,
+//                                cmpBlockTable, ...)
+inline constexpr size_t kSparseAttnCmpKv = 2;
+
 }  // namespace slot
 
 // The orchestrator. Allocation lives in StaticArenaManager, router scoring and
@@ -234,18 +325,51 @@ class Dsv4Pipeline {
 
   // The memory the backbone needs, so the slot planner can subtract it from
   // free HBM before choosing K. Pure arithmetic; no allocation.
-  static size_t BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size, int64_t max_context_len);
+  static size_t BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_size, int64_t max_context_len,
+                                    const std::vector<int64_t>& compress_ratios = {});
 
  private:
+  // One mHC round's planned stages plus the weights and the sub-block output
+  // they bind, so RunMhcPre / RunMhcPost are written once and parameterized
+  // rather than duplicated for attention and MoE.
+  struct MhcRound {
+    const char* pre = nullptr;
+    const char* sinkhorn = nullptr;
+    const char* post = nullptr;
+  };
+
   // ---- build helpers ----
   void PlanStages();
+  void PlanMhcStages();
+  void PlanCompressionStages();
   ExpertSlotAddresses CollectExpertSlotAddresses();
 
   // ---- per-layer helpers ----
+  // The mHC half of a sub-block: Pre folds the four streams into h_in and
+  // Sinkhorn normalizes the residual map; Post folds the sub-block's output
+  // back into the streams and advances the ping-pong parity.
+  void RunMhcPre(const MhcRound& round, const MhcRoundTensors& tensors,
+                 const BackboneWeights::Layer::MhcWeights& weights);
+  // Post needs no tensor set: hRes, hOut and hPost are bound at plan time and
+  // never move; only the ping-pong stream buffers are repointed.
+  void RunMhcPost(const MhcRound& round);
   void RunAttention(int32_t layer, int64_t position);
+  // The attention CORE, chosen by this layer's compress_ratios entry. The
+  // prologue (q/kv projections, rope, the uncompressed cache write) and the
+  // epilogue (attn_quant, o_proj) are shared by all three paths.
+  void RunAttentionCore(int32_t layer, int64_t position);
+  void RunSlidingWindowAttention();
+  void RunCompressedAttention(int32_t layer, int64_t position, AttentionPath path);
+  // Advances this layer's window ring and, on a closing step, emits one
+  // Dsv4CompressedKvEntry into the paged compressed cache. Returns true when
+  // the window closed.
+  bool AdvanceCompressorCadence(int32_t layer, int64_t position, int64_t ratio, AttentionPath path);
   void RunMoe(int32_t layer);
   void RunSharedExpert(int32_t layer);
   void Launch(PipelineStage& stage_entry);
+
+  // Byte base of `layer`'s slice of a per-layer compression reservation.
+  uint8_t* LayerSlice(ArenaHandle handle, size_t layer_stride_bytes, int32_t layer) const;
 
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
@@ -267,7 +391,12 @@ class Dsv4Pipeline {
   // is not movable, see StaticOpSlotTable); the injected MoE block plans its
   // expert stages into the same table, so one DescribeStages covers the
   // whole graph.
-  static constexpr size_t kMaxPipelineStages = 40;
+  //
+  // The ceiling covers the widest graph: the shared dense backbone, two mHC
+  // rounds, the three-stream reduction at the head, and -- on a checkpoint
+  // that marks layers both CSA and HCA -- both compressed cores, both
+  // compressor cadences and the indexer chain.
+  static constexpr size_t kMaxPipelineStages = 56;
   StaticOpSlotTable stages_ = StaticOpSlotTable(kMaxPipelineStages, "pipeline");
   StepCounters counters_;
   InferenceDiagnostics diagnostics_;
@@ -279,9 +408,28 @@ class Dsv4Pipeline {
   // Shapes, fixed at construction from the config.
   int64_t heads_ = kNumAttentionHeads;
 
+  // Which of the two mHC stream buffers holds the live residual stream. Every
+  // `aclnnMhcPost` reads this one and writes the other, so no call aliases its
+  // own input; 86 posts per step leaves it back where it started, but the
+  // parity is tracked rather than assumed.
+  size_t stream_parity_ = 0;
+
+  // Whether the compressed paths were planned at all. False on a SWA-only
+  // checkpoint, where they cost nothing: no reservation, no descriptor, no
+  // executor.
+  bool csa_planned_ = false;
+  bool hca_planned_ = false;
+  bool swa_planned_ = false;
+
   // The pinned host mailboxes for the per-step embedding and cache-slot writes.
   int64_t* token_mailbox_ = nullptr;  // [1] greedy token, D2H
   int32_t* slot_mailbox_ = nullptr;   // [1] paged cache slot, H2D
+  // The compressed stream's per-emission scalars: the destination slot, the
+  // compressed context length, and the compressor's {cuSeqlens, seqused,
+  // startPos} triple, which share one reservation so one copy writes all three.
+  int32_t* cmp_slot_mailbox_ = nullptr;    // [1] compressed cache slot, H2D
+  int32_t* cmp_seq_mailbox_ = nullptr;     // [1] compressed context length, H2D
+  int32_t* cmp_window_mailbox_ = nullptr;  // [3] cuSeqlens, seqused, startPos
 };
 
 }  // namespace ascend_moe

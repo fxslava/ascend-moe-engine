@@ -266,6 +266,39 @@ void StaticOpSlot::Adopt(OpId id, const char* label, uint64_t workspace_size, ac
   DSV4_ACL_CHECK(aclSetAclOpExecutorRepeatable(executor_));
 }
 
+void StaticOpSlot::NoteSingleUse(OpId id, const char* label, uint64_t workspace_size) {
+  DSV4_REQUIRE(executor_ == nullptr, label << ": this slot already holds a retained executor");
+  id_ = id;
+  label_ = label;
+  workspace_size_ = workspace_size;
+  single_use_ = true;
+}
+
+void StaticOpSlot::LaunchSingleUse(const OpTable& table, void* workspace, void* stream, aclOpExecutor* executor,
+                                   uint64_t workspace_size) const {
+  DSV4_REQUIRE(single_use_, label_ << ": LaunchSingleUse on a retained-executor stage");
+  DSV4_REQUIRE(executor != nullptr, label_ << ": LaunchSingleUse without a freshly planned executor");
+  // The fresh plan's own size is what the launch must carry, and it must not
+  // exceed what the probe at Build reserved -- a re-plan that grew would run
+  // past the shared workspace.
+  DSV4_REQUIRE(workspace_size <= workspace_size_,
+               label_ << ": the re-plan wants " << workspace_size << " workspace bytes but Build reserved "
+                      << workspace_size_);
+  DSV4_REQUIRE(workspace != nullptr || workspace_size == 0,
+               label_ << ": needs " << workspace_size << " workspace bytes but was given none");
+  CheckForInterrupt();
+  AclnnLaunchFn launch = table.launch_fn(id_);
+  const int status = launch(workspace_size == 0 ? nullptr : workspace, workspace_size, executor, stream);
+  if (status != 0) {
+    // The launch did not take ownership, so this plan has to be released here
+    // or it leaks on every failing step.
+    OpExecutorGuard orphan(executor);
+    throw AclError(label_, __FILE__, __LINE__, status);
+  }
+  // Success: a non-repeatable executor is consumed by its own launch, so there
+  // is deliberately nothing to destroy.
+}
+
 void StaticOpSlot::SetAddress(size_t index, aclTensor* tensor, void* address) const {
   DSV4_REQUIRE(address && reinterpret_cast<uintptr_t>(address) % 32 == 0,
                label_ << ": replacement device address must be 32-byte aligned (manual 4.38)");

@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ascend_moe {
 
@@ -49,6 +50,154 @@ inline constexpr int64_t kQLoraRank = 1024;
 inline constexpr int64_t kIndexTopK = 512;
 inline constexpr int64_t kIndexHeadDim = 128;
 inline constexpr int64_t kIndexNumHeads = 64;
+
+// ---------------------------------------------------------------------------
+// mHC (manifold hyper-connections) residual stream
+// ---------------------------------------------------------------------------
+//
+// DSV4-Flash carries `n_hc` = 4 parallel residual streams over the 4096-wide
+// hidden state instead of one. Each sub-block (attention, MoE) is wrapped by
+// an mHC round: `aclnnMhcPre` mixes the four streams into the sub-block input,
+// `aclnnMhcSinkhorn` makes the 4x4 residual map doubly stochastic, and
+// `aclnnMhcPost` folds the sub-block output back into the four streams as
+// `x_next = hRes^T x + hOut * hPost`. The input residual is carried by the
+// `hRes^T x` term, so the sub-block output bound to `hOut` is the sub-block
+// FUNCTION output and NOT the function plus its input -- which is why the old
+// `residual_attn` / `residual_moe` InplaceAdd stages are gone.
+inline constexpr int64_t kNhcStreams = 4;
+// phi is [n^2 + 2n, n * D]: 24 mixing rows over the 16384-wide flattened
+// stream. Both numbers are asserted against this geometry by the vendored
+// wrapper (aclnn_mhc_pre.cpp CheckInputOutShape).
+inline constexpr int64_t kMhcMixRows = kNhcStreams * kNhcStreams + 2 * kNhcStreams;  // 24
+inline constexpr int64_t kMhcMixCols = kNhcStreams * kHiddenSize;                    // 16384
+inline constexpr int64_t kMhcAlphaElements = 3;
+// Inside the wrapper's [1, 100] bound; dsv4_operator_hypotheses_test H2.3
+// checks both ends of it and H2.4 shows 20 reaches the Birkhoff invariant
+// within 1e-5.
+inline constexpr int64_t kMhcSinkhornIters = 20;
+inline constexpr float kMhcSinkhornEps = 1e-6f;
+inline constexpr double kMhcHcEpsilon = 1e-6;
+
+// THE LAYOUT CONTRACT: PURE TND, SETTLED ON HARDWARE
+// --------------------------------------------------
+// `aclnn_mhc_post.cpp:CheckShape` ties the ranks of one call together and
+// admits exactly two spellings, TND and BSND, with no mixing (hypotheses H1.4
+// shows the rejection). The 950PR run settled which one this engine uses: the
+// TND set planned, launched and reported Repeatable=true for BOTH `aclnnMhcPre`
+// and `aclnnMhcPost`, so the decode graph is pure TND and nothing is ever
+// squeezed or unsqueezed across the mHC boundary:
+//
+//   x, out   rank 3   [T, n, D]   = [1, 4, 4096]   BF16
+//   hRes     rank 3   [T, n, n]   = [1, 4, 4]      FP32
+//   B_l      rank 3   [T, n, n]   = [1, 4, 4]      FP32, contiguous
+//   hIn      rank 2   [T, D]      = [1, 4096]      BF16
+//   hOut     rank 2   [T, D]      = [1, 4096]      BF16
+//   hPost    rank 2   [T, n]      = [1, 4]         FP32
+//
+// hIn at [1, 4096] is exactly the activation RMSNorm, the attention
+// projections and the MoE router are already planned for, so it feeds them
+// directly -- that, and not a rank preference, is why TND is the right
+// spelling for a single-token decode step.
+inline constexpr size_t kMhcStreamRank = 3;
+inline constexpr size_t kMhcTokenRank = 2;
+
+// HOW B_l IS PRODUCED. `aclnnMhcSinkhorn` cannot be the answer on hardware:
+// the 950PR run refused a non-contiguous output outright (561103,
+// ACL_ERROR_INVALID_PARAM -- so the old "hand it a gapped view" workaround is
+// dead) and, with a CONTIGUOUS output, planned successfully but then failed
+// `aclSetAclOpExecutorRepeatable` with 561000. The wrapper builds a dynamic
+// internal iteration graph that CANN will not mark repeatable, so a standalone
+// Sinkhorn cannot hold a retained executor in StaticOpSlotTable at all.
+//
+//   kPerUsePlan      plan and launch the standalone operator once per use,
+//                    its executor consumed by its own launch. Correct today,
+//                    at the cost of one host plan per mHC round -- counted as
+//                    StepCounters::sinkhorn_replans so the price is visible.
+//   kFusedExternal   B_l arrives ALREADY doubly stochastic in the slot, from a
+//                    fused block that keeps the normalization interior to one
+//                    kernel; the pipeline then launches nothing for this link.
+//                    `aclnnHcPreSinkhorn` is the vendored operator that does
+//                    this (its `comb_frag` output IS B_l, and its own header
+//                    notes the normalization "never leaves the kernel, so no
+//                    such copy stage exists"); wiring it needs mHC's optional
+//                    hMix / invRms outputs, which is the deferred device-side
+//                    fusion. Selecting this mode without such a producer
+//                    leaves B_l at whatever the slot holds, so the stage
+//                    report says loudly when it is on.
+enum class MhcMixingMode { kPerUsePlan, kFusedExternal };
+
+// ---------------------------------------------------------------------------
+// Token compression / sparse attention topology
+// ---------------------------------------------------------------------------
+//
+// Every layer runs one of three attention paths, selected by that layer's
+// `compress_ratios` entry in the checkpoint:
+//
+//   <= 1   SWA   sliding-window attention over the uncompressed paged cache
+//    4     CSA   aclnnCompressor 4->1, quantized lightning indexer top-512,
+//                then shared-KV sparse attention over the compressed stream
+//   128    HCA   aclnnCompressor 128->1 and shared-KV sparse attention
+//                directly, with no indexer (the 128:1 stream is already
+//                short enough that selecting inside it buys nothing)
+//
+// 4 and 128 are the only ratios the deployed kernel admits: the vendored
+// wrapper and the mock both refuse anything else, and H3 checks the refusal at
+// cmpRatio 8.
+inline constexpr int64_t kCompressRatioSwa = 1;
+inline constexpr int64_t kCompressRatioCsa = 4;
+inline constexpr int64_t kCompressRatioHca = 128;
+
+enum class AttentionPath { kSlidingWindow, kCompressedSparse, kHyperCompressed };
+
+// `ratio` is the checkpoint's own number; 0 and 1 both mean "not compressed".
+inline AttentionPath AttentionPathForRatio(int64_t ratio) {
+  if (ratio == kCompressRatioCsa) return AttentionPath::kCompressedSparse;
+  if (ratio == kCompressRatioHca) return AttentionPath::kHyperCompressed;
+  return AttentionPath::kSlidingWindow;
+}
+
+inline const char* AttentionPathName(AttentionPath path) {
+  switch (path) {
+    case AttentionPath::kCompressedSparse:
+      return "CSA";
+    case AttentionPath::kHyperCompressed:
+      return "HCA";
+    default:
+      return "SWA";
+  }
+}
+
+// The compressor's recurrent pooling state is a paged [blocks, blockSize, D]
+// FP32 ring. These are the ring's shape, not the KV cache's.
+inline constexpr int64_t kCompressorStateBlocks = 4;
+inline constexpr int64_t kCompressorStateBlockSize = 8;
+inline constexpr int64_t kCompressorCoff = 1;
+inline constexpr int64_t kCompressorRotaryModeHalf = 0;
+inline constexpr int64_t kCompressorCacheModePaged = 0;
+
+// aclnnKvQuantSparseAttnSharedkv
+inline constexpr int64_t kSparseAttnTileSize = 64;      // must be a multiple of 16
+inline constexpr int64_t kSparseAttnKvQuantMode = 0;
+inline constexpr int64_t kSparseAttnOriMaskSwa = 4;     // sliding window
+inline constexpr int64_t kSparseAttnCmpMaskCausal = 3;  // right-down causal
+inline constexpr const char* kSparseAttnLayoutQ = "BSND";
+inline constexpr const char* kSparseAttnLayoutKv = "PA_ND";
+// The SWA window DSV4-Flash attends on its uncompressed layers. Not published
+// by the checkpoint; carried here as a named default and reported as one.
+inline constexpr int64_t kSlidingWindowLeft = 2048;
+inline constexpr int64_t kSlidingWindowRight = 0;
+
+// aclnnVllmQuantLightningIndexer
+inline constexpr int64_t kIndexerQuantModePerTokenHead = 0;
+inline constexpr int64_t kIndexerSparseModeCausal = 3;
+inline constexpr const char* kIndexerLayoutQuery = "BSND";
+inline constexpr const char* kIndexerLayoutKeyPaged = "PA_BSND";
+
+// aclnnKvCompressEpilog / aclnnIndexerCompressEpilogV2
+inline constexpr int64_t kCompressEpilogQuantGroup = 128;
+inline constexpr int64_t kCompressEpilogQuantMode = 0;
+inline constexpr int64_t kCompressEpilogRoundScalePow2 = 1;
+inline constexpr int64_t kCompressEpilogLayoutPaged = 0;
 
 // Router / activation.
 inline constexpr double kRoutedScalingFactor = 1.5;
@@ -284,6 +433,38 @@ struct RuntimeConfig {
   int64_t max_context_len = 8192;
 
   MlaGeometry mla;
+
+  // Per-layer token-compression ratio, one entry per layer, straight from the
+  // checkpoint's `compress_ratios`. This is what selects SWA / CSA / HCA for
+  // each layer (see AttentionPathForRatio).
+  //
+  // EMPTY MEANS SWA EVERYWHERE, DELIBERATELY. A checkpoint that does not
+  // publish `compress_ratios` leaves the compressed paths planned but never
+  // dispatched, which is the only non-guessing default: inventing an interleave
+  // would silently change which layers compress and corrupt both the KV budget
+  // and the answer, exactly the failure the MlaGeometry note above refuses to
+  // risk. `--compress-ratios` and a checkpoint config.json both fill it, and
+  // `compress_ratios_provenance` records which.
+  std::vector<int64_t> compress_ratios;
+  GeometryProvenance compress_ratios_provenance = GeometryProvenance::kFamilyDefault;
+
+  // How the mHC residual map B_l is produced; see MhcMixingMode. kPerUsePlan
+  // is the only mode that computes it on this toolkit.
+  MhcMixingMode mhc_mixing_mode = MhcMixingMode::kPerUsePlan;
+
+  // This layer's ratio, with the empty-vector default folded in.
+  int64_t compress_ratio(int64_t layer) const {
+    if (layer < 0 || static_cast<size_t>(layer) >= compress_ratios.size()) return kCompressRatioSwa;
+    return compress_ratios[static_cast<size_t>(layer)];
+  }
+  AttentionPath attention_path(int64_t layer) const { return AttentionPathForRatio(compress_ratio(layer)); }
+  bool any_layer_uses(AttentionPath path) const {
+    for (int64_t layer = 0; layer < kNumLayers; ++layer) {
+      if (attention_path(layer) == path) return true;
+    }
+    return false;
+  }
+
   MoePath moe_path = MoePath::kFused;
   MoeBackend moe_backend = MoeBackend::kStandardAclnn;
   int64_t gating_norm_type = kGatingNormTypePreNormalized;

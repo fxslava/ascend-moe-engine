@@ -133,6 +133,22 @@ ModelConfig ModelConfig::FromJsonText(const std::string& json_text, const std::s
   reader.Integer("index_head_dim", &config.index_head_dim);
   reader.Integer("index_n_heads", &config.index_n_heads);
 
+  // The per-layer compression schedule. A malformed entry is a hard error for
+  // the same reason a wrongly-typed scalar is: this vector decides which
+  // attention path every layer takes, and a silent fallback would dispatch the
+  // wrong operator graph for the rest of the run.
+  if (const moe_json::Value* ratios = root.find("compress_ratios")) {
+    DSV4_REQUIRE(ratios->is_array(), source_name << ": 'compress_ratios' must be an array of numbers");
+    config.compress_ratios.reserve(ratios->size());
+    for (size_t index = 0; index < ratios->size(); ++index) {
+      const moe_json::Value& entry = (*ratios)[index];
+      DSV4_REQUIRE(entry.is_number(),
+                   source_name << ": 'compress_ratios[" << index << "]' must be a number");
+      config.compress_ratios.push_back(entry.as_int());
+    }
+    config.present_keys_.push_back("compress_ratios");
+  }
+
   // The MLA geometry: read, but only into the fields the checkpoint really
   // publishes. The provenance flips to kCheckpointConfig iff any of the four
   // appeared, exactly like the report's wording promises.
@@ -214,6 +230,27 @@ void ModelConfig::Validate() const {
   DSV4_REQUIRE(std::isfinite(routed_scaling_factor) && routed_scaling_factor > 0.0,
                "routed_scaling_factor must be a positive finite number");
   DSV4_REQUIRE(std::isfinite(swiglu_limit) && swiglu_limit > 0.0, "swiglu_limit must be a positive finite number");
+
+  // compress_ratios: present means complete and admissible. The deployed
+  // arch35 compressor refuses any cmpRatio outside {4, 128}
+  // (dsv4_operator_hypotheses_test H3 checks the refusal at 8), so a ratio
+  // this binary would have to pass through is caught here rather than at the
+  // first layer that tries to plan it.
+  if (!compress_ratios.empty()) {
+    DSV4_REQUIRE(static_cast<int64_t>(compress_ratios.size()) == num_hidden_layers,
+                 "compress_ratios has " << compress_ratios.size() << " entries but the model has "
+                                        << num_hidden_layers
+                                        << " layers; one ratio per layer selects that layer's attention path");
+    for (size_t layer = 0; layer < compress_ratios.size(); ++layer) {
+      const int64_t ratio = compress_ratios[layer];
+      DSV4_REQUIRE(ratio == 0 || ratio == kCompressRatioSwa || ratio == kCompressRatioCsa ||
+                       ratio == kCompressRatioHca,
+                   "compress_ratios[" << layer << "] = " << ratio
+                                      << " is not one of {0, 1} (SWA), " << kCompressRatioCsa << " (CSA) or "
+                                      << kCompressRatioHca
+                                      << " (HCA); the deployed compressor kernel admits no other cmpRatio");
+    }
+  }
 }
 
 void ModelConfig::AssertMatchesBinaryContract() const {
@@ -279,7 +316,25 @@ std::string ModelConfig::DescribeSummary(const std::string& source_path) const {
   out << "  routed        top-" << num_experts_per_tok << " of " << n_routed_experts << " + " << n_shared_experts
       << " shared, scaling " << routed_scaling_factor << "\n";
   out << "  attention     " << num_attention_heads << " heads, q_lora " << q_lora_rank << ", indexer top-"
-      << index_topk << " (" << index_n_heads << " x " << index_head_dim << ", NOT applied -- see stage report)\n";
+      << index_topk << " (" << index_n_heads << " x " << index_head_dim << ")\n";
+  if (compress_ratios.empty()) {
+    out << "  compression   compress_ratios NOT published by this checkpoint: all " << num_hidden_layers
+        << " layers run the SWA path.\n"
+           "                The CSA / HCA operator graphs are planned and verified but never dispatched; "
+           "supply\n                compress_ratios (or --compress-ratios) to activate them. No interleave is "
+           "guessed.\n";
+  } else {
+    int64_t swa = 0, csa = 0, hca = 0;
+    for (const int64_t ratio : compress_ratios) {
+      switch (AttentionPathForRatio(ratio)) {
+        case AttentionPath::kCompressedSparse: ++csa; break;
+        case AttentionPath::kHyperCompressed: ++hca; break;
+        default: ++swa; break;
+      }
+    }
+    out << "  compression   compress_ratios from the checkpoint: " << swa << " SWA, " << csa << " CSA (4:1), "
+        << hca << " HCA (128:1) across " << compress_ratios.size() << " layers\n";
+  }
   out << "  mla geometry  kv_lora " << mla.kv_lora_rank << " (" << (contains("kv_lora_rank") ? "checkpoint" : "family default; checkpoint does not publish it")
       << "), qk_rope " << mla.qk_rope_head_dim << " (" << (contains("qk_rope_head_dim") ? "checkpoint" : "family default")
       << ") -> cache row " << mla.kv_row_elements() << "\n";
