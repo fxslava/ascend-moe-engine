@@ -138,6 +138,10 @@ void TestTableResolution() {
   const std::vector<OpId> vendored = {OpId::kMhcPre,
                                       OpId::kMhcSinkhorn,
                                       OpId::kMhcPost,
+                                      OpId::kHcPre,
+                                      OpId::kHcPreInvRms,
+                                      OpId::kHcPreSinkhorn,
+                                      OpId::kHcPost,
                                       OpId::kQuantLightningIndexer,
                                       OpId::kCompressor,
                                       OpId::kVllmQuantLightningIndexer,
@@ -148,7 +152,7 @@ void TestTableResolution() {
     Check(ops.available(id), std::string(OpName(id)) + " resolved from the linked libraries");
   }
   ops.RequireAll(vendored);
-  Check(true, "RequireAll accepts all nine vendored operators");
+  Check(true, "RequireAll accepts all thirteen vendored operators");
 
   // The engine's C prototypes and the linked implementation are the same
   // symbols: OpTable's dlsym address equals the address the declaration in
@@ -162,6 +166,34 @@ void TestTableResolution() {
         "OpTable's mhc_sinkhorn plan is exactly &aclnnMhcSinkhornGetWorkspaceSize");
   Check(reinterpret_cast<void*>(&aclnnMhcPostGetWorkspaceSize) == ops.op(OpId::kMhcPost).plan,
         "OpTable's mhc_post plan is exactly &aclnnMhcPostGetWorkspaceSize");
+  // The fused hc_* family. These must be four distinct entry points, and in
+  // particular aclnnHcPreSinkhorn must NOT alias aclnnMhcSinkhorn: they are
+  // different decompositions of the mHC mapping, not a rename.
+  Check(reinterpret_cast<void*>(&aclnnHcPreGetWorkspaceSize) == ops.op(OpId::kHcPre).plan,
+        "OpTable's hc_pre plan is exactly &aclnnHcPreGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnHcPre) == ops.op(OpId::kHcPre).launch,
+        "OpTable's hc_pre launch is exactly &aclnnHcPre");
+  Check(reinterpret_cast<void*>(&aclnnHcPreInvRmsGetWorkspaceSize) == ops.op(OpId::kHcPreInvRms).plan,
+        "OpTable's hc_pre_inv_rms plan is exactly &aclnnHcPreInvRmsGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnHcPreInvRms) == ops.op(OpId::kHcPreInvRms).launch,
+        "OpTable's hc_pre_inv_rms launch is exactly &aclnnHcPreInvRms");
+  Check(reinterpret_cast<void*>(&aclnnHcPreSinkhornGetWorkspaceSize) == ops.op(OpId::kHcPreSinkhorn).plan,
+        "OpTable's hc_pre_sinkhorn plan is exactly &aclnnHcPreSinkhornGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnHcPreSinkhorn) == ops.op(OpId::kHcPreSinkhorn).launch,
+        "OpTable's hc_pre_sinkhorn launch is exactly &aclnnHcPreSinkhorn");
+  Check(reinterpret_cast<void*>(&aclnnHcPostGetWorkspaceSize) == ops.op(OpId::kHcPost).plan,
+        "OpTable's hc_post plan is exactly &aclnnHcPostGetWorkspaceSize");
+  Check(reinterpret_cast<void*>(&aclnnHcPost) == ops.op(OpId::kHcPost).launch,
+        "OpTable's hc_post launch is exactly &aclnnHcPost");
+  Check(ops.op(OpId::kHcPreSinkhorn).plan != ops.op(OpId::kMhcSinkhorn).plan,
+        "hc_pre_sinkhorn and mhc_sinkhorn are distinct entry points (a fusion, not a rename)");
+  Check(ops.op(OpId::kHcPre).plan != ops.op(OpId::kMhcPre).plan &&
+            ops.op(OpId::kHcPost).plan != ops.op(OpId::kMhcPost).plan,
+        "the two mHC families' pre and post stages resolve to different entry points");
+  Check(ops.op(OpId::kHcPre).plan != ops.op(OpId::kHcPreSinkhorn).plan &&
+            ops.op(OpId::kHcPre).plan != ops.op(OpId::kHcPreInvRms).plan,
+        "the fused hc_pre is a distinct entry point from both staged-path operators");
+
   Check(reinterpret_cast<void*>(&aclnnQuantLightningIndexerGetWorkspaceSize) == ops.op(OpId::kQuantLightningIndexer).plan,
         "OpTable's quant_lightning_indexer plan is exactly &aclnnQuantLightningIndexerGetWorkspaceSize");
   Check(reinterpret_cast<void*>(&aclnnCompressorGetWorkspaceSize) == ops.op(OpId::kCompressor).plan,
@@ -194,7 +226,7 @@ void TestTableResolution() {
       inventory_lists_all = false;
     }
   }
-  Check(inventory_lists_all, "the inventory lists all nine vendored operators");
+  Check(inventory_lists_all, "the inventory lists all thirteen vendored operators");
   for (OpId id : vendored) {
     Check(!ops.op(id).provider.empty(), std::string(OpName(id)) + " names its provider (" + ops.op(id).provider + ")");
   }
@@ -331,6 +363,232 @@ void TestMhcChain() {
 
   for (aclTensor* tensor : {x, phi, alpha, bias, gamma, h_in, h_post, h_res, sink_in, sink_out, strided_out, post_x,
                             post_hout, post_out}) {
+    aclDestroyTensor(tensor);
+  }
+  device.DestroyStream(stream);
+  mock::MockUnregisterSpan(arena);
+}
+
+// ---------------------------------------------------------------------------
+// 2b. The fused hc_* mHC family, alongside the mhc_* chain above
+// ---------------------------------------------------------------------------
+//
+// The same mHC mapping, decomposed the vllm-ascend way. What this section is
+// really for is the structural claim: the fused form has no in-place Sinkhorn
+// tensor, so unlike mhc_sinkhorn it has nothing to elide -- the hazard counter
+// AND the elision counter both have to stay put across all four operators,
+// where mhc_sinkhorn necessarily moves the elision counter.
+
+void TestFusedHcFamily() {
+  Section("vendored fused mHC family: hc_pre / hc_pre_inv_rms / hc_pre_sinkhorn / hc_post");
+  mock::MockResetAllocatorForTest();
+  SimulatedDeviceOps device(16ull << 20);
+  OpTable ops;
+
+  const uintptr_t arena = mock::MockDeviceMalloc(16ull << 20);
+  size_t cursor = 0;
+  const auto next = [&](size_t bytes) {
+    cursor += (bytes + 63) & ~size_t(63);
+    return reinterpret_cast<void*>(arena + cursor);
+  };
+
+  DeviceStream stream = device.CreateStream();
+
+  // The hc_* family takes x as [bs, hc, d] (or [b, s, hc, d]); the engine's
+  // decode stream maps on as bs = T.
+  aclTensor* x = MakeTensor({kTokens, kNhc, kHiddenSize}, ACL_BF16, next(kTokens * kNhc * kHiddenSize * 2));
+  aclTensor* hc_fn =
+      MakeTensor({kMixRows, kNhc * kHiddenSize}, ACL_FLOAT32, next(kMixRows * kNhc * kHiddenSize * 4));
+  aclTensor* hc_scale = MakeTensor({3}, ACL_FLOAT32, next(3 * 4));
+  aclTensor* hc_base = MakeTensor({kMixRows}, ACL_FLOAT32, next(kMixRows * 4));
+  aclTensor* y = MakeTensor({kTokens, kHiddenSize}, ACL_BF16, next(kTokens * kHiddenSize * 2));
+  aclTensor* post = MakeTensor({kTokens, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * 4));
+  aclTensor* comb_frag = MakeTensor({kTokens, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
+
+  // The ledger is read once up front: nothing the fused family does may move
+  // either counter.
+  const int hazards_before = mock::MockVendorSelfCopyHazards();
+  const int elisions_before = mock::MockSinkhornSelfCopyElisions();
+  const int ref_plans_before = mock::MockRefOutputPlans();
+
+  // -- hc_pre: the whole prologue in ONE launch -------------------------------
+  aclOpExecutor* executor = nullptr;
+  uint64_t ws = PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &executor, x, hc_fn, hc_scale, hc_base, kNhc, 20, 1e-6,
+                                         1e-6, y, post, comb_frag);
+  Check(ws > 0, "hc_pre planned a non-empty workspace over the DSV4 geometry");
+  StaticOpSlot pre_slot;
+  pre_slot.Adopt(OpId::kHcPre, "vendor/hc_pre", ws, executor);
+  Check(pre_slot.planned() && pre_slot.workspace_size() == ws,
+        "hc_pre's executor adopted and made repeatable (aclSetAclOpExecutorRepeatable)");
+  void* workspace = ws > 0 ? device.DeviceMalloc(ws) : nullptr;
+  pre_slot.Launch(ops, workspace, stream);
+  Check(true, "hc_pre launch enqueued on the mock stream");
+
+  aclOpExecutor* executor2 = nullptr;
+  const uint64_t ws_again = PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &executor2, x, hc_fn, hc_scale, hc_base,
+                                                    kNhc, 20, 1e-6, 1e-6, y, post, comb_frag);
+  Check(ws_again == ws, "re-planning hc_pre returns the same deterministic workspace size");
+  aclDestroyAclOpExecutor(executor2);
+
+  // Two full launch cycles on the ONE plan, re-binding a different slot each
+  // time: the IR capture order is {x, hcFn, hcScale, hcBase, y, post,
+  // combFrag}, so slot 0 is x and slot 4 is y.
+  uint64_t mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  pre_slot.SetAddress(0, x, AsMockTensor(x)->device_addr);
+  pre_slot.Launch(ops, workspace, stream);
+  pre_slot.SetAddress(4, y, AsMockTensor(y)->device_addr);
+  pre_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "hc_pre relaunches twice after aclSetTensorAddr on its x and y slots (no slot-map mismatch)");
+  pre_slot.Reset();
+
+  // hc_mult is fixed at 4 on 950PR and the iteration count carries the same
+  // [1, 100] bound the mhc_sinkhorn path has.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &bad, x, hc_fn, hc_scale, hc_base, 6, 20, 1e-6, 1e-6, y, post,
+                             comb_frag);
+  }, "hc_pre with hc_mult 6 (only 4 is a DSV4-Flash configuration)");
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &bad, x, hc_fn, hc_scale, hc_base, kNhc, 0, 1e-6, 1e-6, y, post,
+                             comb_frag);
+  }, "hc_pre with hc_sinkhorn_iters 0 (below the [1, 100] bound)");
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &bad, x, hc_fn, hc_scale, hc_base, kNhc, 101, 1e-6, 1e-6, y, post,
+                             comb_frag);
+  }, "hc_pre with hc_sinkhorn_iters 101 (above the [1, 100] bound)");
+  // hcFn is [n^2+2n, n*d]; handing it hc_base's [24] would be a silent
+  // misread of 1.5 MB of weights.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPrePlanFn>(ops, OpId::kHcPre, &bad, x, hc_base, hc_scale, hc_base, kNhc, 20, 1e-6, 1e-6, y, post,
+                             comb_frag);
+  }, "hc_pre with a [24] hcFn where [24, n*d] is required");
+
+  // -- hc_pre_inv_rms: the staged path's prologue -----------------------------
+  // rsqrt drops x's last two axes and keeps a trailing 1.
+  aclTensor* rsqrt = MakeTensor({kTokens, 1}, ACL_FLOAT32, next(kTokens * 4));
+  ws = PlanAclnnOp<HcPreInvRmsPlanFn>(ops, OpId::kHcPreInvRms, &executor, x, 1e-6, rsqrt);
+  Check(ws > 0, "hc_pre_inv_rms planned a non-empty workspace");
+  StaticOpSlot rms_slot;
+  rms_slot.Adopt(OpId::kHcPreInvRms, "vendor/hc_pre_inv_rms", ws, executor);
+  Check(rms_slot.planned(), "hc_pre_inv_rms's executor adopted (aclSetAclOpExecutorRepeatable)");
+  rms_slot.Launch(ops, workspace, stream);
+  // IR order {x, y}: slot 1 is the rsqrt output.
+  mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  rms_slot.SetAddress(1, rsqrt, AsMockTensor(rsqrt)->device_addr);
+  rms_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "hc_pre_inv_rms relaunches after aclSetTensorAddr on its rsqrt slot");
+  rms_slot.Reset();
+
+  // The trailing 1 is the contract: a [T] or [T, 4] rsqrt would make
+  // hc_pre_sinkhorn read the normalizer off the wrong stride.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPreInvRmsPlanFn>(ops, OpId::kHcPreInvRms, &bad, x, 1e-6, post);
+  }, "hc_pre_inv_rms with a [T, 4] output where [T, 1] is required");
+
+  // -- hc_pre_sinkhorn: the mixing projection fused with the normalization ----
+  // `mixes` is the [T, 24] product the engine forms with aclnnMatmul, standing
+  // in for upstream's at::linear(x.flatten(-2), hcFn).
+  aclTensor* mixes = MakeTensor({kTokens, kMixRows}, ACL_FLOAT32, next(kTokens * kMixRows * 4));
+  ws = PlanAclnnOp<HcPreSinkhornPlanFn>(ops, OpId::kHcPreSinkhorn, &executor, mixes, rsqrt, hc_scale, hc_base, x,
+                                        kNhc, 20, 1e-6, y, post, comb_frag);
+  Check(ws > 0, "hc_pre_sinkhorn planned a non-empty workspace over the DSV4 geometry");
+  StaticOpSlot sink_slot;
+  sink_slot.Adopt(OpId::kHcPreSinkhorn, "vendor/hc_pre_sinkhorn", ws, executor);
+  Check(sink_slot.planned() && sink_slot.workspace_size() == ws,
+        "hc_pre_sinkhorn's executor adopted and made repeatable");
+  sink_slot.Launch(ops, workspace, stream);
+
+  // Two launch cycles with a re-bind each: IR order is {mixes, rsqrt, hcScale,
+  // hcBase, x, y, post, combFrag}, so slot 1 is rsqrt (the per-token input the
+  // decode loop actually re-points) and slot 5 is y.
+  mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  sink_slot.SetAddress(1, rsqrt, AsMockTensor(rsqrt)->device_addr);
+  sink_slot.Launch(ops, workspace, stream);
+  sink_slot.SetAddress(5, y, AsMockTensor(y)->device_addr);
+  sink_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "hc_pre_sinkhorn relaunches twice after aclSetTensorAddr on its rsqrt and y slots");
+  sink_slot.Reset();
+
+  // Unlike mhc_sinkhorn there is no output that aliases an input here, so a
+  // contiguous output is NOT a special case -- the elision counter stays put.
+  Check(mock::MockSinkhornSelfCopyElisions() == elisions_before,
+        "hc_pre_sinkhorn with contiguous outputs elides nothing: the fused form has no in-place "
+        "Sinkhorn tensor to copy onto itself");
+
+  // mixes must carry the n^2+2n row count; hc_base's [24] happens to match it,
+  // so the check that bites is the rank/leading-axis one.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPreSinkhornPlanFn>(ops, OpId::kHcPreSinkhorn, &bad, post, rsqrt, hc_scale, hc_base, x, kNhc, 20,
+                                     1e-6, y, post, comb_frag);
+  }, "hc_pre_sinkhorn with a [T, 4] mixes where [T, 24] is required");
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPreSinkhornPlanFn>(ops, OpId::kHcPreSinkhorn, &bad, mixes, post, hc_scale, hc_base, x, kNhc, 20,
+                                     1e-6, y, post, comb_frag);
+  }, "hc_pre_sinkhorn with a [T, 4] rsqrt where [T, 1] is required");
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPreSinkhornPlanFn>(ops, OpId::kHcPreSinkhorn, &bad, mixes, rsqrt, hc_scale, hc_base, x, kNhc, 20,
+                                     1e-6, y, post, post);
+  }, "hc_pre_sinkhorn with a [T, 4] comb_frag where [T, 4, 4] is required");
+
+  // -- hc_post: the BSHD residual combine ------------------------------------
+  // HcPost takes x as [b, s, d], not the [T, N, D] of MhcPost; a TND decode
+  // stream maps on as b = T, s = 1. Getting that wrong is the easiest mistake
+  // to make when the two families sit side by side, so it is pinned here.
+  aclTensor* post_x = MakeTensor({kTokens, 1, kHiddenSize}, ACL_BF16, next(kTokens * kHiddenSize * 2));
+  aclTensor* residual =
+      MakeTensor({kTokens, 1, kNhc, kHiddenSize}, ACL_BF16, next(kTokens * kNhc * kHiddenSize * 2));
+  aclTensor* post_bshd = MakeTensor({kTokens, 1, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * 4));
+  aclTensor* comb_bshd = MakeTensor({kTokens, 1, kNhc, kNhc}, ACL_FLOAT32, next(kTokens * kNhc * kNhc * 4));
+  aclTensor* post_out =
+      MakeTensor({kTokens, 1, kNhc, kHiddenSize}, ACL_BF16, next(kTokens * kNhc * kHiddenSize * 2));
+  ws = PlanAclnnOp<HcPostPlanFn>(ops, OpId::kHcPost, &executor, post_x, residual, post_bshd, comb_bshd, post_out);
+  Check(ws > 0, "hc_post planned a non-empty workspace over the BSHD geometry");
+  StaticOpSlot post_slot;
+  post_slot.Adopt(OpId::kHcPost, "vendor/hc_post", ws, executor);
+  Check(post_slot.planned(), "hc_post's executor adopted (aclSetAclOpExecutorRepeatable)");
+  post_slot.Launch(ops, workspace, stream);
+  // IR order {x, residual, post, comb, y}: slot 4 is the output.
+  mismatches_before = mock::MockMemoryStatistics().slot_map_mismatches;
+  post_slot.SetAddress(4, post_out, AsMockTensor(post_out)->device_addr);
+  post_slot.Launch(ops, workspace, stream);
+  post_slot.SetAddress(1, residual, AsMockTensor(residual)->device_addr);
+  post_slot.Launch(ops, workspace, stream);
+  Check(mock::MockMemoryStatistics().slot_map_mismatches == mismatches_before,
+        "hc_post relaunches twice after aclSetTensorAddr on its output and residual slots");
+  post_slot.Reset();
+
+  // The TND shape MhcPost takes is exactly what HcPost must refuse.
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPostPlanFn>(ops, OpId::kHcPost, &bad, x, residual, post_bshd, comb_bshd, post_out);
+  }, "hc_post with MhcPost's [T, N, D] x where BSHD [b, s, d] is required");
+  CheckRefuses([&] {
+    aclOpExecutor* bad = nullptr;
+    PlanAclnnOp<HcPostPlanFn>(ops, OpId::kHcPost, &bad, post_x, residual, post_bshd, comb_bshd, post_x);
+  }, "hc_post with a [b, s, d] output where residual's [b, s, hc, d] is required");
+
+  // -- the whole point: neither ledger counter moved --------------------------
+  Check(mock::MockVendorSelfCopyHazards() == hazards_before,
+        "no operator in the fused hc_* family plans a same-address ViewCopy");
+  Check(mock::MockSinkhornSelfCopyElisions() == elisions_before,
+        "the fused family needs no elision at all -- it removes the manual-4.31 Sinkhorn hazard by "
+        "construction, where mhc_sinkhorn can only work around it");
+  Check(mock::MockRefOutputPlans() == ref_plans_before,
+        "the fused family records no REF-output plan: none of the four hc_* OpDefs has an output whose "
+        "name matches an input");
+
+  for (aclTensor* tensor : {x, hc_fn, hc_scale, hc_base, y, post, comb_frag, rsqrt, mixes, post_x, residual,
+                            post_bshd, comb_bshd, post_out}) {
     aclDestroyTensor(tensor);
   }
   device.DestroyStream(stream);
@@ -831,7 +1089,11 @@ void TestRepeatabilityInvariant() {
   // distinct executor-owned tensor (so its ViewCopy has src != dst), or has a
   // REF output and stages no copy, or -- for the patched mhc_sinkhorn -- elides
   // the copy when the kernel already wrote the caller tensor. So after
-  // exercising all nine above, the hazard ledger must be empty.
+  // exercising all thirteen above, the hazard ledger must be empty.
+  //
+  // The fused hc_* family is the fourth case and the only one that needs no
+  // rule: it has neither a REF output nor an in-place Sinkhorn tensor, so there
+  // is nothing for a copy stage to alias.
   Check(mock::MockVendorSelfCopyHazards() == 0,
         "no vendored operator planned a same-address ViewCopy across the whole suite");
   Check(mock::MockSinkhornSelfCopyElisions() > 0,
@@ -849,6 +1111,7 @@ int RunMain() {
   try {
     TestTableResolution();
     TestMhcChain();
+    TestFusedHcFamily();
     TestQuantLightningIndexer();
     TestCompressor();
     TestSharedKvPath();

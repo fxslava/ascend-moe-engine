@@ -86,6 +86,18 @@ const OpDeclaration kDeclarations[] = {
      false},
     {OpId::kMhcSinkhorn, "aclnnMhcSinkhorn", "vendored mHC doubly-stochastic normalization of hRes", true, false},
     {OpId::kMhcPost, "aclnnMhcPost", "vendored mHC residual combine after the attention/MLP layer", true, false},
+    // The vllm-ascend decomposition of the same mHC mapping, alongside the
+    // trio above rather than replacing it. HcPre fuses the whole prologue into
+    // one launch; HcPreInvRms + aclnnMatmul + HcPreSinkhorn is the staged
+    // alternative, and HcPost is the BSHD residual combine.
+    {OpId::kHcPre, "aclnnHcPre",
+     "vendored fused mHC prologue (inv-RMS + mixing projection + Sinkhorn in one launch)", true, false},
+    {OpId::kHcPreInvRms, "aclnnHcPreInvRms",
+     "vendored reciprocal-RMS prologue; the only producer of HcPreSinkhorn's rsqrt input", true, false},
+    {OpId::kHcPreSinkhorn, "aclnnHcPreSinkhorn",
+     "vendored mixing projection fused with the Sinkhorn normalization (no in-place Sinkhorn tensor)", true,
+     false},
+    {OpId::kHcPost, "aclnnHcPost", "vendored mHC residual combine, BSHD layout, no attributes", true, false},
     {OpId::kQuantLightningIndexer, "aclnnQuantLightningIndexer",
      "vendored sparse-flash indexer top-k + query/key quantization", true, false},
     {OpId::kCompressor, "aclnnCompressor",

@@ -101,6 +101,15 @@ enum class OpId {
   kMhcPre,
   kMhcSinkhorn,
   kMhcPost,
+  // The vllm-ascend decomposition of the SAME mHC mapping, kept alongside the
+  // ops-transformer trio rather than replacing it: kHcPre is the fully fused
+  // prologue (reciprocal RMS + mixing projection + Sinkhorn in one launch),
+  // kHcPreInvRms + a mixing GEMM + kHcPreSinkhorn is the staged alternative,
+  // and kHcPost is the BSHD residual combine.
+  kHcPre,
+  kHcPreInvRms,
+  kHcPreSinkhorn,
+  kHcPost,
   kQuantLightningIndexer,
   kCompressor,
   kVllmQuantLightningIndexer,
@@ -967,6 +976,141 @@ using MhcSinkhornPlanFn = int (*)(const aclTensor* x, float eps, int64_t num_ite
 using MhcPostPlanFn = int (*)(const aclTensor* x, const aclTensor* h_res, const aclTensor* h_out,
                               const aclTensor* h_post, aclTensor* out, uint64_t* workspace_size,
                               aclOpExecutor** executor);
+
+// ---------------------------------------------------------------------------
+// Vendored vllm-ascend arch35 fused mHC family (third_party/ops_dsv4/mhc/hc_*).
+// Prototypes: include/moe/ops/aclnn_dsv4_vendor_ops.h, transcribed from the
+// vendored op_host/op_api/aclnn_hc_*.h headers.
+//
+// The SAME mHC mapping as the mhc_* trio above, decomposed differently. The
+// decisive structural difference is the Sinkhorn stage: MhcSinkhorn is a
+// standalone in-place operator, which is what creates the manual-4.31
+// same-address ViewCopy its wrapper has to elide. In this family the
+// normalization is interior to HcPre / HcPreSinkhorn and never becomes a
+// tensor at the aclnn layer, so the hazard cannot arise at all.
+//
+// Launch counts per layer, for choosing between them:
+//   HcPre -> HcPost                                      2
+//   MhcPre -> MhcSinkhorn -> MhcPost                      3
+//   HcPreInvRms -> Matmul -> HcPreSinkhorn -> HcPost       4
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief aclnnHcPre: plan phase (vendored arch35 custom op).
+ * @details The fully fused mHC prologue: the reciprocal-RMS reduction, the
+ * mixing projection x.flatten(-2) @ hc_fn^T and the Sinkhorn normalization in
+ * ONE launch, from the stacked states and the mixing weights alone.
+ * @note Engine geometry: hc = hc_mult = 4, d = 4096 (7168 also accepted), BF16
+ * x/y, FP32 weights and state. x is [bs,hc,d] or [b,s,hc,d].
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @warning Attr order: hc_eps precedes norm_eps, the reverse of the order the
+ * two epsilons appear in aclnnMhcPre.
+ * @param[in] x Stacked mHC states, [bs,hc,d] or [b,s,hc,d], BF16.
+ * @param[in] hc_fn Mixing weights, [hc_mult^2+2*hc_mult, hc*d] = [24,16384], FP32.
+ * @param[in] hc_scale Gain triple [3], FP32.
+ * @param[in] hc_base Mixing bias [24], FP32.
+ * @param[in] hc_mult Hyper-connection multiplicity; 4 only.
+ * @param[in] hc_sinkhorn_iters Sinkhorn iteration count, in [1, 100].
+ * @param[in] hc_eps Sinkhorn division guard.
+ * @param[in] norm_eps RMS normalization epsilon.
+ * @param[out] y Layer input, [bs,d] or [b,s,d], BF16.
+ * @param[out] post Post-mapping state, [bs,hc_mult] or [b,s,hc_mult], FP32.
+ * @param[out] comb_frag Combine fragment, [..,hc_mult,hc_mult], FP32.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using HcPrePlanFn = int (*)(const aclTensor* x, const aclTensor* hc_fn, const aclTensor* hc_scale,
+                            const aclTensor* hc_base, int64_t hc_mult, int64_t hc_sinkhorn_iters, double hc_eps,
+                            double norm_eps, const aclTensor* y, const aclTensor* post, const aclTensor* comb_frag,
+                            uint64_t* workspace_size, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnHcPreInvRms: plan phase (vendored arch35 custom op).
+ * @details The prologue of the staged path: reduce the stacked states over
+ * their last two axes into rsqrt = 1 / sqrt(mean(x^2) + epsilon), the FP32
+ * normalizer aclnnHcPreSinkhorn consumes.
+ * @note Required, not optional: it is the only producer of HcPreSinkhorn's
+ * `rsqrt` input, and this engine is torch-free so there is no fallback.
+ * The output drops the two reduced axes and keeps a trailing 1.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Stacked mHC states, FP32/FP16/BF16.
+ * @param[in] epsilon Variance floor.
+ * @param[out] y Reciprocal RMS scale, [bs,1] or [b,s,1], FP32.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using HcPreInvRmsPlanFn = int (*)(const aclTensor* x, double epsilon, const aclTensor* y, uint64_t* workspace_size,
+                                  aclOpExecutor** executor);
+
+/**
+ * @brief aclnnHcPreSinkhorn: plan phase (vendored arch35 custom op).
+ * @details The mixing projection fused with the Sinkhorn normalization: takes
+ * the already-projected `mixes`, the `rsqrt` scale from aclnnHcPreInvRms, the
+ * gain triple, the bias and the stacked states, and emits the layer input, the
+ * post-mapping state and the combine fragment in one launch.
+ * @note NOT a rename of aclnnMhcSinkhorn. MhcSinkhorn normalizes a square
+ * matrix in place, and that in-place shape is exactly what makes its trailing
+ * ViewCopy a potential manual-4.31 same-address self-copy. Here the
+ * normalization never leaves the kernel, so no such copy stage exists --
+ * the hazard is removed by construction, not elided.
+ * @note `mixes` is at::linear(x.flatten(-2), hc_fn) upstream; the engine
+ * produces the same [.., 24] rows with aclnnMatmul under its [K, N] contract.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] mixes Mixing state, [..,hc_mult^2+2*hc_mult] = [..,24], FP32.
+ * @param[in] rsqrt Reciprocal RMS scale, [..,1], FP32.
+ * @param[in] hc_scale Gain triple [3], FP32.
+ * @param[in] hc_base Mixing bias [24], FP32.
+ * @param[in] x Stacked mHC states, [bs,hc,d] or [b,s,hc,d], BF16.
+ * @param[in] hc_mult Hyper-connection multiplicity; 4 only.
+ * @param[in] hc_sinkhorn_iters Sinkhorn iteration count, in [1, 100].
+ * @param[in] hc_eps Sinkhorn division guard.
+ * @param[out] y Layer input, [bs,d] or [b,s,d], BF16.
+ * @param[out] post Post-mapping state, [..,hc_mult], FP32.
+ * @param[out] comb_frag Combine fragment, [..,hc_mult,hc_mult], FP32.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using HcPreSinkhornPlanFn = int (*)(const aclTensor* mixes, const aclTensor* rsqrt, const aclTensor* hc_scale,
+                                    const aclTensor* hc_base, const aclTensor* x, int64_t hc_mult,
+                                    int64_t hc_sinkhorn_iters, double hc_eps, const aclTensor* y,
+                                    const aclTensor* post, const aclTensor* comb_frag, uint64_t* workspace_size,
+                                    aclOpExecutor** executor);
+
+/**
+ * @brief aclnnHcPost: plan phase (vendored arch35 custom op).
+ * @details y = comb^T @ residual + x * post -- the same residual combine as
+ * aclnnMhcPost, carried in the BSHD layout instead of TND, and with no
+ * attributes at all.
+ * @note Layout: x [b,s,d], residual/y [b,s,hc,d], post [b,s,hc], comb
+ * [b,s,hc,hc]. A TND token stream maps on as b = T, s = 1.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract
+ * apply. Resolves from libcust_opapi.so, not the toolkit's libopapi.
+ * @param[in] x Layer output, [b,s,d], FP32/FP16/BF16.
+ * @param[in] residual Residual streams, [b,s,hc,d], dtype of x.
+ * @param[in] post Post-mapping state, [b,s,hc], FP32/FP16/BF16.
+ * @param[in] comb Combine matrix, [b,s,hc,hc], dtype of post.
+ * @param[out] y Next layer input, shape and dtype of residual.
+ * @param[out] workspace_size Returned device workspace bytes.
+ * @param[out] executor Returned execution plan.
+ * @return 0 (ACLNN_SUCCESS); 161001 (NULLPTR); 161002 (INVALID); 361001
+ * (RUNTIME_ERROR).
+ * @see AclnnLaunchFn
+ */
+using HcPostPlanFn = int (*)(const aclTensor* x, const aclTensor* residual, const aclTensor* post,
+                             const aclTensor* comb, const aclTensor* y, uint64_t* workspace_size,
+                             aclOpExecutor** executor);
 
 /**
  * @brief aclnnQuantLightningIndexer: plan phase (vendored arch35 custom op).

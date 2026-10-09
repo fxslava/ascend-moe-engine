@@ -39,7 +39,7 @@
 #
 # TARGETS
 #   ascend_moe_engine            libascend_moe_engine.so -- the engine itself
-#   cust_opapi                   (CANN mode) libcust_opapi.so, the nine
+#   cust_opapi                   (CANN mode) libcust_opapi.so, the thirteen
 #                                vendored arch35 operator entry points (mHC chain,
 #                                both indexers, compressor, shared-KV attention,
 #                                the two cache epilogs)
@@ -280,6 +280,10 @@ else()
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_pre/op_host/op_api"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_sinkhorn/op_host/op_api"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/mhc_post/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/hc_pre/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/hc_pre_inv_rms/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/hc_pre_sinkhorn/op_host/op_api"
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/mhc/hc_post/op_host/op_api"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/quant_lightning_indexer/op_host/op_api"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/compressor/op_host/op_api"
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_dsv4/attention/vllm_quant_lightning_indexer/op_host/op_api"
@@ -311,7 +315,7 @@ endif()
 # the two cache epilogs -- see third_party/ops_dsv4/CMakeLists.txt for which
 # upstream each subtree came from. In a CANN build this produces
 # libcust_opapi.so in the build root and link-loads it into the engine, so
-# OpTable's dlsym(RTLD_DEFAULT, ...) resolves all nine vendored entry-point
+# OpTable's dlsym(RTLD_DEFAULT, ...) resolves all thirteen vendored entry-point
 # pairs. In a mock build the directory contributes nothing: the stubs live in
 # mock/mock_ops.cpp inside libopapi_mock.so.
 add_subdirectory(third_party/ops_dsv4)

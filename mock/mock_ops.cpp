@@ -1137,6 +1137,211 @@ aclnnStatus aclnnMhcPostGetWorkspaceSize(const aclTensor* x, const aclTensor* h_
   return 0;
 }
 
+// -- vendored vllm-ascend arch35 fused mHC family (hc_*) ----------------------
+//
+// The same mHC mapping as the mhc_* trio above, decomposed differently; both
+// families are registered and both are exercised. Geometry transcribed from the
+// vendored wrappers' own checks and from vllm-ascend's
+// check_hc_pre_shape_and_dtype: hc = hc_mult = 4 streams over the 4096-wide
+// hidden state (7168 also accepted upstream), BF16 states, FP32 mixing weights
+// and routing state, Sinkhorn iterations in [1, 100].
+//
+// THE REPEATABILITY LEDGER AND THIS FAMILY
+//   None of the four stubs below calls RecordRefOutputPlan(), and none can
+//   increment g_sinkhorn_selfcopy_elided either. Both omissions are the point:
+//   the hc_* OpDefs declare NO REF parameter (no output name matches an input
+//   name), and the Sinkhorn normalization is interior to HcPre / HcPreSinkhorn
+//   rather than being a standalone in-place operator. So there is no tensor
+//   that is both an input and an output, and no copy stage whose source and
+//   destination could coincide -- the hazard aclnnMhcSinkhorn has to elide does
+//   not arise here at all. The invariant these stubs hold is therefore the
+//   plain one: g_vendor_selfcopy_hazards never moves.
+
+constexpr int64_t kHcMult = 4;                                   // hc_mult, HC_PRE_HC_LIMIT upstream
+constexpr int64_t kHcMixRows = kHcMult * kHcMult + 2 * kHcMult;   // n^2 + 2n = 24, HC_PRE_MIX_HC_LIMIT
+constexpr int64_t kHcScaleElements = 3;                          // HC_SCALE_SIZE upstream
+constexpr int64_t kHiddenExtended = 7168;                        // HC_PRE_D_LIMIT_EXTEND
+
+bool IsHcHidden(int64_t d) { return d == kHidden || d == kHiddenExtended; }
+
+// Every hc_pre / hc_pre_sinkhorn tensor is shaped over the same leading axes as
+// x -- the [bs] or [b, s] prefix left once x's trailing hc and d axes drop.
+bool HcLeadingAxesMatch(const MockAclTensor* tensor, const MockAclTensor* x, size_t leading) {
+  for (size_t index = 0; index < leading; ++index) {
+    if (tensor->dim(static_cast<int>(index)) != x->dim(static_cast<int>(index))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// aclnnHcPre: the whole prologue fused -- inv-RMS, mixing projection through
+// hcFn [24, 16384] and Sinkhorn -- in one launch.
+aclnnStatus aclnnHcPreGetWorkspaceSize(const aclTensor* x, const aclTensor* hc_fn, const aclTensor* hc_scale,
+                                       const aclTensor* hc_base, int64_t hc_mult, int64_t hc_sinkhorn_iters,
+                                       double hc_eps, double norm_eps, const aclTensor* y, const aclTensor* post,
+                                       const aclTensor* comb_frag, uint64_t* workspace_size,
+                                       aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* mfn = AsMockTensor(hc_fn);
+  const MockAclTensor* mscale = AsMockTensor(hc_scale);
+  const MockAclTensor* mbase = AsMockTensor(hc_base);
+  const MockAclTensor* my = AsMockTensor(y);
+  const MockAclTensor* mpost = AsMockTensor(post);
+  const MockAclTensor* mcomb = AsMockTensor(comb_frag);
+  MOCK_REQUIRE(mx != nullptr && mfn != nullptr && mscale != nullptr && mbase != nullptr && my != nullptr &&
+                   mpost != nullptr && mcomb != nullptr,
+               "HcPre: bad tensor handle");
+  MOCK_REQUIRE(hc_mult == kHcMult, "HcPre: hcMult only supports 4, got " + std::to_string(hc_mult));
+  MOCK_REQUIRE(hc_sinkhorn_iters >= 1 && hc_sinkhorn_iters <= 100,
+               "HcPre: hcSinkhornIters must be in [1, 100], got " + std::to_string(hc_sinkhorn_iters));
+  MOCK_REQUIRE(hc_eps > 0.0 && norm_eps > 0.0, "HcPre: hcEps and normEps must be positive");
+  MOCK_REQUIRE(mx->shape.size() == 3 || mx->shape.size() == 4,
+               "HcPre: x must be [bs, hc, d] or [b, s, hc, d], got " + ShapeOf(mx));
+  const size_t rank = mx->shape.size();
+  const size_t leading = rank - 2;
+  const int64_t hc = mx->dim(static_cast<int>(rank) - 2);
+  const int64_t d = mx->dim(static_cast<int>(rank) - 1);
+  MOCK_REQUIRE(hc == hc_mult, "HcPre: x's hc axis must equal hcMult (4), got " + std::to_string(hc));
+  MOCK_REQUIRE(IsHcHidden(d), "HcPre: x's d must be 4096 or 7168, got " + std::to_string(d));
+  MOCK_REQUIRE(mx->dtype == ACL_BF16, "HcPre: x must be BF16");
+  MOCK_REQUIRE(mfn->shape.size() == 2 && mfn->dim(0) == kHcMixRows && mfn->dim(1) == hc * d &&
+                   mfn->dtype == ACL_FLOAT32,
+               "HcPre: hcFn must be [24, hc*d] FP32, got " + ShapeOf(mfn));
+  MOCK_REQUIRE(mscale->elements() == kHcScaleElements && mscale->dtype == ACL_FLOAT32,
+               "HcPre: hcScale must be [3] FP32");
+  MOCK_REQUIRE(mbase->elements() == kHcMixRows && mbase->dtype == ACL_FLOAT32, "HcPre: hcBase must be [24] FP32");
+  MOCK_REQUIRE(my->shape.size() == leading + 1 && my->dim(static_cast<int>(leading)) == d &&
+                   HcLeadingAxesMatch(my, mx, leading) && my->dtype == ACL_BF16,
+               "HcPre: y must carry x's leading axes and a trailing d, BF16, got " + ShapeOf(my));
+  MOCK_REQUIRE(mpost->shape.size() == leading + 1 && mpost->dim(static_cast<int>(leading)) == hc_mult &&
+                   HcLeadingAxesMatch(mpost, mx, leading) && mpost->dtype == ACL_FLOAT32,
+               "HcPre: post must carry x's leading axes and a trailing hcMult, FP32, got " + ShapeOf(mpost));
+  MOCK_REQUIRE(mcomb->shape.size() == leading + 2 && mcomb->dim(static_cast<int>(leading)) == hc_mult &&
+                   mcomb->dim(static_cast<int>(leading) + 1) == hc_mult && HcLeadingAxesMatch(mcomb, mx, leading) &&
+                   mcomb->dtype == ACL_FLOAT32,
+               "HcPre: combFrag must carry x's leading axes and a trailing [hcMult, hcMult], FP32, got " +
+                   ShapeOf(mcomb));
+  // The fused kernel keeps the mixing state and the Sinkhorn matrix internal,
+  // so its workspace carries both where the staged path would materialize them.
+  *workspace_size = Align4k(static_cast<uint64_t>(mx->elements()) * 4) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnHcPre", {x, hc_fn, hc_scale, hc_base, y, post, comb_frag});
+  return 0;
+}
+
+// aclnnHcPreInvRms: rsqrt = 1 / sqrt(mean(x^2) + epsilon) over x's last two
+// axes -- the only producer of HcPreSinkhorn's `rsqrt` input.
+aclnnStatus aclnnHcPreInvRmsGetWorkspaceSize(const aclTensor* x, double epsilon, const aclTensor* y,
+                                             uint64_t* workspace_size, aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* my = AsMockTensor(y);
+  MOCK_REQUIRE(mx != nullptr && my != nullptr, "HcPreInvRms: bad tensor handle");
+  MOCK_REQUIRE(IsFloat(mx), "HcPreInvRms: x must be FP32/FP16/BF16");
+  MOCK_REQUIRE(my->dtype == ACL_FLOAT32, "HcPreInvRms: y must be FP32");
+  MOCK_REQUIRE(epsilon >= 0.0, "HcPreInvRms: epsilon must not be negative");
+  MOCK_REQUIRE(mx->shape.size() >= 2, "HcPreInvRms: x must have at least 2 axes to reduce over, got " + ShapeOf(mx));
+  const size_t leading = mx->shape.size() - 2;
+  MOCK_REQUIRE(my->shape.size() == leading + 1 && my->dim(static_cast<int>(leading)) == 1 &&
+                   HcLeadingAxesMatch(my, mx, leading),
+               "HcPreInvRms: y must carry x's leading axes and a trailing 1, got " + ShapeOf(my));
+  *workspace_size = Align4k(static_cast<uint64_t>(my->elements()) * 4) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnHcPreInvRms", {x, y});
+  return 0;
+}
+
+// aclnnHcPreSinkhorn: the mixing projection fused with the Sinkhorn
+// normalization. Unlike aclnnMhcSinkhorn there is no in-place square matrix
+// here, so no copy stage to elide.
+aclnnStatus aclnnHcPreSinkhornGetWorkspaceSize(const aclTensor* mixes, const aclTensor* rsqrt,
+                                               const aclTensor* hc_scale, const aclTensor* hc_base,
+                                               const aclTensor* x, int64_t hc_mult, int64_t hc_sinkhorn_iters,
+                                               double hc_eps, const aclTensor* y, const aclTensor* post,
+                                               const aclTensor* comb_frag, uint64_t* workspace_size,
+                                               aclOpExecutor** executor) {
+  const MockAclTensor* mmix = AsMockTensor(mixes);
+  const MockAclTensor* mrsqrt = AsMockTensor(rsqrt);
+  const MockAclTensor* mscale = AsMockTensor(hc_scale);
+  const MockAclTensor* mbase = AsMockTensor(hc_base);
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* my = AsMockTensor(y);
+  const MockAclTensor* mpost = AsMockTensor(post);
+  const MockAclTensor* mcomb = AsMockTensor(comb_frag);
+  MOCK_REQUIRE(mmix != nullptr && mrsqrt != nullptr && mscale != nullptr && mbase != nullptr && mx != nullptr &&
+                   my != nullptr && mpost != nullptr && mcomb != nullptr,
+               "HcPreSinkhorn: bad tensor handle");
+  MOCK_REQUIRE(hc_mult == kHcMult, "HcPreSinkhorn: hcMult only supports 4, got " + std::to_string(hc_mult));
+  MOCK_REQUIRE(hc_sinkhorn_iters >= 1 && hc_sinkhorn_iters <= 100,
+               "HcPreSinkhorn: hcSinkhornIters must be in [1, 100], got " + std::to_string(hc_sinkhorn_iters));
+  MOCK_REQUIRE(hc_eps > 0.0, "HcPreSinkhorn: hcEps must be positive");
+  MOCK_REQUIRE(mx->shape.size() == 3 || mx->shape.size() == 4,
+               "HcPreSinkhorn: x must be [bs, hc, d] or [b, s, hc, d], got " + ShapeOf(mx));
+  const size_t rank = mx->shape.size();
+  const size_t leading = rank - 2;
+  const int64_t hc = mx->dim(static_cast<int>(rank) - 2);
+  const int64_t d = mx->dim(static_cast<int>(rank) - 1);
+  MOCK_REQUIRE(hc == hc_mult, "HcPreSinkhorn: x's hc axis must equal hcMult (4), got " + std::to_string(hc));
+  MOCK_REQUIRE(IsHcHidden(d), "HcPreSinkhorn: x's d must be 4096 or 7168, got " + std::to_string(d));
+  MOCK_REQUIRE(mx->dtype == ACL_BF16, "HcPreSinkhorn: x must be BF16");
+  MOCK_REQUIRE(mmix->shape.size() == leading + 1 && mmix->dim(static_cast<int>(leading)) == kHcMixRows &&
+                   HcLeadingAxesMatch(mmix, mx, leading) && mmix->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: mixes must carry x's leading axes and a trailing 24, FP32, got " + ShapeOf(mmix));
+  MOCK_REQUIRE(mrsqrt->shape.size() == leading + 1 && mrsqrt->dim(static_cast<int>(leading)) == 1 &&
+                   HcLeadingAxesMatch(mrsqrt, mx, leading) && mrsqrt->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: rsqrt must carry x's leading axes and a trailing 1, FP32, got " + ShapeOf(mrsqrt));
+  MOCK_REQUIRE(mscale->elements() == kHcScaleElements && mscale->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: hcScale must be [3] FP32");
+  MOCK_REQUIRE(mbase->elements() == kHcMixRows && mbase->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: hcBase must be [24] FP32");
+  MOCK_REQUIRE(my->shape.size() == leading + 1 && my->dim(static_cast<int>(leading)) == d &&
+                   HcLeadingAxesMatch(my, mx, leading) && my->dtype == ACL_BF16,
+               "HcPreSinkhorn: y must carry x's leading axes and a trailing d, BF16, got " + ShapeOf(my));
+  MOCK_REQUIRE(mpost->shape.size() == leading + 1 && mpost->dim(static_cast<int>(leading)) == hc_mult &&
+                   HcLeadingAxesMatch(mpost, mx, leading) && mpost->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: post must carry x's leading axes and a trailing hcMult, FP32, got " + ShapeOf(mpost));
+  MOCK_REQUIRE(mcomb->shape.size() == leading + 2 && mcomb->dim(static_cast<int>(leading)) == hc_mult &&
+                   mcomb->dim(static_cast<int>(leading) + 1) == hc_mult && HcLeadingAxesMatch(mcomb, mx, leading) &&
+                   mcomb->dtype == ACL_FLOAT32,
+               "HcPreSinkhorn: combFrag must carry x's leading axes and a trailing [hcMult, hcMult], FP32, got " +
+                   ShapeOf(mcomb));
+  *workspace_size = Align4k(static_cast<uint64_t>(mmix->elements()) * 4) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnHcPreSinkhorn", {mixes, rsqrt, hc_scale, hc_base, x, y, post, comb_frag});
+  return 0;
+}
+
+// aclnnHcPost: y = comb^T @ residual + x * post, BSHD layout, no attributes.
+aclnnStatus aclnnHcPostGetWorkspaceSize(const aclTensor* x, const aclTensor* residual, const aclTensor* post,
+                                        const aclTensor* comb, const aclTensor* y, uint64_t* workspace_size,
+                                        aclOpExecutor** executor) {
+  const MockAclTensor* mx = AsMockTensor(x);
+  const MockAclTensor* mres = AsMockTensor(residual);
+  const MockAclTensor* mpost = AsMockTensor(post);
+  const MockAclTensor* mcomb = AsMockTensor(comb);
+  const MockAclTensor* my = AsMockTensor(y);
+  MOCK_REQUIRE(mx != nullptr && mres != nullptr && mpost != nullptr && mcomb != nullptr && my != nullptr,
+               "HcPost: bad tensor handle");
+  MOCK_REQUIRE(mx->shape.size() == 3, "HcPost: x must be [b, s, d] (BSHD, not TND), got " + ShapeOf(mx));
+  MOCK_REQUIRE(IsFloat(mx), "HcPost: x must be FP32/FP16/BF16");
+  const int64_t batch = mx->dim(0);
+  const int64_t sequence = mx->dim(1);
+  const int64_t d = mx->dim(2);
+  MOCK_REQUIRE(batch > 0 && sequence > 0 && IsHcHidden(d),
+               "HcPost: x must be [b, s, d] with d 4096 or 7168, got " + ShapeOf(mx));
+  MOCK_REQUIRE(mres->shape.size() == 4 && mres->dim(0) == batch && mres->dim(1) == sequence &&
+                   mres->dim(2) == kHcMult && mres->dim(3) == d && mres->dtype == mx->dtype,
+               "HcPost: residual must be [b, s, 4, d] in the dtype of x, got " + ShapeOf(mres));
+  MOCK_REQUIRE(mpost->shape.size() == 3 && mpost->dim(0) == batch && mpost->dim(1) == sequence &&
+                   mpost->dim(2) == kHcMult && IsFloat(mpost),
+               "HcPost: post must be [b, s, 4], got " + ShapeOf(mpost));
+  MOCK_REQUIRE(mcomb->shape.size() == 4 && mcomb->dim(0) == batch && mcomb->dim(1) == sequence &&
+                   mcomb->dim(2) == kHcMult && mcomb->dim(3) == kHcMult && mcomb->dtype == mpost->dtype,
+               "HcPost: comb must be [b, s, 4, 4] in the dtype of post, got " + ShapeOf(mcomb));
+  MOCK_REQUIRE(my->same_shape_as(*mres) && my->dtype == mres->dtype,
+               "HcPost: y must match residual [b, s, 4, d]");
+  *workspace_size = Align4k(static_cast<uint64_t>(mx->elements()) * 2) + kWorkspaceMhcBase;
+  *executor = NewExecutor("aclnnHcPost", {x, residual, post, comb, y});
+  return 0;
+}
+
 // aclnnQuantLightningIndexer: sparse top-k selection + query/key quantization.
 aclnnStatus aclnnQuantLightningIndexerGetWorkspaceSize(
     const aclTensor* query, const aclTensor* key, const aclTensor* weights, const aclTensor* query_dequant_scale,
@@ -1712,6 +1917,10 @@ MOCK_NOOP_LAUNCH(aclnnGroupedMatmulFinalizeRoutingV3)
 MOCK_NOOP_LAUNCH(aclnnMhcPre)
 MOCK_NOOP_LAUNCH(aclnnMhcSinkhorn)
 MOCK_NOOP_LAUNCH(aclnnMhcPost)
+MOCK_NOOP_LAUNCH(aclnnHcPre)
+MOCK_NOOP_LAUNCH(aclnnHcPreInvRms)
+MOCK_NOOP_LAUNCH(aclnnHcPreSinkhorn)
+MOCK_NOOP_LAUNCH(aclnnHcPost)
 MOCK_NOOP_LAUNCH(aclnnQuantLightningIndexer)
 MOCK_NOOP_LAUNCH(aclnnCompressor)
 MOCK_NOOP_LAUNCH(aclnnVllmQuantLightningIndexer)

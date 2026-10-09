@@ -19,21 +19,33 @@
 # PROVENANCE
 #   mhc/{mhc_pre,mhc_sinkhorn,mhc_post}       ops-transformer
 #   attention/quant_lightning_indexer         ops-transformer
+#   mhc/{hc_pre,hc_pre_inv_rms,
+#        hc_pre_sinkhorn,hc_post}             vllm-ascend csrc/moe
 #   attention/compressor                      vllm-ascend csrc/attention
 #   attention/vllm_quant_lightning_indexer    vllm-ascend csrc/attention
 #   attention/kv_quant_sparse_attn_sharedkv   vllm-ascend csrc/attention
 #   attention/kv_compress_epilog              vllm-ascend csrc/attention
 #   attention/indexer_compress_epilog_v2      vllm-ascend csrc/attention
 #
+#   THE TWO mHC FAMILIES COEXIST ON PURPOSE. mhc_* is the ops-transformer
+#   decomposition (MhcPre -> MhcSinkhorn -> MhcPost), where the Sinkhorn
+#   normalization is a separate in-place operator. hc_* is the vllm-ascend
+#   decomposition of the same mapping, in which HcPre fuses the whole prologue
+#   -- reciprocal RMS, mixing projection and Sinkhorn -- into one launch, and
+#   HcPreInvRms + a mixing GEMM + HcPreSinkhorn is the staged alternative.
+#   Neither family's Sinkhorn stage exists as a standalone tensor in the hc_*
+#   form, which is what removes the manual-4.31 self-copy hazard that
+#   mhc_sinkhorn can only work around. See README.md for which to prefer.
+#
 #   The four ops-transformer trees arrive with a hand-written op_api layer.
-#   The five vllm-ascend trees do NOT: upstream reaches them through torch-npu
+#   The nine vllm-ascend trees do NOT: upstream reaches them through torch-npu
 #   EXEC_NPU_CMD, which dlsyms the aclnn entry points that the CANN custom-op
 #   package generator emits from op_host/*_def.cpp. This repository is
 #   torch-free, so their op_host/op_api/ layer is written here by hand against
 #   the operator definitions, in the same shape as the ops-transformer ones.
 #
 # WHAT IS BUILT HERE
-#   cust_opapi -> libcust_opapi.so : the nine operators' op_api layer (the
+#   cust_opapi -> libcust_opapi.so : the thirteen operators' op_api layer (the
 #   aclnn*GetWorkspaceSize / aclnn* C entry points and their l0op builders),
 #   compiled against the CANN toolkit the engine itself is built against and
 #   linked as a DT_NEEDED library of libascend_moe_engine.so. OpTable resolves
@@ -57,7 +69,7 @@
 #
 # MOCK MODE
 #   With ENABLE_MOCK_RUNTIME=ON this directory contributes nothing: the mock
-#   stubs for all nine entry points live in the engine's mock/ tree and fold
+#   stubs for all thirteen entry points live in the engine's mock/ tree and fold
 #   into libopapi_mock.so, which keeps the whole symbolic build free of any
 #   CANN dependency.
 
@@ -96,6 +108,10 @@ set(DSV4_VENDOR_OPS
   "mhc/mhc_pre|mhc_pre"
   "mhc/mhc_sinkhorn|mhc_sinkhorn"
   "mhc/mhc_post|mhc_post"
+  "mhc/hc_pre|hc_pre"
+  "mhc/hc_pre_inv_rms|hc_pre_inv_rms"
+  "mhc/hc_pre_sinkhorn|hc_pre_sinkhorn"
+  "mhc/hc_post|hc_post"
   "attention/quant_lightning_indexer|quant_lightning_indexer"
   "attention/compressor|compressor"
   "attention/vllm_quant_lightning_indexer|vllm_quant_lightning_indexer"

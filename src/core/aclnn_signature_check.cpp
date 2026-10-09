@@ -81,6 +81,10 @@
 #include "aclnn_mhc_pre.h"
 #include "aclnn_mhc_sinkhorn.h"
 #include "aclnn_mhc_post.h"
+#include "aclnn_hc_pre.h"
+#include "aclnn_hc_pre_inv_rms.h"
+#include "aclnn_hc_pre_sinkhorn.h"
+#include "aclnn_hc_post.h"
 #include "aclnn_quant_lightning_indexer.h"
 #include "aclnn_compressor.h"
 #include "aclnn_vllm_quant_lightning_indexer.h"
@@ -151,6 +155,10 @@ DSV4_ASSERT_SIGNATURE(aclnnFusedInferAttentionScoreV5, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPreGetWorkspaceSize, MhcPrePlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhornGetWorkspaceSize, MhcSinkhornPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPostGetWorkspaceSize, MhcPostPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPreGetWorkspaceSize, HcPrePlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPreInvRmsGetWorkspaceSize, HcPreInvRmsPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPreSinkhornGetWorkspaceSize, HcPreSinkhornPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPostGetWorkspaceSize, HcPostPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexerGetWorkspaceSize, QuantLightningIndexerPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnCompressorGetWorkspaceSize, CompressorPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnVllmQuantLightningIndexerGetWorkspaceSize, VllmQuantLightningIndexerPlanFn);
@@ -160,6 +168,10 @@ DSV4_ASSERT_SIGNATURE(aclnnIndexerCompressEpilogV2GetWorkspaceSize, IndexerCompr
 DSV4_ASSERT_SIGNATURE(aclnnMhcPre, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcSinkhorn, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnMhcPost, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPre, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPreInvRms, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPreSinkhorn, AclnnLaunchFn);
+DSV4_ASSERT_SIGNATURE(aclnnHcPost, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnQuantLightningIndexer, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnCompressor, AclnnLaunchFn);
 DSV4_ASSERT_SIGNATURE(aclnnVllmQuantLightningIndexer, AclnnLaunchFn);
