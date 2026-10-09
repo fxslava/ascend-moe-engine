@@ -1,0 +1,269 @@
+dsv4_operator_hypotheses_test -- build verification
+generated 2026-10-09 10:48:20 UTC from a clean tree, fresh build directories
+
+================ TOOLCHAIN ================
+Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+cmake version 3.22.1
+c++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+CANN toolkit: /usr/local/Ascend/cann-9.2.0-beta.2
+base commit:  8f7e694 (feat/consolidate-dsv4-operators)
+              the test suite and this log are the working-tree additions verified on top of it
+
+================ [1/2] HOST MOCK TARGET ================
+cmake -S . -B <dir> -DENABLE_MOCK_RUNTIME=ON -DDSV4_WERROR=ON
+  configure exit: 0
+  full build exit: 0
+  error:/warning: lines in the whole build:
+    (none)
+  the test target:
+    [ 80%] Building CXX object tests/CMakeFiles/dsv4_operator_hypotheses_test.dir/dsv4_operator_hypotheses_test.cpp.o
+    [ 97%] Linking CXX executable dsv4_operator_hypotheses_test
+    [100%] Built target dsv4_operator_hypotheses_test
+
+================ [2/2] CANN TARGET -- ascend950 / arch35 ================
+cmake -S . -B <dir> -DENABLE_MOCK_RUNTIME=OFF -DDSV4_WERROR=ON
+  configure exit: 0
+    -- ascend-moe-engine: CANN /usr/local/Ascend/cann-9.2.0-beta.2, libraries /usr/local/Ascend/cann-9.2.0-beta.2/x86_64-linux/lib64
+    -- ops_dsv4: Ascend C kernels not compiled (DSV4_VENDOR_ASCENDC_KERNELS=OFF); host library libcust_opapi.so only
+  full build exit: 0
+  error: lines in the whole build:
+    (none)
+  warning: lines attributable to the test translation unit:
+    (none)
+  the test target:
+    [ 88%] Building CXX object tests/CMakeFiles/dsv4_operator_hypotheses_test.dir/dsv4_operator_hypotheses_test.cpp.o
+    [100%] Linking CXX executable dsv4_operator_hypotheses_test
+    [100%] Built target dsv4_operator_hypotheses_test
+
+================ BINARIES ================
+-rwxr-xr-x 1 dmin dmin 150648 Oct  9 13:49 /tmp/fcann_1791542900/tests/dsv4_operator_hypotheses_test
+-rwxr-xr-x 1 dmin dmin 151104 Oct  9 13:48 /tmp/fmock_1791542900/tests/dsv4_operator_hypotheses_test
+/tmp/fcann_1791542900/tests/dsv4_operator_hypotheses_test: ELF 64-bit LSB pie executable, x86-64, version 1 (GNU/Linux), dynamically linked, interpreter /lib64/
+
+================ CANN LINKAGE CONTRACT ================
+undefined symbols (ldd -r):      0
+libpython / libtorch in closure: 0
+operator libraries resolved:
+    	libascendcl.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libascendcl.so (0x00007b3704f49000)
+    	libnnopbase.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libnnopbase.so (0x00007b3704400000)
+    	libopapi.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libopapi.so (0x00007b3701600000)
+    	libopapi_nn.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libopapi_nn.so (0x00007b3700400000)
+    	libopapi_math.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libopapi_math.so (0x00007b36ff600000)
+    	libopapi_transformer.so => /usr/local/Ascend/cann-9.2.0-beta.2/lib64/libopapi_transformer.so (0x00007b36fea00000)
+    	libcust_opapi.so => /tmp/fcann_1791542900/tests/../libcust_opapi.so (0x00007b3700340000)
+vendored entry points the probe resolves by dlsym:
+    exported  aclnnMhcPreGetWorkspaceSize
+    exported  aclnnMhcPre
+    exported  aclnnMhcSinkhornGetWorkspaceSize
+    exported  aclnnMhcSinkhorn
+    exported  aclnnMhcPostGetWorkspaceSize
+    exported  aclnnMhcPost
+    exported  aclnnCompressorGetWorkspaceSize
+    exported  aclnnCompressor
+    exported  aclnnVllmQuantLightningIndexerGetWorkspaceSize
+    exported  aclnnVllmQuantLightningIndexer
+
+================ CTEST ================
+-- mock configuration:
+    4/6 Test #4: mock_failure_teardown ............   Passed    0.29 sec
+        Start 5: vendor_ops_table_test
+    5/6 Test #5: vendor_ops_table_test ............   Passed    0.00 sec
+        Start 6: dsv4_operator_hypotheses_test
+    6/6 Test #6: dsv4_operator_hypotheses_test ....   Passed    0.00 sec
+    
+    100% tests passed, 0 tests failed out of 6
+    
+    Label Time Summary:
+    mock    =   0.90 sec*proc (6 tests)
+    
+    Total Test time (real) =   0.90 sec
+-- CANN configuration on this host (no NPU attached; SKIP is the contract):
+    100% tests passed, 0 tests failed out of 4
+    
+    Label Time Summary:
+    npu    =   1.01 sec*proc (4 tests)
+    
+    Total Test time (real) =   1.01 sec
+    
+    The following tests did not run:
+    	  1 - npu_backend_probe (Skipped)
+    	  2 - npu_weights_ingest_probe (Skipped)
+    	  3 - npu_e2e_single_token (Skipped)
+    	  4 - dsv4_operator_hypotheses_test (Skipped)
+
+================ MOCK-TARGET RUN (full output) ================
+dsv4_operator_hypotheses_test -- targeted contract verification of the vendored
+arch35 (Ascend 950PR) DeepSeek-V4-Flash operators at the engine's own geometry.
+backend: symbolic (ENABLE_MOCK_RUNTIME=ON) -- plan-phase hypotheses only; device memory is
+an interval registry, so the numeric sections hold the host reference instead.
+device backend: simulated
+
+=============================================================
+HYPOTHESIS 1 -- aclnnMhcPre / aclnnMhcPost accept the DSV4 residual-stream geometry
+=============================================================
+  assumed: residual stream x = [1, 1, 4, 4096] BF16 (BSND) or [1, 4, 4096] BF16 (TND)
+  assumed: projection weight phi = [24, 16384] FP32 (n^2+2n rows by n*D columns)
+  assumed: gain alpha = [3] FP32, mixing bias = [24] FP32
+  assumed: mhc_pre emits hIn [1, 4096], hPost [1, 4], hRes [1, 4, 4] on the TND spelling
+  assumed: mhc_post consumes x, hRes, hOut, hPost and writes x_next at the shape of x
+  assumed: the plan phase performs NO host synchronization and NO DMA
+
+-- H1.1 the TND decode spelling, one token --
+  [ ok ] phi's [n^2+2n, n*D] really is [24, 16384] at n_hc = 4, D = 4096
+  [ ok ] the hIn / hPost / hRes triple is allocated at [1, 4096] / [1, 4] / [1, 4, 4]
+  [ ok ] mhc_pre accepts x [1, 4, 4096] BF16 with phi [24, 16384] FP32
+  [ ok ] the mhc_pre plan phase issued no host synchronization and no DMA (every staging tensor comes from executor->AllocTensor)
+  [ ok ] mhc_pre reports a non-empty device workspace for this geometry
+  [ ok ] the mhc_pre executor is retained and made repeatable (aclSetAclOpExecutorRepeatable)
+  [ ok ] mhc_pre launched on the retained executor
+  [ ok ] re-planning mhc_pre returns the same workspace size (a static arena can be sized once)
+
+-- H1.2 the BSND spelling x = [1, 1, 4, 4096] --
+  [ ok ] mhc_pre accepts the rank-4 BSND stream [1, 1, 4, 4096] BF16
+  [note] the BSND outputs are rank-4/rank-3 throughout -- hIn [1, 1, 4096], hPost [1, 1, 4], hRes [1, 1, 4, 4]. The brief pairs a rank-4 x with the TND output shapes hIn [1, 4096], hPost [1, 4], hRes [1, 4, 4]; that pairing is one layout short and H1.4 shows what the operator does with it.
+
+-- H1.3 mhc_post: x_next = (hRes)^T x + hOut * hPost --
+  [ ok ] mhc_post accepts the TND set x [1, 4, 4096] BF16, hRes [1, 4, 4] FP32, hOut [1, 4096] BF16, hPost [1, 4] FP32
+  [ ok ] mhc_post writes x_next at the shape of x, [1, 4, 4096] BF16
+  [ ok ] the mhc_post executor is retained and made repeatable
+  [ ok ] mhc_post launched on the retained executor
+  [ ok ] mhc_post accepts the all-rank-4 BSND set (hRes [1, 1, 4, 4], hOut [1, 1, 4096], hPost [1, 1, 4])
+
+-- H1.4 the brief's mixed-layout mhc_post set --
+  assumed: the brief's mhc_post call is x [1, 1, 4, 4096], hOut [1, 4096], hRes [1, 4, 4], hPost [1, 4]
+  [ ok ] refused as predicted: a rank-4 BSND x paired with the rank-3/rank-2 TND companions
+  [note] the vendored wrapper ties the ranks together (aclnn_mhc_post.cpp CheckInputOutDims): a rank-4 x demands rank-4 hRes and out plus rank-3 hOut and hPost. The runtime must pick ONE spelling per call -- the TND set of H1.1/H1.3 is the one this engine's decode stream already carries.
+
+-- H1.5 pre -> sinkhorn -> post over one shared hRes --
+  [ ok ] the three-stage mHC chain plans no same-address ViewCopy, so every stage's executor is reusable
+
+=============================================================
+HYPOTHESIS 2 -- aclnnMhcSinkhorn: Birkhoff invariant and the CANN 4.31 aliasing guard
+=============================================================
+  assumed: input hRes = [1, 4, 4] FP32, numIters = 20, eps = 1e-6
+  assumed: output B = [1, 4, 4] FP32, doubly stochastic: row and column sums 1.0 +/- 1e-5
+  assumed: a NON-CONTIGUOUS output view keeps the executor configurable with aclSetAclOpExecutorRepeatable (the stated workaround for the 4.31 ViewCopy(src, src) hazard)
+  [ ok ] the probe's second output really is a non-contiguous view (strides [128, 16, 2] against contiguous [16, 4, 1])
+
+-- H2.1 the non-contiguous output view --
+  [ ok ] mhc_sinkhorn accepts a non-contiguous [1, 4, 4] FP32 output view
+  [ ok ] aclSetAclOpExecutorRepeatable succeeded on the non-contiguous plan -- the executor is reusable
+  [ ok ] the non-contiguous plan relaunched after aclSetTensorAddr on its output slot
+  [ ok ] no same-address ViewCopy was planned: Contiguous() allocated a distinct temp, so src != dst
+  [ ok ] nothing was elided on this path -- the trailing ViewCopy is real work, one extra launch per token
+
+-- H2.2 the contiguous output (the case the DSV4 patch targets) --
+  [ ok ] mhc_sinkhorn accepts a contiguous [1, 4, 4] FP32 output
+  [ ok ] aclSetAclOpExecutorRepeatable succeeded on the CONTIGUOUS plan too -- the DSV4 patch holds
+  [ ok ] the contiguous plan relaunched after aclSetTensorAddr on its output slot
+  [ ok ] no same-address ViewCopy on the contiguous path either -- the patch elides it instead of issuing it
+  [ ok ] the patched wrapper elided exactly one trailing ViewCopy (kernelOut == output)
+  [note] BOTH output forms yield a repeatable executor, so a non-contiguous view is not required as a workaround -- and it is the more expensive of the two, since it reinstates the ViewCopy the patch removes. The runtime should bind a CONTIGUOUS Sinkhorn output.
+
+-- H2.3 numIters and eps bounds --
+  [ ok ] refused as predicted: numIters = 0, below the [1, 100] bound
+  [ ok ] refused as predicted: numIters = 101, above the [1, 100] bound
+  [note] numIters = 20 sits inside the bound, so the engine's Sinkhorn attribute is admissible.
+
+-- H2.4 the Birkhoff invariant over the result --
+  [ ok ] the seed is NOT already doubly stochastic (worst deviation 4.875e+00), so the invariant below is a real measurement
+  [ ok ] 20 alternating row/column normalizations at eps = 1e-6 reach row and column sums of 1.0 within 1e-5 (worst deviation 1.028e-06) -- the invariant is reachable at these attributes
+  [SKIP] the operator's own output cannot be read back in this build (symbolic device memory); the check above fixes the reference and the tolerance the on-device run applies
+
+=============================================================
+HYPOTHESIS 3 -- aclnnCompressor expresses a sequence-ring cadence at cmpRatio 4 (CSA)
+=============================================================
+  assumed: compression ratio 4 (CSA), compressed width D = 512, ropeHeadDim = 64
+  assumed: the pooling state is a paged ring buffer [blocks, blockSize, D] FP32, updated in place (REF)
+  assumed: steps t = 0, 1, 2 emit nothing and write nothing into the compressed KV destination
+  assumed: step t = 3 closes the window and emits exactly one compressed entry
+  [note] API mapping: the compressed rows land in cmpKvOut (the brief's 'kvCacheRef' destination) and the recurrent ring lives in stateCacheRef, the one REF parameter. 'emitted' is cmpKvOut's row count, which the wrapper pins at T / cmpRatio.
+  [ ok ] the ring state is the paged 3-D FP32 buffer the wrapper requires, [4, 8, 512] FP32
+  [ ok ] normWeight is 1-D at the compressed width, so cmpKvOut channels are normWeight[0] * coff = 512
+  [note] the brief's [1, 1, 1024] KV and score tensors map onto the compressor's wkv/wgate projection pair over the 4096-wide residual stream; 1024 = 2 * kv_lora_rank is the gate-side width, not a tensor this operator takes directly.
+
+-- H3 step t = 0: window 1 token(s), cmpKvOut rows 0 --
+  [ ok ] the compressor accepts the step-0 window x [1, 4096] BF16
+  [ ok ] step 0 emits nothing: cmpKvOut is [0, 512] BF16
+  [ ok ] the incomplete window plans a ZERO-byte workspace -- the wrapper's empty-tensor early return fired, so no kernel and no ViewCopy were staged
+  [ ok ] no in-place update of stateCacheRef was staged either: the step is a total no-op, so nothing can reach the compressed KV destination
+  [ ok ] the step-0 plan adopted (repeatable) and launched
+
+-- H3 step t = 1: window 2 token(s), cmpKvOut rows 0 --
+  [ ok ] the compressor accepts the step-1 window x [2, 4096] BF16
+  [ ok ] step 1 emits nothing: cmpKvOut is [0, 512] BF16
+  [ ok ] the incomplete window plans a ZERO-byte workspace -- the wrapper's empty-tensor early return fired, so no kernel and no ViewCopy were staged
+  [ ok ] no in-place update of stateCacheRef was staged either: the step is a total no-op, so nothing can reach the compressed KV destination
+  [ ok ] the step-1 plan adopted (repeatable) and launched
+
+-- H3 step t = 2: window 3 token(s), cmpKvOut rows 0 --
+  [ ok ] the compressor accepts the step-2 window x [3, 4096] BF16
+  [ ok ] step 2 emits nothing: cmpKvOut is [0, 512] BF16
+  [ ok ] the incomplete window plans a ZERO-byte workspace -- the wrapper's empty-tensor early return fired, so no kernel and no ViewCopy were staged
+  [ ok ] no in-place update of stateCacheRef was staged either: the step is a total no-op, so nothing can reach the compressed KV destination
+  [ ok ] the step-2 plan adopted (repeatable) and launched
+
+-- H3 step t = 3: window 4 token(s), cmpKvOut rows 1 --
+  [ ok ] the compressor accepts the step-3 window x [4, 4096] BF16
+  [ ok ] step 3 emits exactly one row: cmpKvOut is [1, 512] BF16
+  [ ok ] the window-closing step plans a non-empty workspace -- real work is staged
+  [ ok ] exactly one REF plan was recorded: stateCacheRef is updated in place, with no copy stage to alias
+  [ ok ] the emitting step plans no same-address ViewCopy, so its executor stays reusable across windows
+  [ ok ] the emitted entry is 1024 bytes (D = 512 x BF16)
+  [note] UNRESOLVED: the brief states a 604-byte compressed entry. No (width, dtype) pair in this geometry produces that: BF16 x 512 = 1024, FP8 x 512 = 512, FP8 x (512 + 64 rope) = 576. The on-device run should settle which width the deployed kernel writes; this probe asserts the derived one.
+  [ ok ] the step-3 plan adopted (repeatable) and launched
+
+-- H3 the cadence over one full window --
+  [ ok ] four steps at cmpRatio 4 emit exactly one compressed entry in total (1)
+
+-- H3 the ring's addressing attribute --
+  [note] GUARDED on this backend: a stateCacheStrideDim0 one element past the ring buffer's own axis-0 stride (4096) was refused before it could reach a kernel
+  [ ok ] refused as predicted: cmpRatio = 8, outside the deployed {4 (CSA), 128 (HCA)} pair
+
+=============================================================
+HYPOTHESIS 4 -- aclnnVllmQuantLightningIndexer: top-512 indices, INT32, inside the sequence
+=============================================================
+  assumed: query = [1, 1, 64, 128] FP8 E4M3 (BSND, D = 128, N1 = 64)
+  assumed: key cache = FP8 E4M3 in the PA_BSND paged layout, N2 = 1, D = 128
+  assumed: top-k = 512
+  assumed: sparseIndicesOut = [1, 1, 1, 512] INT32
+  assumed: every index returned is >= 0 and strictly inside the valid sequence slots
+  [ ok ] the query really is [1, 1, 64, 128] FP8 E4M3
+  [ ok ] the output really is [1, 1, 1, 512] INT32 at top-k = 512
+  [ ok ] top-k = 512 sits inside the operator's [1, 2048] bound
+  [note] the operator also admits HiFloat8 for query/key; E4M3 is the path this engine selects on 950PR, and ACL_HIFLOAT8 is the single-token change if that choice is revisited.
+
+-- H4.1 the plan over the paged FP8 key stream --
+  [ ok ] the indexer accepts query [1, 1, 64, 128] FP8_E4M3 over a PA_BSND FP8 E4M3 key cache
+  [ ok ] the indexer reports a non-empty device workspace for this geometry
+  [ ok ] the indexer's executor is retained and made repeatable
+  [ ok ] the indexer launched on the retained executor
+
+-- H4.2 the attributes that address the paged stream --
+  [note] GUARDED on this backend: a key stride one element past the paged key's own axis-0 stride (16384) was refused before it could reach a kernel
+  [ ok ] refused as predicted: top-k = 2049, past the operator's [1, 2048] bound
+
+-- H4.3 the index range the attention core will gather at --
+  [ ok ] the range checker rejects an out-of-bounds slot (index[511] = 1024 is outside [0, 1024))
+  [SKIP] the operator's own indices cannot be read back in this build (symbolic device memory); the checker above fixes the bound [0, 1024) the on-device run applies to sparseIndicesOut
+
+=============================================================
+66 checks, 0 failures, 2 skipped
+every decidable hypothesis holds at the DSV4-Flash geometry.
+=============================================================
+run exit: 0
+
+================ CANN-TARGET RUN on this host ================
+dsv4_operator_hypotheses_test -- targeted contract verification of the vendored
+arch35 (Ascend 950PR) DeepSeek-V4-Flash operators at the engine's own geometry.
+[ SKIP ] Physical Ascend NPU not detected
+run exit: 0
+
+================ VERDICT ================
+host mock target  (-DENABLE_MOCK_RUNTIME=ON  -DDSV4_WERROR=ON): build exit 0
+CANN arch35 target(-DENABLE_MOCK_RUNTIME=OFF -DDSV4_WERROR=ON): build exit 0
+
+To run the hypotheses on the 950PR:
+  source <toolkit>/set_env.sh
+  cmake -S . -B build_cann -DENABLE_MOCK_RUNTIME=OFF -DDSV4_WERROR=ON && cmake --build build_cann -j
+  ./build_cann/tests/dsv4_operator_hypotheses_test --require-device

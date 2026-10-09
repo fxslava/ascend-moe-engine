@@ -171,6 +171,50 @@ std::string ShapeOf(const MockAclTensor* tensor) {
   return text.str();
 }
 
+// ---------------------------------------------------------------------------
+// Leading-axis layout helpers (the mHC family's TND / BSND duality)
+// ---------------------------------------------------------------------------
+//
+// Every vendored mHC wrapper admits x in two layouts -- TND, rank 3
+// ([T, n, D]) and BSND, rank 4 ([B, S, n, D]) -- and every other tensor in the
+// call carries the SAME leading axes with its own trailing suffix. So the
+// checks express a shape as "the leading prefix of x, plus this suffix": hIn
+// is lead + [D], hPost is lead + [n], hRes is lead + [n, n], invRms is lead
+// alone. That keeps one rule for both layouts instead of two parallel sets of
+// dimension indices.
+
+// `x`'s leading axes: everything but the trailing `trailing` dimensions.
+std::vector<int64_t> LeadingAxes(const MockAclTensor* tensor, size_t trailing) {
+  return std::vector<int64_t>(tensor->shape.begin(), tensor->shape.end() - trailing);
+}
+
+std::vector<int64_t> WithSuffix(const std::vector<int64_t>& lead, std::initializer_list<int64_t> suffix) {
+  std::vector<int64_t> shape = lead;
+  shape.insert(shape.end(), suffix.begin(), suffix.end());
+  return shape;
+}
+
+int64_t ProductOf(const std::vector<int64_t>& axes) {
+  int64_t product = 1;
+  for (int64_t axis : axes) {
+    product *= axis;
+  }
+  return product;
+}
+
+std::string ShapeText(const std::vector<int64_t>& axes) {
+  std::ostringstream text;
+  text << "[";
+  for (size_t index = 0; index < axes.size(); ++index) {
+    if (index != 0) {
+      text << ", ";
+    }
+    text << axes[index];
+  }
+  text << "]";
+  return text.str();
+}
+
 // The five DeepSeek-V4 Flash contract validators -----------------------------
 
 // aclnnSoftplus / aclnnSqrt: scores over [tokens, 256], float dtype.
@@ -1023,10 +1067,15 @@ aclnnStatus aclnnMhcPreGetWorkspaceSize(const aclTensor* x, const aclTensor* phi
   MOCK_REQUIRE(mx != nullptr && mp != nullptr && ma != nullptr && mb != nullptr && min != nullptr &&
                    mpost != nullptr && mres != nullptr,
                "MhcPre: bad tensor handle");
-  MOCK_REQUIRE(mx->shape.size() == 3 && mx->dim(1) == kNhcStreams && mx->dim(2) == kHidden,
-               "MhcPre: x must be [T, 4, 4096] (TND stacked mHC states), got " + ShapeOf(mx));
+  // TND ([T, n, D]) and BSND ([B, S, n, D]) are both admitted, exactly as the
+  // vendored wrapper's CheckInputOutDims does.
+  MOCK_REQUIRE(mx->shape.size() == 3 || mx->shape.size() == 4,
+               "MhcPre: x must be TND [T, 4, 4096] or BSND [B, S, 4, 4096], got " + ShapeOf(mx));
+  MOCK_REQUIRE(mx->dim(mx->shape.size() - 2) == kNhcStreams && mx->dim(mx->shape.size() - 1) == kHidden,
+               "MhcPre: the trailing axes of x must be [4, 4096] (n_hc, hidden), got " + ShapeOf(mx));
   MOCK_REQUIRE(mx->dtype == ACL_BF16 || mx->dtype == ACL_FLOAT16, "MhcPre: x must be BF16/FP16");
-  const int64_t tokens = mx->dim(0);
+  const std::vector<int64_t> lead = LeadingAxes(mx, 2);
+  const int64_t tokens = ProductOf(lead);
   const int64_t mix_rows = kNhcStreams * kNhcStreams + 2 * kNhcStreams;  // n^2 + 2n = 24
   MOCK_REQUIRE(mp->shape.size() == 2 && mp->dim(0) == mix_rows &&
                    mp->dim(1) == kNhcStreams * kHidden,
@@ -1038,26 +1087,27 @@ aclnnStatus aclnnMhcPreGetWorkspaceSize(const aclTensor* x, const aclTensor* phi
                                   mg->dtype == ACL_FLOAT32),
                "MhcPre: gammaOptional must be [4, 4096] FP32 or null");
   MOCK_REQUIRE(norm_eps > 0.0 && hc_eps > 0.0, "MhcPre: normEps and hcEps must be positive");
-  MOCK_REQUIRE(min->shape.size() == 2 && min->dim(0) == tokens && min->dim(1) == kHidden &&
-                   min->dtype == mx->dtype,
-               "MhcPre: hIn must be [T, 4096] in the dtype of x");
-  MOCK_REQUIRE(mpost->shape.size() == 2 && mpost->dim(0) == tokens && mpost->dim(1) == kNhcStreams &&
-                   mpost->dtype == ACL_FLOAT32,
-               "MhcPre: hPost must be [T, 4] FP32");
-  MOCK_REQUIRE(mres->shape.size() == 3 && mres->dim(0) == tokens && mres->dim(1) == kNhcStreams &&
-                   mres->dim(2) == kNhcStreams && mres->dtype == ACL_FLOAT32,
-               "MhcPre: hRes must be [T, 4, 4] FP32");
+  // Each output carries x's leading axes; only the suffix differs. hIn drops
+  // the stream axis, hPost replaces (n, D) by n, hRes keeps the square
+  // (n, n) mapping.
+  MOCK_REQUIRE(min->shape == WithSuffix(lead, {kHidden}) && min->dtype == mx->dtype,
+               "MhcPre: hIn must be " + ShapeText(WithSuffix(lead, {kHidden})) + " in the dtype of x, got " +
+                   ShapeOf(min));
+  MOCK_REQUIRE(mpost->shape == WithSuffix(lead, {kNhcStreams}) && mpost->dtype == ACL_FLOAT32,
+               "MhcPre: hPost must be " + ShapeText(WithSuffix(lead, {kNhcStreams})) + " FP32, got " +
+                   ShapeOf(mpost));
+  MOCK_REQUIRE(mres->shape == WithSuffix(lead, {kNhcStreams, kNhcStreams}) && mres->dtype == ACL_FLOAT32,
+               "MhcPre: hRes must be " + ShapeText(WithSuffix(lead, {kNhcStreams, kNhcStreams})) + " FP32, got " +
+                   ShapeOf(mres));
   const MockAclTensor* mrms = inv_rms_optional == nullptr ? nullptr : AsMockTensor(inv_rms_optional);
   const MockAclTensor* mmix = h_mix_optional == nullptr ? nullptr : AsMockTensor(h_mix_optional);
   const MockAclTensor* mpre = h_pre_optional == nullptr ? nullptr : AsMockTensor(h_pre_optional);
-  MOCK_REQUIRE(mrms == nullptr || (mrms->elements() == tokens && mrms->dtype == ACL_FLOAT32),
-               "MhcPre: invRmsOptional must be [T] FP32 or null");
-  MOCK_REQUIRE(mmix == nullptr || (mmix->shape.size() == 2 && mmix->dim(0) == tokens &&
-                                   mmix->dim(1) == mix_rows && mmix->dtype == ACL_FLOAT32),
-               "MhcPre: hMixOptional must be [T, 24] FP32 or null");
-  MOCK_REQUIRE(mpre == nullptr || (mpre->shape.size() == 2 && mpre->dim(0) == tokens &&
-                                   mpre->dim(1) == kNhcStreams && mpre->dtype == ACL_FLOAT32),
-               "MhcPre: hPreOptional must be [T, 4] FP32 or null");
+  MOCK_REQUIRE(mrms == nullptr || (mrms->shape == lead && mrms->dtype == ACL_FLOAT32),
+               "MhcPre: invRmsOptional must be " + ShapeText(lead) + " FP32 or null");
+  MOCK_REQUIRE(mmix == nullptr || (mmix->shape == WithSuffix(lead, {mix_rows}) && mmix->dtype == ACL_FLOAT32),
+               "MhcPre: hMixOptional must be " + ShapeText(WithSuffix(lead, {mix_rows})) + " FP32 or null");
+  MOCK_REQUIRE(mpre == nullptr || (mpre->shape == WithSuffix(lead, {kNhcStreams}) && mpre->dtype == ACL_FLOAT32),
+               "MhcPre: hPreOptional must be " + ShapeText(WithSuffix(lead, {kNhcStreams})) + " FP32 or null");
   *workspace_size = Align4k(static_cast<uint64_t>(tokens) * static_cast<uint64_t>(kNhcStreams) *
                             static_cast<uint64_t>(kHidden) * 4) + kWorkspaceMhcBase;
   *executor = NewExecutor("aclnnMhcPre",
@@ -1073,9 +1123,10 @@ aclnnStatus aclnnMhcSinkhornGetWorkspaceSize(const aclTensor* x, float eps, int6
   const MockAclTensor* mx = AsMockTensor(x);
   const MockAclTensor* my = AsMockTensor(output);
   MOCK_REQUIRE(mx != nullptr && my != nullptr, "MhcSinkhorn: bad tensor handle");
-  MOCK_REQUIRE(mx->shape.size() == 3, "MhcSinkhorn: x must be [T, n, n] (TND), got " + ShapeOf(mx));
-  const int64_t n0 = mx->dim(1);
-  const int64_t n1 = mx->dim(2);
+  MOCK_REQUIRE(mx->shape.size() == 3 || mx->shape.size() == 4,
+               "MhcSinkhorn: x must be TND [T, n, n] or BSND [B, S, n, n], got " + ShapeOf(mx));
+  const int64_t n0 = mx->dim(mx->shape.size() - 2);
+  const int64_t n1 = mx->dim(mx->shape.size() - 1);
   MOCK_REQUIRE(n0 == n1 && (n0 == 4 || n0 == 6 || n0 == 8),
                "MhcSinkhorn: n must be square and one of {4, 6, 8}, got " + ShapeOf(mx));
   MOCK_REQUIRE(mx->dtype == ACL_FLOAT32, "MhcSinkhorn: x must be FP32");
@@ -1102,7 +1153,7 @@ aclnnStatus aclnnMhcSinkhornGetWorkspaceSize(const aclTensor* x, float eps, int6
   if (IsContiguous(my)) {
     ++g_sinkhorn_selfcopy_elided;
   }
-  *workspace_size = Align4k(static_cast<uint64_t>(mx->dim(0)) * static_cast<uint64_t>(n0) *
+  *workspace_size = Align4k(static_cast<uint64_t>(ProductOf(LeadingAxes(mx, 2))) * static_cast<uint64_t>(n0) *
                             static_cast<uint64_t>(n1) * 4) + kWorkspaceMhcBase;
   *executor = NewExecutor("aclnnMhcSinkhorn", {x, output, norm_out, sum_out});
   return 0;
@@ -1119,19 +1170,27 @@ aclnnStatus aclnnMhcPostGetWorkspaceSize(const aclTensor* x, const aclTensor* h_
   const MockAclTensor* my = AsMockTensor(out);
   MOCK_REQUIRE(mx != nullptr && mr != nullptr && mo != nullptr && mp != nullptr && my != nullptr,
                "MhcPost: bad tensor handle");
-  MOCK_REQUIRE(mx->shape.size() == 3 && mx->dim(1) == kNhcStreams && mx->dim(2) == kHidden,
-               "MhcPost: x must be [T, 4, 4096] (TND), got " + ShapeOf(mx));
+  // As in MhcPre, TND and BSND are both admitted -- but the vendored wrapper
+  // ties the ranks TOGETHER: a rank-4 x demands rank-4 hRes/out and rank-3
+  // hOut/hPost, and a rank-3 x demands rank-3 hRes/out and rank-2 hOut/hPost.
+  // Mixing the two layouts inside one call is rejected.
+  MOCK_REQUIRE(mx->shape.size() == 3 || mx->shape.size() == 4,
+               "MhcPost: x must be TND [T, 4, 4096] or BSND [B, S, 4, 4096], got " + ShapeOf(mx));
+  MOCK_REQUIRE(mx->dim(mx->shape.size() - 2) == kNhcStreams && mx->dim(mx->shape.size() - 1) == kHidden,
+               "MhcPost: the trailing axes of x must be [4, 4096] (n_hc, hidden), got " + ShapeOf(mx));
   MOCK_REQUIRE(mx->dtype == ACL_BF16 || mx->dtype == ACL_FLOAT16, "MhcPost: x must be BF16/FP16");
-  const int64_t tokens = mx->dim(0);
-  MOCK_REQUIRE(mr->shape.size() == 3 && mr->dim(0) == tokens && mr->dim(1) == kNhcStreams &&
-                   mr->dim(2) == kNhcStreams && mr->dtype == ACL_FLOAT32,
-               "MhcPost: hRes must be [T, 4, 4] FP32");
-  MOCK_REQUIRE(mo->shape.size() == 2 && mo->dim(0) == tokens && mo->dim(1) == kHidden && mo->dtype == mx->dtype,
-               "MhcPost: hOut must be [T, 4096] in the dtype of x");
-  MOCK_REQUIRE(mp->shape.size() == 2 && mp->dim(0) == tokens && mp->dim(1) == kNhcStreams &&
-                   mp->dtype == ACL_FLOAT32,
-               "MhcPost: hPost must be [T, 4] FP32");
-  MOCK_REQUIRE(my->same_shape_as(*mx) && my->dtype == mx->dtype, "MhcPost: out must match x [T, 4, 4096]");
+  const std::vector<int64_t> lead = LeadingAxes(mx, 2);
+  const int64_t tokens = ProductOf(lead);
+  MOCK_REQUIRE(mr->shape == WithSuffix(lead, {kNhcStreams, kNhcStreams}) && mr->dtype == ACL_FLOAT32,
+               "MhcPost: hRes must be " + ShapeText(WithSuffix(lead, {kNhcStreams, kNhcStreams})) + " FP32, got " +
+                   ShapeOf(mr));
+  MOCK_REQUIRE(mo->shape == WithSuffix(lead, {kHidden}) && mo->dtype == mx->dtype,
+               "MhcPost: hOut must be " + ShapeText(WithSuffix(lead, {kHidden})) + " in the dtype of x, got " +
+                   ShapeOf(mo));
+  MOCK_REQUIRE(mp->shape == WithSuffix(lead, {kNhcStreams}) && mp->dtype == ACL_FLOAT32,
+               "MhcPost: hPost must be " + ShapeText(WithSuffix(lead, {kNhcStreams})) + " FP32, got " + ShapeOf(mp));
+  MOCK_REQUIRE(my->same_shape_as(*mx) && my->dtype == mx->dtype,
+               "MhcPost: out must match x " + ShapeOf(mx) + ", got " + ShapeOf(my));
   *workspace_size = Align4k(static_cast<uint64_t>(tokens) * static_cast<uint64_t>(kHidden) * 2) + kWorkspaceMhcBase;
   *executor = NewExecutor("aclnnMhcPost", {x, h_res, h_out, h_post, out});
   return 0;
@@ -1531,6 +1590,21 @@ aclnnStatus aclnnCompressorGetWorkspaceSize(
       MOCK_REQUIRE(AsMockTensor(lengths)->dtype == ACL_INT32,
                    "Compressor: cuSeqlens/seqused/startPos must be INT32 when bound");
     }
+  }
+
+  // The sequence-ring cadence, straight out of the vendored wrapper:
+  //
+  //   if (x->IsEmpty() || cmpKvOut->IsEmpty()) { *workspaceSize = 0; return 0; }
+  //
+  // sits AFTER the parameter checks and before any l0 call. An incomplete
+  // compression window therefore plans a validated, completely empty
+  // executor: no kernel, no ViewCopy into cmpKvOut and no in-place update of
+  // stateCacheRef. That is how a caller holding back T < cmpRatio tokens
+  // emits nothing at all -- not a zero-row write, but no write.
+  if (mx->elements() == 0 || mkv->elements() == 0) {
+    *workspace_size = 0;
+    *executor = NewExecutor("aclnnCompressor", {});
+    return 0;
   }
 
   // The REF parameter takes no copy stage, so nothing here can be a
