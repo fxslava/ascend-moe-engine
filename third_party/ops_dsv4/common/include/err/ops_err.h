@@ -18,9 +18,13 @@
 
 #include "log/log.h"
 
+// The upstream stub also called OpLogSub(OP, ...); this toolkit's op_common
+// log.h does not expose the bare OP module enum at that point, and the desc
+// argument is a context pointer at most call sites, so the report goes through
+// REPORT_INNER_ERR_MSG alone -- same text, same failure verdict.
 #define OPS_INNER_ERR_STUB(ERR_CODE_STR, OPS_DESC, FMT, ...)                                                           \
     do {                                                                                                               \
-        OpLogSub(OP, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__);                                                    \
+        (void)(OPS_DESC);                                                                                              \
         REPORT_INNER_ERR_MSG(ERR_CODE_STR, FMT, ##__VA_ARGS__);                                                        \
     } while (0)
 

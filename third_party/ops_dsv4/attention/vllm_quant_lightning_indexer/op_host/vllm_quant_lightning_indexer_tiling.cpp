@@ -23,7 +23,7 @@ using std::map;
 using std::string;
 namespace optiling {
 // --------------------------QLIInfoParser类成员函数定义-------------------------------------
-ge::graphStatus QLIInfoParser::CheckRequiredInOutExistence() const
+ge::graphStatus VllmQLIInfoParser::CheckRequiredInOutExistence() const
 {
     OP_CHECK_IF(opParamInfo_.query.shape == nullptr, OP_LOGE(opName_, "Shape of tensor query is nullptr"),
                return ge::GRAPH_FAILED);
@@ -52,7 +52,7 @@ ge::graphStatus QLIInfoParser::CheckRequiredInOutExistence() const
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::CheckRequiredAttrExistence() const
+ge::graphStatus VllmQLIInfoParser::CheckRequiredAttrExistence() const
 {
     OP_CHECK_IF(opParamInfo_.layOutQuery == nullptr, OP_LOGE(opName_, "attr layout_query is nullptr"),
                return ge::GRAPH_FAILED);
@@ -73,7 +73,7 @@ ge::graphStatus QLIInfoParser::CheckRequiredAttrExistence() const
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::CheckRequiredParaExistence() const
+ge::graphStatus VllmQLIInfoParser::CheckRequiredParaExistence() const
 {
     if (CheckRequiredInOutExistence() != ge::GRAPH_SUCCESS || CheckRequiredAttrExistence() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
@@ -82,7 +82,7 @@ ge::graphStatus QLIInfoParser::CheckRequiredParaExistence() const
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetOpName()
+ge::graphStatus VllmQLIInfoParser::GetOpName()
 {
     if (context_->GetNodeName() == nullptr) {
         OP_LOGE("VllmQuantLightningIndexer", "opName got from TilingContext is nullptr");
@@ -92,7 +92,7 @@ ge::graphStatus QLIInfoParser::GetOpName()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetNpuInfo()
+ge::graphStatus VllmQLIInfoParser::GetNpuInfo()
 {
     platformInfo_ = context_->GetPlatformInfo();
     OP_CHECK_IF(platformInfo_ == nullptr, OP_LOGE(opName_, "GetPlatformInfo is nullptr."), return ge::GRAPH_FAILED);
@@ -118,7 +118,7 @@ ge::graphStatus QLIInfoParser::GetNpuInfo()
     return ge::GRAPH_SUCCESS;
 }
 
-void QLIInfoParser::GetOptionalInputParaInfo()
+void VllmQLIInfoParser::GetOptionalInputParaInfo()
 {
     opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ACTUAL_SEQ_Q_INDEX);
     opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ACTUAL_SEQ_Q_INDEX);
@@ -130,7 +130,7 @@ void QLIInfoParser::GetOptionalInputParaInfo()
     opParamInfo_.metadata.desc = context_->GetOptionalInputDesc(METADATA_INDEX);
 }
 
-void QLIInfoParser::GetInputParaInfo()
+void VllmQLIInfoParser::GetInputParaInfo()
 {
     opParamInfo_.query.desc = context_->GetInputDesc(QUERY_INDEX);
     opParamInfo_.query.shape = context_->GetInputShape(QUERY_INDEX);
@@ -145,13 +145,13 @@ void QLIInfoParser::GetInputParaInfo()
     GetOptionalInputParaInfo();
 }
 
-void QLIInfoParser::GetOutputParaInfo()
+void VllmQLIInfoParser::GetOutputParaInfo()
 {
     opParamInfo_.attenOut.desc = context_->GetOutputDesc(vllm_quant_lightning_indexer);
     opParamInfo_.attenOut.shape = context_->GetOutputShape(vllm_quant_lightning_indexer);
 }
 
-ge::graphStatus QLIInfoParser::GetAttrParaInfo()
+ge::graphStatus VllmQLIInfoParser::GetAttrParaInfo()
 {
     auto attrs = context_->GetAttrs();
     OP_CHECK_IF(attrs == nullptr, OP_LOGE(context_->GetNodeName(), "attrs got from ge is nullptr"),
@@ -209,7 +209,7 @@ ge::graphStatus QLIInfoParser::GetAttrParaInfo()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::CheckAttrParaInfo()
+ge::graphStatus VllmQLIInfoParser::CheckAttrParaInfo()
 {
     std::string layout_key(opParamInfo_.layOutKey);
     std::string layout_query(opParamInfo_.layOutQuery);
@@ -266,7 +266,7 @@ ge::graphStatus QLIInfoParser::CheckAttrParaInfo()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetOpParaInfo()
+ge::graphStatus VllmQLIInfoParser::GetOpParaInfo()
 {
     GetInputParaInfo();
     GetOutputParaInfo();
@@ -279,7 +279,7 @@ ge::graphStatus QLIInfoParser::GetOpParaInfo()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetAndCheckInOutDataType()
+ge::graphStatus VllmQLIInfoParser::GetAndCheckInOutDataType()
 {
     inputQType_ = opParamInfo_.query.desc->GetDataType();
     inputKType_ = opParamInfo_.key.desc->GetDataType();
@@ -332,7 +332,7 @@ ge::graphStatus QLIInfoParser::GetAndCheckInOutDataType()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetQueryKeyAndOutLayout()
+ge::graphStatus VllmQLIInfoParser::GetQueryKeyAndOutLayout()
 {
     // 获取query,key的Layout基准值
     const map<string, DataLayout> layoutQueryMap = {{"BSND", DataLayout::BSND}, {"TND", DataLayout::TND}};
@@ -355,7 +355,7 @@ ge::graphStatus QLIInfoParser::GetQueryKeyAndOutLayout()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetAndCheckOptionalInput()
+ge::graphStatus VllmQLIInfoParser::GetAndCheckOptionalInput()
 {
     if (kLayout_ == DataLayout::PA_BSND) {
         OP_CHECK_IF(opParamInfo_.blockTable.tensor == nullptr,
@@ -398,7 +398,7 @@ ge::graphStatus QLIInfoParser::GetAndCheckOptionalInput()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::CheckShapeDim()
+ge::graphStatus VllmQLIInfoParser::CheckShapeDim()
 {
     OP_CHECK_IF((opParamInfo_.blockTable.tensor != nullptr) &&
                 (opParamInfo_.blockTable.tensor->GetStorageShape().GetDimNum() != DIM_NUM_TWO),
@@ -437,7 +437,7 @@ ge::graphStatus QLIInfoParser::CheckShapeDim()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetN1Size()
+ge::graphStatus VllmQLIInfoParser::GetN1Size()
 {
     if (qLayout_ == DataLayout::BSND) {
         n1Size_ = static_cast<uint32_t>(opParamInfo_.query.shape->GetStorageShape().GetDim(DIM_IDX_TWO));
@@ -449,7 +449,7 @@ ge::graphStatus QLIInfoParser::GetN1Size()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
+ge::graphStatus VllmQLIInfoParser::GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
                                                    const std::string &actualSeqLenName) const
 {
     size = static_cast<uint32_t>(tensor->GetShapeSize());
@@ -460,7 +460,7 @@ ge::graphStatus QLIInfoParser::GetActualSeqLenSize(uint32_t &size, const gert::T
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetAndCheckN2Size()
+ge::graphStatus VllmQLIInfoParser::GetAndCheckN2Size()
 {
     // PA_BSND
     if (kLayout_ == DataLayout::TND) {
@@ -474,7 +474,7 @@ ge::graphStatus QLIInfoParser::GetAndCheckN2Size()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetGSize()
+ge::graphStatus VllmQLIInfoParser::GetGSize()
 {
     if (n1Size_ % n2Size_ != 0) {
         OP_LOGE(opName_, "input query's head_num %u can not be a multiple of key's head_num %u.", n1Size_, n2Size_);
@@ -488,7 +488,7 @@ ge::graphStatus QLIInfoParser::GetGSize()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetBatchSize()
+ge::graphStatus VllmQLIInfoParser::GetBatchSize()
 {
     // 获取B基准值
     // 1、非TND时, 以query的batch_size维度为基准;
@@ -527,7 +527,7 @@ ge::graphStatus QLIInfoParser::GetBatchSize()
     }
 }
 
-ge::graphStatus QLIInfoParser::GetHeadDim()
+ge::graphStatus VllmQLIInfoParser::GetHeadDim()
 {
     // 以query的D维度为基准
     uint32_t dIndex = DIM_IDX_TWO;
@@ -552,7 +552,7 @@ ge::graphStatus QLIInfoParser::GetHeadDim()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetS1Size()
+ge::graphStatus VllmQLIInfoParser::GetS1Size()
 {
     if (qLayout_ == DataLayout::BSND) {
         s1Size_ = opParamInfo_.query.shape->GetStorageShape().GetDim(1);
@@ -560,7 +560,7 @@ ge::graphStatus QLIInfoParser::GetS1Size()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetAndCheckBlockSize()
+ge::graphStatus VllmQLIInfoParser::GetAndCheckBlockSize()
 {
     blockSize_ = static_cast<uint32_t>(opParamInfo_.key.shape->GetStorageShape().GetDim(1));
     OP_LOGI(context_->GetNodeName(), "blockSize_ is %d", blockSize_);
@@ -573,7 +573,7 @@ ge::graphStatus QLIInfoParser::GetAndCheckBlockSize()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetS2SizeForPageAttention()
+ge::graphStatus VllmQLIInfoParser::GetS2SizeForPageAttention()
 {
     if (GetAndCheckBlockSize() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
@@ -589,7 +589,7 @@ ge::graphStatus QLIInfoParser::GetS2SizeForPageAttention()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetS2SizeForBatchContinuous()
+ge::graphStatus VllmQLIInfoParser::GetS2SizeForBatchContinuous()
 {
     std::string layout_key(opParamInfo_.layOutKey);
     if (kLayout_ == DataLayout::BSND) {
@@ -603,7 +603,7 @@ ge::graphStatus QLIInfoParser::GetS2SizeForBatchContinuous()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::GetS2Size()
+ge::graphStatus VllmQLIInfoParser::GetS2Size()
 {
     // 获取S2基准值
     // 1、BATCH_CONTINUOUS时, 从key的S轴获取
@@ -614,7 +614,7 @@ ge::graphStatus QLIInfoParser::GetS2Size()
     return GetS2SizeForBatchContinuous();
 }
 
-ge::graphStatus QLIInfoParser::ValidateInputShapesMatch()
+ge::graphStatus VllmQLIInfoParser::ValidateInputShapesMatch()
 {
     /*
     TND:
@@ -741,7 +741,7 @@ ge::graphStatus QLIInfoParser::ValidateInputShapesMatch()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus QLIInfoParser::CheckScaleShape()
+ge::graphStatus VllmQLIInfoParser::CheckScaleShape()
 {
     uint32_t qShapeDim = opParamInfo_.query.shape->GetStorageShape().GetDimNum();
     uint32_t kShapeDim = opParamInfo_.key.shape->GetStorageShape().GetDimNum();
@@ -777,7 +777,7 @@ ge::graphStatus QLIInfoParser::CheckScaleShape()
     return ge::GRAPH_SUCCESS;
 }
 
-void QLIInfoParser::GenerateInfo(QLITilingInfo &QLIInfo)
+void VllmQLIInfoParser::GenerateInfo(QLITilingInfo &QLIInfo)
 {
     QLIInfo.opName = opName_;
     QLIInfo.platformInfo = platformInfo_;
@@ -813,7 +813,7 @@ void QLIInfoParser::GenerateInfo(QLITilingInfo &QLIInfo)
     QLIInfo.inputKLayout = kLayout_;
 }
 
-ge::graphStatus QLIInfoParser::ParseAndCheck(QLITilingInfo &QLIInfo)
+ge::graphStatus VllmQLIInfoParser::ParseAndCheck(QLITilingInfo &QLIInfo)
 {
     if (ge::GRAPH_SUCCESS != GetOpName() || ge::GRAPH_SUCCESS != GetNpuInfo() || ge::GRAPH_SUCCESS != GetOpParaInfo() ||
         ge::GRAPH_SUCCESS != CheckRequiredParaExistence()) {
@@ -932,8 +932,8 @@ ge::graphStatus TilingForVllmQuantLightningIndexer(gert::TilingContext *context)
     OP_CHECK_IF(context == nullptr, OP_LOGE("VllmQuantLightningIndexer", "Tiling context is null."),
                return ge::GRAPH_FAILED);
     QLITilingInfo QLIInfo;
-    QLIInfoParser QLIInfoParser(context);
-    if (QLIInfoParser.ParseAndCheck(QLIInfo) != ge::GRAPH_SUCCESS) {
+    VllmQLIInfoParser VllmQLIInfoParser(context);
+    if (VllmQLIInfoParser.ParseAndCheck(QLIInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
     VllmQuantLightningIndexerTiling QLITiling(context);

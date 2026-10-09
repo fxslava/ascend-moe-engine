@@ -177,10 +177,10 @@ public:
 };
 
 // -----------算子Tiling入参信息解析及Check类---------------
-class QLIInfoParser {
+class VllmQLIInfoParser {
 public:
-    explicit QLIInfoParser(gert::TilingContext *context) : context_(context) {}
-    ~QLIInfoParser() = default;
+    explicit VllmQLIInfoParser(gert::TilingContext *context) : context_(context) {}
+    ~VllmQLIInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
     ge::graphStatus CheckRequiredAttrExistence() const;
