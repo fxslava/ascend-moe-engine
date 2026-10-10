@@ -6,7 +6,7 @@
 
 namespace moe::ops::mhc_fused_sinkhorn_gemv {
 
-inline constexpr std::uint32_t kSinkhornIterations = 20;
+inline constexpr std::uint32_t kTilingSinkhornIterations = 20;
 inline constexpr std::size_t kResidualBufferBytes = 4 * 4 * sizeof(float);
 inline constexpr std::size_t kVectorBufferBudgetBytes = 64 * 1024;
 

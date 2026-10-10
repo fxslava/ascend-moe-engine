@@ -91,6 +91,8 @@ The projection rows are partitioned as `[h_in(4), h_post(4), h_res(4x4)]`;
 the three alpha entries scale those three segments respectively, before bias.
 Twenty row/column Sinkhorn normalization passes produce the residual mixing
 matrix, and the output is `B^T*x + h_post[:,None]*h_out`, rounded to BF16.
+The host C API exposes a CPU fallback entry point with explicit argument and
+execution status codes for callers that select the portable path.
 
 All probes exit 0 with `[ SKIP ]` when the capability they probe is genuinely
 absent on the host (no weights dir, no NPU); they fail only when a present

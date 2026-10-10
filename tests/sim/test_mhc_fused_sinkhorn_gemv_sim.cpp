@@ -7,6 +7,7 @@
 #include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 using namespace moe::ops::mhc_fused_sinkhorn_gemv;
@@ -96,6 +97,30 @@ void TestHostTilingPlanContract() {
           "null host tiling-plan output was not rejected");
 }
 
+void TestHostCpuFallback() {
+  const auto inputs = test_common::MakeDeterministicMhcFusedSinkhornGemvInputs();
+  std::vector<std::uint16_t> output(kInputElements);
+  const auto status = moe::ops::MhcFusedSinkhornGemvCpuFallback(
+      inputs.x_bf16.data(), inputs.x_bf16.size(), inputs.phi.data(),
+      inputs.phi.size(), inputs.alpha.data(), inputs.alpha.size(),
+      inputs.bias.data(), inputs.bias.size(), inputs.h_out_bf16.data(),
+      inputs.h_out_bf16.size(), output.data(), output.size());
+  Require(status == moe::ops::MhcFusedSinkhornGemvStatus::kSuccess,
+          "host CPU fallback failed");
+
+  const auto reference = MhcFusedSinkhornGemvReference::Compute(inputs);
+  Require(output == reference.y_bf16,
+          "host CPU fallback differs from the portable reference");
+  Require(moe::ops::MhcFusedSinkhornGemvCpuFallback(
+              nullptr, inputs.x_bf16.size(), inputs.phi.data(),
+              inputs.phi.size(), inputs.alpha.data(), inputs.alpha.size(),
+              inputs.bias.data(), inputs.bias.size(),
+              inputs.h_out_bf16.data(), inputs.h_out_bf16.size(),
+              output.data(), output.size()) ==
+              moe::ops::MhcFusedSinkhornGemvStatus::kInvalidArgument,
+          "host CPU fallback did not reject a null input");
+}
+
 }  // namespace
 
 int main() {
@@ -105,6 +130,7 @@ int main() {
     TestNonUniformSinkhornReferenceVector();
     TestBf16Rounding();
     TestHostTilingPlanContract();
+    TestHostCpuFallback();
   } catch (const std::exception& error) {
     std::cerr << "[FAIL] MhcFusedSim: " << error.what() << '\n';
     return 1;
