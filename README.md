@@ -13,8 +13,9 @@ apps/       executables (moe_runner)
 include/    engine public headers (moe/...)
 src/        engine library (static arena, exclusive staging, router engine,
             IRoutedMoeBlock + standard/lattice backends, config.json parsing)
+            and custom operators in op_host/op_kernel/cpu_ref partitions
 mock/       symbolic libopapi_mock backend (zero-NPU contract validation)
-tests/      every test binary: contract smoke, mock suite, device probes
+tests/      common test utilities plus sim/, mock/, and npu/ suites
 python/     torch-free tokenizer + benchmark harness (tokenizers-only)
 ```
 
@@ -78,9 +79,18 @@ measures host simulation, not NPU performance or model quality.
 | `mock_pipeline_e2e` | the full symbolic suite (mock build only) | no |
 | `mock_safetensors_index_probe` | headers, aliases, HF/HC topology, all local expert descriptors; no shard payloads | no |
 
-`ENABLE_MOCK_RUNTIME=ON` builds only `mock_*` tests; `OFF` builds only
-`npu_*` tests. Binaries live in `build_*/tests/`, and CTest labels are `mock`
-and `npu`. There are no CANN dependencies in the mock suite.
+`ENABLE_MOCK_RUNTIME=ON` builds the mock suite and the standalone CPU
+simulation; `OFF` builds the NPU suite and CPU simulation. The simulator target
+`test_mhc_fused_sinkhorn_gemv_sim` links only `test_common` and `cpu_ref`, so it
+does not require CANN libraries or an NPU. Binaries live in `build_*/tests/`,
+and CTest labels are `mock`, `npu`, and `sim`.
+
+The portable fused operator reference accepts `x=[1,4,4096]` BF16,
+`phi=[24,16384]` FP32, `alpha=[3]`, `bias=[24]`, and `h_out=[1,4096]` BF16.
+The projection rows are partitioned as `[h_in(4), h_post(4), h_res(4x4)]`;
+the three alpha entries scale those three segments respectively, before bias.
+Twenty row/column Sinkhorn normalization passes produce the residual mixing
+matrix, and the output is `B^T*x + h_post[:,None]*h_out`, rounded to BF16.
 
 All probes exit 0 with `[ SKIP ]` when the capability they probe is genuinely
 absent on the host (no weights dir, no NPU); they fail only when a present

@@ -310,6 +310,11 @@ if(TARGET cust_opapi)
 endif()
 
 # -----------------------------------------------------------------------------
+# Standalone fused mHC/Sinkhorn operator and portable CPU reference
+# -----------------------------------------------------------------------------
+add_subdirectory(src/ops/mhc_fused_sinkhorn_gemv)
+
+# -----------------------------------------------------------------------------
 # Executables and tests
 # -----------------------------------------------------------------------------
 add_executable(moe_runner apps/moe_runner.cpp)
