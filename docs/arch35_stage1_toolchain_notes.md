@@ -5,39 +5,66 @@ in container `cann92_dev` (image `b82c08f530f9`), target `dav-3510`. These are
 CANN/environment behaviours, not gaps in PipeSim or ascend_analyzer; those are
 recorded in each tool's own `ISSUES_AND_GAPS.md`.
 
-## 1. BLOCKING for the SIMT kernels: `asc_vf_call` is elided under the bare compile line
+## 1. `asc_vf_call` IS emitted under the bare compile line (an earlier note here was wrong)
 
-`asc_vf_call<Fn>(dim3 threads, ...)` (`simt_api/common_functions.h`) expands to
-`cce::async_invoke` only under:
+`--npu-arch=dav-3510` predefines **`__DAV_VEC__`**, so the SIMT dispatch is
+live with nothing but `bisheng -O2 --npu-arch=dav-3510 --asc-aicore-lang -c`:
 
-```c
-#if (__NPU_ARCH__ == 5102) || defined(SPLIT_CORE_VEC) || defined(ASCENDC_CPU_DEBUG)
+```
+$ bisheng --npu-arch=dav-3510 -dM -E - </dev/null | grep DAV
+#define __DAV_C310_CUBE__ 1
+#define __DAV_C310_VEC__ 1
+#define __DAV_C310__ 1
+#define __DAV_CUBE__ 1
+#define __DAV_VEC__ 1
 ```
 
-and `SPLIT_CORE_VEC` is defined only when `__DAV_VEC__` is set:
+and preprocessing a kernel confirms the CANN-side gate opens too:
 
-```c
-#if (defined(__DAV_VEC__) && (__NPU_ARCH__ == 2201 || __NPU_ARCH__ == 3510))
+```
+$ bisheng ... -dM -E ker05_mxfp4_expert_gemv.cpp | grep -E 'SPLIT_CORE_VEC|__DAV_VEC__'
+#define SPLIT_CORE_VEC
+#define __DAV_VEC__ 1
 ```
 
-`__DAV_VEC__` is **not** set by `bisheng -O2 --npu-arch=dav-3510
---asc-aicore-lang -c`. Measured consequence: the object is byte-identical with
-and without `-DSPLIT_CORE_VEC` (same md5), i.e. **the `__simt_vf__` body is not
-emitted and the dispatch is a no-op**.
+**Why this was briefly misdiagnosed, and the lesson.** Two `__DAV_VEC__` gates
+have to open for a VF to exist: CANN's
+`simt_api/common_functions.h` wraps `asc_vf_call` in
+`#if ... defined(SPLIT_CORE_VEC) ...`, and the compiler's own
+`__clang_cce_simt.h` puts the entire body of `cce::async_invoke` --
+`__builtin_cce_store_vfsimt_info` and the `Func(Args...)` call -- inside
+`#ifdef __DAV_VEC__`. Adding `-DSPLIT_CORE_VEC` produced a byte-identical
+object, which was read as "the body is not emitted". The real reason is the
+opposite: the header had **already** defined `SPLIT_CORE_VEC` off
+`__DAV_VEC__`, so the command-line define was redundant. An unchanged object
+proves a flag had no effect; it says nothing about whether the code was there
+to begin with.
 
-So KER-01 and KER-05 compile cleanly and pass the static audit, but as built by
-that exact command line their SIMT phases do nothing. They must be built
-through the operator build system, which sets the vector-core split via
-`--cce-soc-version` plus `--cce-soc-core-type`; passing `--cce-soc-core-type`
-alone fails with *"Ascend soc_version or soc_core_type is empty"*.
+The test that actually answers the question is differential on the VF body --
+perturb one constant *inside* the `__simt_vf__` and see whether the object
+moves:
 
-**Treat the SIMT path as unverified until it is built that way.** Nothing in
-the compile or the audit catches this, which is exactly the failure mode the
-kernel contracts warn about: plausible-looking and silently wrong.
+| kernel | original | VF constant perturbed | verdict |
+|---|---|---|---|
+| `ker01_mhc_pre_norm_sinkhorn` | `abe48ee7da7e3737` | `0a51bc84c9b0f3a1` | emitted |
+| `ker05_mxfp4_expert_gemv` | `4648ee58fe40462b` | `5ddf70ffa57f1112` | emitted |
 
-Also note `--enable-simt` is for *pure*-SIMT translation units and is
-incompatible with `kernel_operator.h` (`#error`), so a hybrid SIMD+SIMT kernel
-must not use it.
+No split-core build wiring, `--cce-soc-core-type` or `--cce-soc-version` is
+needed for the VFs to compile.
+
+For the record, the soc-version route is not even available in this image:
+`--cce-soc-version` accepts only the SKUs baked into this build, and every
+950 string -- including the `Ascend950PR_9589` that appears in the binary's
+own string table -- is rejected with *"Ascend soc_version: ... is not
+supported"*. `--cce-soc-core-type` takes `CubeCore` or `VecCore` but requires
+a soc_version, so it cannot be used standalone. The `dav-c310-vec`,
+`dav-c310-simt` and `dav-c310-simd` arch names in the binary are likewise
+rejected by `--npu-arch`; `dav-3510` is the one that works, and it already
+defines both `__DAV_VEC__` and `__DAV_CUBE__`.
+
+`--enable-simt` remains for *pure*-SIMT translation units and is incompatible
+with `kernel_operator.h` (`#error`), so a hybrid SIMD+SIMT kernel must not use
+it. `--run-mode` accepts `cpu` and `sim`, not `npu`.
 
 ## 2. `ReduceSum`'s count form requires a `TPipe` to exist
 

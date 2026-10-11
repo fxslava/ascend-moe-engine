@@ -6,6 +6,8 @@
 #      and fail if either was stale (so offsets cannot drift from the sources)
 #   2. ascend_analyzer --chip ascend950pr --ub-bytes 221184 --warnings-as-errors
 #   3. bisheng -O2 --npu-arch=dav-3510 --asc-aicore-lang
+#   4. assert the SIMT dispatch gates are open, so a __simt_vf__ cannot be
+#      compiled away while still passing steps 2 and 3
 #
 # The analyzer and PipeSim live outside the repo and outside the CANN
 # container, so the audit runs on the host from a venv and the compile runs in
@@ -90,8 +92,28 @@ for k in "${KERNELS[@]}"; do
 done
 
 echo
+echo "== 4. SIMT dispatch is live (asc_vf_call not compiled away) =="
+# cce::async_invoke's whole body, and CANN's asc_vf_call wrapper, sit behind
+# __DAV_VEC__ / SPLIT_CORE_VEC. --npu-arch=dav-3510 predefines __DAV_VEC__, so
+# both gates are open -- but if a future flag or CANN version closes them, the
+# __simt_vf__ bodies in KER-01 and KER-05 would silently become no-ops while
+# still compiling and auditing clean. This asserts the gates are open.
+for k in ker01_mhc_pre_norm_sinkhorn ker05_mxfp4_expert_gemv; do
+  defs=$(docker exec "$CANN_CONTAINER" bash -lc "
+    $BISHENG -O2 --npu-arch=dav-3510 --asc-aicore-lang       -I$CANN_REPO_MOUNT/include -I$CANN_REPO_MOUNT/$KERNEL_DIR       -dM -E $CANN_REPO_MOUNT/$KERNEL_DIR/$k.cpp 2>/dev/null       | grep -cE '^#define (SPLIT_CORE_VEC|__DAV_VEC__)'
+  " 2>/dev/null | tr -d '[:space:]')
+  if [[ "$defs" == "2" ]]; then
+    printf '  OK    %-32s SPLIT_CORE_VEC and __DAV_VEC__ both defined\n' "$k"
+  else
+    printf '  FAIL  %-32s expected both SPLIT_CORE_VEC and __DAV_VEC__, found %s\n' "$k" "${defs:-0}"
+    echo "        the SIMT VF body would be compiled away; see docs/arch35_stage1_toolchain_notes.md" >&2
+    fail=1
+  fi
+done
+
+echo
 if [[ $fail -eq 0 ]]; then
-  echo "ALL GATES PASSED for KER-01..KER-05 (layout, audit, device compile)."
+  echo "ALL GATES PASSED for KER-01..KER-05 (layout, audit, device compile, SIMT dispatch)."
 else
   echo "GATE FAILURES present; see above." >&2
 fi
