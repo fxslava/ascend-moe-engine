@@ -14,3 +14,9 @@ moe_prof_out/
 *.pdf
 tmp/
 src/moe-engine.txt
+
+# Downloaded DeepSeek-V4-Flash weights and the emulation golden it produces.
+# scripts/download_dsv4_layer0.sh fetches multi-gigabyte shards here, and
+# apps/dsv4_layer0_emu_bench writes golden_layer0_ref.bin beside them; none of
+# it belongs in the source tree.
+data/

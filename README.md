@@ -9,19 +9,28 @@ this repository carries that subtree's full commit history (root-level here).
 ## Layout
 
 ```
-apps/       executables (moe_runner)
-include/    engine public headers (moe/...)
+apps/       executables (moe_runner, dsv4_layer0_emu_bench)
+include/    engine public headers (moe/...), including moe/emu/ -- the
+            header-only host emulation API, safetensors reader and FP8 types
 src/        engine library (static arena, exclusive staging, router engine,
             IRoutedMoeBlock + standard/lattice backends, config.json parsing)
             and custom operators in op_host/op_kernel/cpu_ref partitions
+src/emu/    plain C/C++ host emulation of the three fused decode operators
 mock/       symbolic libopapi_mock backend (zero-NPU contract validation)
-tests/      common test utilities plus sim/, mock/, and npu/ suites
+tests/      common test utilities plus sim/, mock/, npu/ and emu/ suites
+scripts/    download_dsv4_layer0.sh -- fetches the metadata and the shard that
+            holds Layer 0
 python/     torch-free tokenizer + benchmark harness (tokenizers-only)
 ```
 
 ## Build
 
 ```bash
+# standalone host CPU emulation (no CANN, no Docker, no NPU, no device):
+cmake -S . -B build_emu -DENABLE_HOST_EMU=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_emu -j$(nproc)
+ctest --test-dir build_emu --output-on-failure
+
 # host-only symbolic verification (no CANN, no Docker, no NPU):
 cmake -S . -B build_mock -DENABLE_MOCK_RUNTIME=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build_mock -j$(nproc)
@@ -68,6 +77,72 @@ request counters remain zero. Omit `--dry-run` to exercise the full pipeline.
 mock build uses symbolic weights and seeded routing/token outputs; its timing
 measures host simulation, not NPU performance or model quality.
 
+## Host CPU emulation (`ENABLE_HOST_EMU`)
+
+A plain C++17 emulation of the three fused decode operators, built with nothing
+but a host compiler. It exists to replace minutes-per-iteration CAModel
+simulation with milliseconds, to prove the CPU fallback semantics, and to be
+the golden numerical reference the Ascend C kernels are diffed against.
+
+| operator | upstream golden it is ported from |
+| --- | --- |
+| `mhc_fused_sinkhorn_gemv_cpu` | ops-transformer `mhc_pre_sinkhorn_premix` `golden.py::_compute` + `mhc_post` `golden.py::_mhc_post_compute` |
+| `paged_compressor_decode_c4a` | ops-transformer `compressor_golden.py::cpu_compressor` + the vendored arch35 RMSNorm/RoPE epilog |
+| `fast_fp8_indexer_topk_cpu` | ops-transformer `quant_lightning_indexer_golden.py::cal_atten_per_batch_fp8` |
+
+`ENABLE_HOST_EMU=ON` makes the root `CMakeLists.txt` return before any toolkit
+discovery, so the tree cannot acquire a CANN dependency even by accident;
+`ctest` re-checks that against the built binary (`emu_standalone_linkage`).
+
+### End-to-end Layer 0 pass on real weights
+
+```bash
+scripts/download_dsv4_layer0.sh              # metadata + 16 MiB of shard 2
+scripts/download_dsv4_layer0.sh --shard 4 --slice-mib 40   # layer 2's compressor/indexer
+./build_emu/apps/dsv4_layer0_emu_bench       # ~0.14 s, writes the golden dump
+```
+
+Three things about the checkpoint that the obvious assumption gets wrong, all
+read out of `model.safetensors.index.json` rather than guessed:
+
+- **Layer 0 is in shard 2, not shard 1.** Shard 1 maps to exactly one tensor,
+  `embed.weight` BF16 `[129280, 4096]` (1.06 GB); all 1565 `layers.0.*`
+  tensors are in shard 2. The download script fetches shard 2 by default.
+- **The tensor names are flat, with no `model.` prefix and no `mhc_pre`
+  submodule**: `layers.0.hc_attn_fn` F32 `[24, 16384]` is the mHC phi,
+  `hc_attn_scale` `[3]` is alpha, `hc_attn_base` `[24]` is bias (and likewise
+  `hc_ffn_*`). There is no `input_layernorm` and no `self_attn`.
+- **Layer 0 has neither a compressor nor an indexer.** `compress_ratios`
+  starts `[0, 0, 4, 128, ...]`, so layer 0 is an uncompressed (SWA) layer.
+  Those weights first appear on layer 2, and
+  `layers.2.attn.compressor.wkv.weight` BF16 `[1024, 4096]` is what pins the
+  C4A configuration (coff 2, D 512, ratio 4). The bench prints a provenance
+  line per phase saying whether each stage ran on layer 0's weights, layer 2's,
+  or a synthetic stand-in; nothing is silently substituted.
+
+The script's default **slice mode** fetches only the header plus a leading
+window of a shard, because every tensor the Layer 0 pipeline reads lives in the
+first ~11.5 MB of shard 2's data segment. `safetensors_view.hpp` treats such a
+file as well-formed: the header parses in full and each `TensorView` carries an
+`available` flag, so a tensor outside the window is reported rather than
+faulted on. Use `--full` for the FP8 projections.
+
+### A measured caveat on the 20-iteration Sinkhorn bound
+
+With the **real** `layers.0.hc_attn_*` weights, 20 Sinkhorn iterations do *not*
+produce a doubly stochastic `hRes`: the row sums land ~7.6e-2 off (column sums
+converge to ~1e-6, since the cadence ends on a column normalization). This is a
+property of the checkpoint, not a solver fault — `hc_attn_base` rows 8..23 span
+roughly `-30.1 … +9.9`, and six of the matching `hc_attn_fn` rows have an L2
+norm below 1e-4, leaving those logits equal to their bias. `exp` then covers
+~e^-40, and Sinkhorn-Knopp converges slowly that close to degenerate: the same
+logits reach 1e-6 by 200 iterations.
+
+Since `config.json` pins `"hc_sinkhorn_iters": 20`, the 20-iteration result
+**is** the contract the NPU kernel must reproduce. The emulation suite therefore
+asserts the Birkhoff invariant only on fixtures that actually converge, and pins
+the real-weight regime by its measured value instead.
+
 ## Tests (`tests/`)
 
 | binary | what it proves | needs a device? |
@@ -78,6 +153,11 @@ measures host simulation, not NPU performance or model quality.
 | `npu_e2e_single_token` | one full 43-layer decode step: zero deadlocks, zero stream errors, 0 in-step allocations | yes, explicit `--coverage` |
 | `mock_pipeline_e2e` | the full symbolic suite (mock build only) | no |
 | `mock_safetensors_index_probe` | headers, aliases, HF/HC topology, all local expert descriptors; no shard payloads | no |
+| `test_mhc_sinkhorn_emu` | Birkhoff invariants, the golden stable fixture in closed form, mass conservation + L2 non-expansiveness over 100 cases, `B^T` orientation, the real-checkpoint logit regime | no (emu build) |
+| `test_paged_compressor_emu` | columnar softmax, RMSNorm + half-mode RoPE on the last 64 lanes, HOLD/EMIT cadence and the coff=2 window overlap | no (emu build) |
+| `test_fp8_indexer_emu` | E4M3FN/E5M2/E8M0 round trips, per-head-relu ordering, top-512 identical to a full-sort baseline as a ranked list | no (emu build) |
+| `test_safetensors_loader` | offsets/dtypes/shapes, misaligned data segments, truncated slices, malformed headers; parses the real shard when present | no (emu build) |
+| `emu_standalone_linkage` | the emu bench links no CANN, Python or Torch library and has no undefined symbols | no (emu build) |
 
 `ENABLE_MOCK_RUNTIME=ON` builds the mock suite and the standalone CPU
 simulation; `OFF` builds the NPU suite and CPU simulation. The simulator target

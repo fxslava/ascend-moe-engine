@@ -28,12 +28,20 @@
 #     cmake -S . -B build_mock -DENABLE_MOCK_RUNTIME=ON
 #     cmake --build build_mock -j && ctest --test-dir build_mock
 #
+#   standalone host CPU emulation (no CANN at all -- see ENABLE_HOST_EMU):
+#     cmake -S . -B build_emu -DENABLE_HOST_EMU=ON -DCMAKE_BUILD_TYPE=Release
+#     cmake --build build_emu -j && ctest --test-dir build_emu
+#     ./build_emu/apps/dsv4_layer0_emu_bench
+#
 # LAYOUT
-#   apps/       executables (moe_runner)
+#   apps/       executables (moe_runner, dsv4_layer0_emu_bench)
 #   include/    the engine's public headers (moe/...)
 #   src/        the engine library
 #   mock/       the symbolic libopapi_mock backend (headers + implementation)
-#   tests/      every test binary: contract smoke, mock suite, device probes
+#   src/emu/    plain C/C++ host emulation of the fused decode operators
+#   tests/      every test binary: contract smoke, mock suite, device probes,
+#               and the host emulation suite (tests/emu/)
+#   scripts/    download_dsv4_layer0.sh -- the DSV4 metadata + Layer 0 shard
 #   python/     torch-free tokenizer + benchmark harness
 #   third_party/ops_dsv4/ vendored arch35 DSV4 operator sources
 #
@@ -72,6 +80,12 @@ option(DSV4_USE_BISHENG "Compile the host C++ with CANN's BiSheng (clang) instea
 # CANN toolkit -- no device, no Docker, and no physical memory behind any
 # weight, slot or arena.
 option(ENABLE_MOCK_RUNTIME "Build against the zero-allocation symbolic mock runtime" OFF)
+# ENABLE_HOST_EMU: build ONLY the plain-C/C++ host emulation of the fused
+# decode operators -- the CPU fallback, the golden numerical reference, and the
+# Layer 0 bench. Configuring with this on short-circuits the whole CANN path
+# below (see the block after project()), so the tree builds with nothing but a
+# host compiler and links no toolkit library at all.
+option(ENABLE_HOST_EMU "Build only the standalone host CPU emulation layer (no CANN)" OFF)
 
 if(DSV4_USE_BISHENG AND NOT CMAKE_CXX_COMPILER)
   set(_moe_toolkit "$ENV{ASCEND_HOME_PATH}")
@@ -99,6 +113,103 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(DSV4_WERROR "Treat compiler warnings as errors" OFF)
+
+# -----------------------------------------------------------------------------
+# ENABLE_HOST_EMU -- the standalone host CPU emulation layer
+# -----------------------------------------------------------------------------
+# This block RETURNS, and that is the point. Everything after it -- the engine
+# library, the CANN toolkit discovery, the vendored arch35 operators, the mock
+# backend, moe_runner -- is skipped entirely, so an emu configure has no way to
+# acquire a dependency on libopapi, libascendcl or libnnopbase even by
+# accident. The acceptance criterion "must NOT link against any CANN toolkit
+# libraries" is met structurally rather than by hoping the link line stays
+# clean, and dsv4_emu_verify_standalone re-checks it on the built artifacts.
+#
+#   cmake -S . -B build_emu -DENABLE_HOST_EMU=ON -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build_emu -j$(nproc)
+#   ctest --test-dir build_emu --output-on-failure
+#   ./build_emu/apps/dsv4_layer0_emu_bench
+# -----------------------------------------------------------------------------
+if(ENABLE_HOST_EMU)
+  message(STATUS "ENABLE_HOST_EMU=ON -- standalone host CPU emulation, no CANN")
+
+  if(ENABLE_MOCK_RUNTIME)
+    message(FATAL_ERROR
+      "ENABLE_HOST_EMU and ENABLE_MOCK_RUNTIME are mutually exclusive: the emu "
+      "tree deliberately builds no engine and no backend at all. Configure them "
+      "into separate build directories.")
+  endif()
+
+  set(MOE_EMU_WARNINGS -Wall -Wextra)
+  if(DSV4_WERROR)
+    list(APPEND MOE_EMU_WARNINGS -Werror)
+  endif()
+
+  # -O3 comes from CMAKE_BUILD_TYPE=Release. The vectorization flags are probed
+  # rather than assumed: this layer is required to build on the aarch64 950PR
+  # host as well as on x86_64, and -mavx2/-mfma do not exist there. On aarch64
+  # NEON is baseline, so the unit-stride dot products vectorize with no flag.
+  include(CheckCXXCompilerFlag)
+  set(MOE_EMU_ARCH_FLAGS "")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
+    foreach(candidate -mavx2 -mfma)
+      string(MAKE_C_IDENTIFIER "HAVE${candidate}" candidate_var)
+      check_cxx_compiler_flag("${candidate}" ${candidate_var})
+      if(${candidate_var})
+        list(APPEND MOE_EMU_ARCH_FLAGS "${candidate}")
+      endif()
+    endforeach()
+  endif()
+  if(MOE_EMU_ARCH_FLAGS)
+    message(STATUS "  host emu vectorization: ${MOE_EMU_ARCH_FLAGS}")
+  else()
+    message(STATUS "  host emu vectorization: compiler defaults "
+                   "(${CMAKE_SYSTEM_PROCESSOR})")
+  endif()
+
+  # OpenMP is optional: nothing here needs it for correctness, and a single
+  # decode token is too small to parallelize usefully. It is linked when
+  # present so a caller can parallelize across tokens or layers.
+  find_package(OpenMP COMPONENTS CXX)
+  if(OpenMP_CXX_FOUND)
+    set(MOE_EMU_OPENMP ON)
+    message(STATUS "  host emu OpenMP: ${OpenMP_CXX_FLAGS}")
+  else()
+    set(MOE_EMU_OPENMP OFF)
+    message(STATUS "  host emu OpenMP: not found (not required)")
+  endif()
+
+  add_subdirectory(src/emu)
+
+  add_executable(dsv4_layer0_emu_bench apps/dsv4_layer0_emu_bench.cpp)
+  target_link_libraries(dsv4_layer0_emu_bench PRIVATE moe_emu)
+  target_compile_options(dsv4_layer0_emu_bench PRIVATE ${MOE_EMU_WARNINGS})
+  set_target_properties(dsv4_layer0_emu_bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/apps"
+  )
+
+  enable_testing()
+  add_subdirectory(tests/emu)
+
+  # The standalone claim, verified against the artifacts. `ldd` on the bench
+  # must show no CANN, no Python and no torch library; a static moe_emu plus a
+  # host-only link line should leave only libstdc++/libm/libc/libgcc.
+  add_custom_target(dsv4_emu_verify_standalone
+    COMMAND ${CMAKE_COMMAND}
+            -DBENCH=$<TARGET_FILE:dsv4_layer0_emu_bench>
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_emu_standalone.cmake"
+    DEPENDS dsv4_layer0_emu_bench
+    COMMENT "Verifying the emu bench links no CANN / Python / Torch library"
+    VERBATIM
+  )
+  add_test(NAME emu_standalone_linkage
+           COMMAND ${CMAKE_COMMAND}
+                   -DBENCH=$<TARGET_FILE:dsv4_layer0_emu_bench>
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_emu_standalone.cmake")
+
+  return()
+endif()
+
 
 # -----------------------------------------------------------------------------
 # The engine library
