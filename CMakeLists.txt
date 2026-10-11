@@ -192,7 +192,7 @@ if(ENABLE_HOST_EMU)
 
   add_subdirectory(src/emu)
 
-  foreach(emu_app dsv4_layer0_emu_bench dsv4_semi_e2e_bench)
+  foreach(emu_app dsv4_layer0_emu_bench dsv4_semi_e2e_bench dsv4_extract_kernel_fixtures)
     add_executable(${emu_app} "apps/${emu_app}.cpp")
     target_link_libraries(${emu_app} PRIVATE moe_emu)
     target_compile_options(${emu_app} PRIVATE ${MOE_EMU_WARNINGS})
