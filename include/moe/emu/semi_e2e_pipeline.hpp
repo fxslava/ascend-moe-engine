@@ -93,6 +93,36 @@ struct SemiE2eReport {
   AttentionStats layer2_attention;
   MhcSinkhornTrace layer0_attn_trace;
   MhcSinkhornTrace layer2_attn_trace;
+  MhcSinkhornTrace moe_ffn_trace;
+
+  // Optional diagnostic activations stored in golden_semi_e2e_ref.bin v2.
+  // Experts are flattened in the same order as routing.experts.
+  std::vector<std::uint16_t> x_input;
+  std::vector<std::uint16_t> x_after_layer0;
+  std::vector<std::uint16_t> x_after_layer2;
+  std::vector<float> layer0_h_in;
+  std::vector<float> layer2_h_in;
+  std::vector<float> moe_h_in;
+  std::vector<float> expert_outputs;
+  std::vector<float> moe_routed;
+  std::vector<float> moe_shared;
+  std::vector<std::uint16_t> layer2_compressed_tokens;
+
+  // Stage boundaries that v3 does NOT serialize, captured so the isolated
+  // arch35 kernel fixtures (KER-01's h_norm, KER-02's h_out) can be built
+  // without re-deriving them. Purely diagnostic: nothing here feeds the
+  // pipeline, so the golden file is unaffected.
+  //
+  //   *_h_norm  the activation RMSNorm of h_in with the stage's norm weight,
+  //             i.e. exactly KER-01's `h_norm` output before the BF16 store
+  //   *_h_out   the sub-block FUNCTION output alone (attention output, or the
+  //             scaled routed sum plus shared expert), i.e. KER-02's `h_out`
+  std::vector<float> layer0_h_norm;
+  std::vector<float> layer2_h_norm;
+  std::vector<float> moe_h_norm;
+  std::vector<std::uint16_t> layer0_h_out;
+  std::vector<std::uint16_t> layer2_h_out;
+  std::vector<std::uint16_t> moe_h_out;
 
   MemoryUsage memory;
   double total_microseconds = 0.0;

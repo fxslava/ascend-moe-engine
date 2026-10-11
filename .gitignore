@@ -3,6 +3,8 @@ build*/
 *.so
 compile_commands.json
 .cache/
+work/
+.venv-ref/
 __pycache__/
 *.pyc
 stats.json
@@ -20,3 +22,7 @@ src/moe-engine.txt
 # apps/dsv4_layer0_emu_bench writes golden_layer0_ref.bin beside them; none of
 # it belongs in the source tree.
 data/
+
+# Isolated arch35 kernel fixtures: ~50 MiB of weight and activation slices,
+# regenerated on demand by apps/dsv4_extract_kernel_fixtures.
+data/dsv4_layer0/kernel_fixtures/

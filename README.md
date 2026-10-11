@@ -187,18 +187,45 @@ Two things worth knowing about the expert weights: the packed payload is spelled
 `I8` in the header, not `F4_E2M1` — `expert_dtype: "fp4"` plus the scale-grid
 width is what establishes that the bytes are nibble pairs, and this repo's
 `src/core/weight_source.cpp:600` gates on `"F4_E2M1"`/`"MOE_F4"`, which would
-not match. And the **nibble order cannot be settled from the checkpoint**:
-swapping it permutes elements within each adjacent pair, leaving the value
-multiset — and so every distributional statistic, including the per-group max
-that sets the scale — completely unchanged. It is isolated in
-`kMxfp4LowNibbleFirst` (`include/moe/emu/dsv4_layers.h`) so a device run can
-settle it in one place.
+not match. The checkpoint alone cannot settle nibble order by distributional
+statistics: swapping adjacent values preserves each group’s multiset and scale.
+The official DeepSeek-V4-Flash `inference/convert.py` decoder explicitly stacks
+**low then high**, so `kMxfp4LowNibbleFirst` is `true`.
+`scripts/verify_mxfp4_packing.py` checks this elementwise on expert 30 and
+uses a nonuniform GEMV probe; an all-ones probe is invariant to pair swaps.
 
 **Shared KV, not per-head.** `wkv` maps 4096 → 512, which is `head_dim`, *not*
 `n_heads * head_dim`: with `num_key_value_heads: 1` all 64 query heads score
 against the same 512-wide row per token. That is what the vendored
 `kv_quant_sparse_attn_sharedkv` is named for, and why the window cache is
 128×512 floats rather than 64× that.
+
+### PyTorch reference check (WSL CPU)
+
+After building the host-only `dsv4_semi_e2e_bench` target, rerun it to produce
+version 3 of `golden_semi_e2e_ref.bin`. Version 3 preserves the version-1
+prefix and appends the synthetic input, intermediate `h_in` vectors, MoE
+expert outputs, compressed KV token, and stream bundles for stage-level checks. With CPU PyTorch
+and `safetensors` installed, run:
+
+```bash
+./build_emu/apps/dsv4_semi_e2e_bench --memory-budget-mb 2500
+python3 scripts/verify_mxfp4_packing.py
+python3 scripts/run_pytorch_layer_ref.py --source-only
+python3 scripts/run_pytorch_layer_ref.py
+python3 scripts/run_pytorch_layer_ref.py --input source-embedding --attention-formula official
+```
+
+The source-offset flag range-fetches and hashes each of the 101 compact
+tensors against its original shard bytes without opening whole shards. The
+default PyTorch run reproduces the C++ semi-e2e schedule and compares all
+saved tensors with relative L2 and cosine similarity. The real-embedding run
+fetches only `embed.weight[3]` and uses the official one-token attention
+formula; it cannot be compared numerically with the golden’s synthetic input.
+The compact cache contains attention 0 and 2 plus MoE 1, so these checks are
+for the available 0 → 2 → 1 slice, not complete decoder layers 0–2.
+The benchmark computes a four-step layer-2 compressed token and a synthetic
+indexer side path, but does not feed those keys into its attention output.
 
 ### A measured caveat on the 20-iteration Sinkhorn bound
 

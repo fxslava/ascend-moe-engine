@@ -396,6 +396,7 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
            "is drawn deterministically at initializer_range 0.02",
            MicrosecondsSince(start));
   }
+  report.x_input = x;
 
   std::vector<float> rope_cos;
   std::vector<float> rope_sin;
@@ -420,9 +421,19 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
         // 1. hc_pre: the 24-row projection, the gates, and the Sinkhorn solve.
         mhc_pre_sinkhorn_cpu(x.data(), mhc.phi, mhc.alpha, mhc.bias, trace,
                              kHcEpsilon, kHcSinkhornIters, kRmsNormEpsilon);
+        if (layer == options.layer0) {
+          report.layer0_h_in.assign(trace->h_in, trace->h_in + kHiddenSize);
+        } else if (layer == options.layer2) {
+          report.layer2_h_in.assign(trace->h_in, trace->h_in + kHiddenSize);
+        }
         // 2. input_layernorm on h_in -- the [1, D] mHC output, NOT the bundle.
         rms_norm_cpu(trace->h_in, attn_norm, h_in_normed.data(), kHiddenSize,
                      kRmsNormEpsilon);
+        if (layer == options.layer0) {
+          report.layer0_h_norm.assign(h_in_normed.begin(), h_in_normed.end());
+        } else if (layer == options.layer2) {
+          report.layer2_h_norm.assign(h_in_normed.begin(), h_in_normed.end());
+        }
 
         // 3. Prime the sliding window, then the measured step. Without this the
         //    window holds one token and the softmax is a no-op, which would
@@ -446,6 +457,11 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
           h_out_bf16[static_cast<std::size_t>(i)] =
               FloatToBf16(attention_out[static_cast<std::size_t>(i)]);
         }
+        if (layer == options.layer0) {
+          report.layer0_h_out = h_out_bf16;
+        } else if (layer == options.layer2) {
+          report.layer2_h_out = h_out_bf16;
+        }
         mhc_post_cpu(x.data(), trace->birkhoff, trace->h_post, h_out_bf16.data(),
                      scratch_bundle.data());
         x.swap(scratch_bundle);
@@ -468,12 +484,14 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
                       &report.layer0_attention,
                       "layer 0: mHC round + shared-KV SWA attention (window 128)");
   report.x_after_layer0_l2 = L2Norm(x.data(), x.size());
+  report.x_after_layer0 = x;
 
   // ===== layer 2: mHC + SWA attention + compressor + indexer ==============
   run_attention_layer(options.layer2, &report.layer2_attn_trace,
                       &report.layer2_attention,
                       "layer 2: mHC round + shared-KV SWA attention");
   report.x_after_layer2_l2 = L2Norm(x.data(), x.size());
+  report.x_after_layer2 = x;
 
   // --- the 4:1 compressor cadence over `decode_steps` tokens --------------
   // Driven by layer 2's h_in, which is what the real compressor consumes.
@@ -516,6 +534,7 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
         compressed_tokens.insert(compressed_tokens.end(), slot.begin(), slot.end());
       }
     }
+    report.layer2_compressed_tokens = compressed_tokens;
     record("layer 2: compressor C4A cadence, " + std::to_string(options.decode_steps) +
                " steps -> " + std::to_string(report.compressed_tokens_emitted) +
                " tokens",
@@ -613,8 +632,11 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
     MhcSinkhornTrace ffn_trace;
     mhc_pre_sinkhorn_cpu(x.data(), mhc.phi, mhc.alpha, mhc.bias, &ffn_trace,
                          kHcEpsilon, kHcSinkhornIters, kRmsNormEpsilon);
+    report.moe_ffn_trace = ffn_trace;
+    report.moe_h_in.assign(ffn_trace.h_in, ffn_trace.h_in + kHiddenSize);
     rms_norm_cpu(ffn_trace.h_in, ffn_norm, h_in_normed.data(), kHiddenSize,
                  kRmsNormEpsilon);
+    report.moe_h_norm.assign(h_in_normed.begin(), h_in_normed.end());
 
     // The gate runs in FP32 on the normed activation:
     //   router_logits = F.linear(hidden_states.float(), gate.weight)
@@ -685,6 +707,8 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
           resolver.Mxfp4(expert_prefix + ".w2", kHiddenSize, kMoeIntermediate);
       moe_expert_swiglu_mxfp4_cpu(w1, w3, w2, h_in_normed.data(), expert_out.data(),
                                   kSwigluLimit, &expert_scratch);
+      report.expert_outputs.insert(report.expert_outputs.end(), expert_out.begin(),
+                                   expert_out.end());
       const float weight = report.routing.weights[i];
       for (int feature = 0; feature < kHiddenSize; ++feature) {
         routed[static_cast<std::size_t>(feature)] +=
@@ -692,6 +716,7 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
       }
     }
     report.moe_routed_l2 = L2Norm(routed.data(), routed.size());
+    report.moe_routed = routed;
 
     // --- the shared expert (FP8, intermediate = moe_intermediate * n_shared)
     std::vector<float> shared(kHiddenSize, 0.0F);
@@ -706,6 +731,7 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
                                 kSwigluLimit, &expert_scratch);
     }
     report.moe_shared_l2 = L2Norm(shared.data(), shared.size());
+    report.moe_shared = shared;
 
     // DeepseekV4MoE.forward: the top-k weights are already normalized, so the
     // scaling factor multiplies the ROUTED SUM and the shared expert is added
@@ -722,6 +748,7 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
       }
     }
 
+    report.moe_h_out = ffn_out;
     mhc_post_cpu(x.data(), ffn_trace.birkhoff, ffn_trace.h_post, ffn_out.data(),
                  scratch_bundle.data());
     x.swap(scratch_bundle);
@@ -732,8 +759,8 @@ SemiE2eReport SemiE2ePipeline::Run(const SemiE2eOptions& options,
            Fidelity::kReference,
            "layers." + std::to_string(layer) + ".{hc_ffn_*, ffn_norm, ffn.gate.*, "
            "ffn.experts.*, ffn.shared_experts.*} (real)",
-           "routed experts are MXFP4 group-32; the nibble order is the "
-           "documented assumption in dsv4_layers.h",
+           "routed experts are MXFP4 group-32, low nibble first as confirmed "
+           "by official DeepSeek inference/convert.py",
            MicrosecondsSince(start));
   }
 

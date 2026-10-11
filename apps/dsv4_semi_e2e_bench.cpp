@@ -276,7 +276,7 @@ int main(int argc, char** argv) try {
       std::int32_t indexer_top_k;
     } header{};
     std::memcpy(header.magic, "DSV4SE2E", 8);
-    header.version = 1;
+    header.version = 3;
     header.dtype_code = 1;
     header.streams = kHcStreams;
     header.hidden = kHiddenSize;
@@ -295,6 +295,22 @@ int main(int argc, char** argv) try {
     write(report.layer2_attn_trace.birkhoff, sizeof(report.layer2_attn_trace.birkhoff));
     write(report.routing.experts, sizeof(report.routing.experts));
     write(report.routing.weights, sizeof(report.routing.weights));
+    // Version 2 appends the precise stage inputs needed by an independent
+    // PyTorch reference. The version-1 prefix above is kept byte-for-byte.
+    const auto write_vector = [&write](const auto& values) {
+      write(values.data(), values.size() * sizeof(values[0]));
+    };
+    write_vector(report.x_input);
+    write_vector(report.x_after_layer0);
+    write_vector(report.x_after_layer2);
+    write_vector(report.layer0_h_in);
+    write_vector(report.layer2_h_in);
+    write_vector(report.moe_h_in);
+    write(report.moe_ffn_trace.birkhoff, sizeof(report.moe_ffn_trace.birkhoff));
+    write_vector(report.expert_outputs);
+    write_vector(report.moe_routed);
+    write_vector(report.moe_shared);
+    write_vector(report.layer2_compressed_tokens);
     out.close();
     if (!out.good()) {
       std::fprintf(stderr, "error: writing %s failed\n", dump_path.c_str());
@@ -304,7 +320,7 @@ int main(int argc, char** argv) try {
     std::printf("    %s (%lld bytes)\n", dump_path.c_str(),
                 static_cast<long long>(probe.tellg()));
     std::printf("      header %zu B, x_next [1, 4, 4096] BF16, 2 x hRes [4, 4] F32,\n"
-                "      routed expert ids + weights\n",
+                "      routed expert ids + weights, v3 stage diagnostics\n",
                 sizeof(header));
   } else {
     std::printf("\n[9] golden reference dump skipped (--no-dump)\n");

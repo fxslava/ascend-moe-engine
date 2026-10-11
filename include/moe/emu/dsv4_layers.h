@@ -114,18 +114,11 @@ struct Fp8BlockMatrix {
 
 // E2M1 nibbles with per-row, per-32-group E8M0 scales.
 //
-// NIBBLE ORDER -- AN ASSUMPTION THAT THE CHECKPOINT CANNOT SETTLE
-//   `packed` holds two logical elements per byte. This emulation reads logical
-//   column 2i from the LOW nibble and 2i+1 from the HIGH nibble, which is the
-//   dominant MX packing convention.
-//
-//   It cannot be confirmed from the data. Swapping the order permutes elements
-//   within each adjacent pair, which leaves the value MULTISET -- and therefore
-//   every distributional statistic, including the per-group max that sets the
-//   E8M0 scale -- completely unchanged. No test on the weights alone can tell
-//   the two apart; only a device run or a documented packing can. The order is
-//   therefore isolated in `kMxfp4LowNibbleFirst` below so it can be flipped in
-//   exactly one place, and the bench reports which convention it used.
+// NIBBLE ORDER -- confirmed by the official DeepSeek-V4-Flash
+// inference/convert.py cast_e2m1fn_to_e4m3fn: low then high are stacked and
+// flattened along the logical input dimension. The all-ones GEMV cannot
+// distinguish a within-pair swap, so scripts/verify_mxfp4_packing.py also
+// checks every decoded value and a nonuniform probe.
 struct Mxfp4Matrix {
   const std::uint8_t* packed = nullptr;  // [rows, cols/2] packed nibbles
   const std::uint8_t* scale = nullptr;   // [rows, cols/32] E8M0
@@ -133,7 +126,7 @@ struct Mxfp4Matrix {
   int cols = 0;  // LOGICAL columns, i.e. twice the stored byte width
 };
 
-// See the note on Mxfp4Matrix. Change here and nowhere else.
+// See the source-backed convention above. Change here and nowhere else.
 inline constexpr bool kMxfp4LowNibbleFirst = true;
 
 // The eight magnitudes of OCP E2M1: 1-2-1 with bias 1, no infinities, no NaN.
