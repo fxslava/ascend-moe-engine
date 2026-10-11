@@ -57,6 +57,7 @@
 // is complete before selection begins.
 
 #include "kernel_operator.h"
+#include "simt_api/asc_simt.h"
 
 #include "arch35_ub_layout.h"
 #include "moe/kernels/arch35/kernel_contracts.h"
@@ -91,6 +92,11 @@
 // @ascend-layout: name=red_tmp pos=VECCALC offset=176864 count=512 dtype=float
 // @ascend-layout: name=red_dst pos=VECCALC offset=178944 count=8 dtype=float
 // @ascend-layout: name=nan_box pos=VECCALC offset=178976 count=8 dtype=int32_t
+// SIMT raw-pointer aliases of the tensors above, declared so the
+// analyzer can still verify their extents, and grouped so the
+// deliberate overlap is not reported as accidental aliasing.
+// @ascend-layout: name=fp8_lut_ub pos=VECCALC offset=80576 count=256 dtype=float
+// @ascend-reuse-group: group=simt_fp8_lut_ub names=fp8_lut,fp8_lut_ub
 // <<< END GENERATED UB LAYOUT ANNOTATIONS
 
 using namespace AscendC;
@@ -110,6 +116,21 @@ constexpr int32_t kQuietNanBits = 0x7FC00000;
 
 }  // namespace
 
+// Build the 256-code E4M3FN table in thread registers. Each SIMT lane owns
+// one code, so no scalar loop writes a bulk tensor buffer.
+__simt_vf__ inline void BuildE4M3LutVf(__ubuf__ float* lut, float quiet_nan) {
+  const uint32_t code = threadIdx.x;
+  if (code >= 256U) return;
+  const uint32_t exponent = (code >> 3U) & 0x0FU;
+  const uint32_t mantissa = code & 0x07U;
+  const bool negative = (code & 0x80U) != 0U;
+  float magnitude = exponent == 0U
+      ? static_cast<float>(mantissa) * (1.0F / 512.0F)
+      : ldexpf(1.0F + static_cast<float>(mantissa) * 0.125F,
+               static_cast<int32_t>(exponent) - 7);
+  if (exponent == 0x0FU && mantissa == 0x07U) magnitude = quiet_nan;
+  lut[code] = negative ? -magnitude : magnitude;
+}
 extern "C" __global__ __aicore__ void ker04_fp8_indexer_topk(
     GM_ADDR query_gm, GM_ADDR key_cache_gm, GM_ADDR dequant_scales_gm,
     GM_ADDR block_table_gm, GM_ADDR indices_gm, GM_ADDR workspace_gm,
@@ -189,47 +210,16 @@ extern "C" __global__ __aicore__ void ker04_fp8_indexer_topk(
   }
 
   // =========================================================================
-  // Phase A -- the E4M3 lookup table, 256 entries, built once in scalar.
-  //
-  //   exp == 15 && mant == 7  -> quiet NaN (the two E4M3FN NaN encodings)
-  //   exp == 0                -> subnormal, mantissa * 2^-9 (signed zero at 0)
-  //   otherwise               -> (1 + mantissa/8) * 2^(exp - 7)
-  //
-  // The NaN is produced from its exact bit pattern through an int32 box rather
-  // than from an arithmetic identity, because this device has no scalar libm
-  // and 0.0/0.0 or sqrt(-1) would be relying on unspecified behaviour.
+  // Phase A -- register-parallel E4M3FN decode table construction.
   // =========================================================================
   nan_box.SetValue(0, kQuietNanBits);
   const float quiet_nan = nan_box.ReinterpretCast<float>().GetValue(0);
-
-  // 2^(exp-7) for exp in [0, 16); index 0 is unused (handled as subnormal).
-  float pow2[16];
-  pow2[7] = 1.0F;
-  for (uint32_t e = 8U; e < 16U; ++e) {
-    pow2[e] = pow2[e - 1U] * 2.0F;
-  }
-  for (uint32_t e = 7U; e > 0U; --e) {
-    pow2[e - 1U] = pow2[e] * 0.5F;
-  }
-  for (uint32_t code = 0U; code < ub::kFp8LutCount; ++code) {
-    const uint32_t exponent = (code >> 3U) & 0x0FU;
-    const uint32_t mantissa = code & 0x07U;
-    const bool negative = (code & 0x80U) != 0U;
-    float magnitude;
-    if (exponent == 0x0FU && mantissa == 0x07U) {
-      magnitude = quiet_nan;
-    } else if (exponent == 0U) {
-      magnitude = static_cast<float>(mantissa) * (1.0F / 8.0F) * (1.0F / 64.0F);
-    } else {
-      magnitude = (1.0F + static_cast<float>(mantissa) * 0.125F) * pow2[exponent];
-    }
-    fp8_lut.SetValue(code, negative ? -magnitude : magnitude);
-  }
-  // Scalar-written table, vector-read through Gather: the S->V handshake is
-  // what makes the table visible to the Vector unit.
-  SetFlag<HardEvent::S_V>(EVENT_ID3);
-  WaitFlag<HardEvent::S_V>(EVENT_ID3);
-
+  __ubuf__ float* fp8_lut_ub =
+      reinterpret_cast<__ubuf__ float*>(fp8_lut.GetPhyAddr());
+  asc_vf_call<BuildE4M3LutVf>(dim3(256, 1, 1), fp8_lut_ub, quiet_nan);
+  // The SIMT VF writes the table consumed by SIMD Gather below.
+  // @ascend-ignore: AKA3005
+  PipeBarrier<PIPE_V>();
   // =========================================================================
   // Phase B -- dequantize the 64x128 query once, 1024 codes at a time, and
   // load the 64 head scales. head_scale already folds the query dequant and

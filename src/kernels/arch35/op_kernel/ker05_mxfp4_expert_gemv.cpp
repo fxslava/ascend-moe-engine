@@ -49,10 +49,8 @@
 // E2M1 and E8M0 are decoded ARITHMETICALLY, in register:
 //   E2M1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are reproduced branch-free
 //   from the 3 magnitude bits; the sign is bit 3.
-//   E8M0 code e is 2^(e-127), which is exactly ldexpf(1, e-127). Codes 0 and
-//   255 are the OCP special cases (2^-127 and NaN); ldexpf renders 0 as
-//   2^-127 correctly and 255 as 2^128 = inf rather than NaN. Real checkpoints
-//   do not emit either; see ISSUES_AND_GAPS.md.
+//   E8M0 code e is 2^(e-127), which is exactly ldexpf(1, e-127) for e<255.
+//   Code 0 is 2^-127; code 255 is the OCP NaN marker and is emitted as NaN.
 //
 // ACCUMULATION ORDER: the scale is folded per column before the reduction,
 // where the oracle sums a group's 32 columns and scales the partial once.
@@ -126,8 +124,10 @@ __simt_vf__ inline void Mxfp4RowProductVf(
     const float weight = ((code & 8U) != 0U) ? -magnitude : magnitude;
 
     // E8M0: one scale per 32 logical columns, value 2^(code - 127).
-    const float scale =
-        ldexpf(1.0F, static_cast<int32_t>(scale_row[col >> 5U]) - 127);
+    const uint8_t scale_code = scale_row[col >> 5U];
+    const float scale = (scale_code == 255U)
+        ? __builtin_nanf("")
+        : ldexpf(1.0F, static_cast<int32_t>(scale_code) - 127);
 
     product[col] = weight * scale * x[col];
   }

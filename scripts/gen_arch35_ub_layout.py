@@ -167,7 +167,7 @@ ALIASES = {
     "Ker01": [],
     "Ker02": [],
     "Ker03": [],
-    "Ker04": [],
+    "Ker04": [("fp8_lut_ub", "FP8_LUT")],
     "Ker05": [("x_ub", "XF32"), ("prod_ub", "PROD")],
 }
 
