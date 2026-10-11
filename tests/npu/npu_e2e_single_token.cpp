@@ -139,6 +139,12 @@ int RunMain(int argc, char** argv) {
     RuntimeConfig config;
     config.synthetic_weights = true;
     config.max_context_len = 256;  // bring-up reservation; the probe runs one position
+    // The checkpoint's compression schedule decides which attention cores the
+    // probe plans and dispatches; absent, every layer stays on SWA.
+    config.compress_ratios = model.compress_ratios;
+    if (!config.compress_ratios.empty()) {
+      config.compress_ratios_provenance = GeometryProvenance::kCheckpointConfig;
+    }
 
     // Real hardware: synthetic weights are REAL bytes, so the hierarchy's host
     // half is real pinned RAM. The probe never guesses a footprint; coverage
@@ -171,7 +177,8 @@ int RunMain(int argc, char** argv) {
     size_t total_hbm = 0;
     DSV4_REQUIRE(device->QueryDeviceMemory(&free_hbm, &total_hbm), "aclrtGetMemInfo(ACL_HBM_MEM) failed");
     const size_t backbone_bytes =
-        Dsv4Pipeline::BackboneDeviceBytes(model.mla, config.block_size, config.max_context_len);
+        Dsv4Pipeline::BackboneDeviceBytes(model.mla, config.block_size, config.max_context_len,
+                                          config.compress_ratios);
     options.device_slots = ExclusiveExpertManager::PlanDeviceSlots(
         free_hbm, backbone_bytes, layout.slot_num_bytes(), coverage, kDeviceReserveBytes, kTransferChunkBytes,
         model.num_experts_per_tok, -1);

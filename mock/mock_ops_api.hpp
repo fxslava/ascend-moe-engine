@@ -69,12 +69,26 @@ aclnnStatus MockValidateRoutingForTest(const aclTensor* expert_idx, int64_t expe
                                        const aclTensor* group_list_out);
 aclnnStatus MockValidateGmmForTest(const aclTensorList* weight, const aclTensorList* scale_optional,
                                    int64_t split_item, int64_t group_type);
-// Plans since the last read that saw aclnnMhcSinkhorn's trailing
-// ViewCopy(output, output) stage run as a same-address self-copy -- i.e. a
-// CONTIGUOUS output view, the manual-4.31 condition that makes the executor
-// non-reusable. A non-contiguous output (the workaround: Contiguous then
-// allocates a distinct temp, src != dst) is not counted.
-int MockSinkhornViewCopyWarnings();
+// The vendored operators' manual-4.31 repeatability ledger. See the long note
+// in mock_ops.cpp; in short:
+//
+//   MockVendorSelfCopyHazards()   plans across the whole vendored set that
+//                                 would issue a same-address ViewCopy. Every
+//                                 wrapper in third_party/ops_dsv4 is written
+//                                 or patched to avoid one, so the invariant
+//                                 the tests hold is that this stays 0.
+//   MockSinkhornSelfCopyElisions() plans where the patched aclnnMhcSinkhorn
+//                                 wrapper skipped its trailing ViewCopy
+//                                 because the kernel had already written the
+//                                 caller tensor -- the contiguous-output case
+//                                 upstream copied onto its own address.
+//   MockRefOutputPlans()          plans of an operator whose output IS one of
+//                                 its inputs: Compressor.stateCache,
+//                                 aclnnKvCompressEpilog and
+//                                 aclnnIndexerCompressEpilogV2.
+int MockVendorSelfCopyHazards();
+int MockSinkhornSelfCopyElisions();
+int MockRefOutputPlans();
 
 }  // namespace mock
 }  // namespace ascend_moe

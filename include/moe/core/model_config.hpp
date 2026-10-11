@@ -83,11 +83,23 @@ class ModelConfig {
   double swiglu_limit = kSwigluLimit;
   double rms_norm_eps = kRmsNormEpsilon;
 
-  // ---- the compressed Lightning Indexer (reported, NOT applied: the
-  //      pipeline's deviation note 2 says why) -----------------------------
+  // ---- the compressed Lightning Indexer ---------------------------------
   int64_t index_topk = kIndexTopK;
   int64_t index_head_dim = kIndexHeadDim;
   int64_t index_n_heads = kIndexNumHeads;
+
+  // ---- per-layer token compression --------------------------------------
+  //
+  // One ratio per layer: <= 1 is SWA, 4 is CSA, 128 is HCA. This is the single
+  // field that decides which attention path every layer takes, so Validate()
+  // refuses a length that is not `num_hidden_layers` and any value outside
+  // {0, 1, 4, 128} -- the deployed kernel admits only 4 and 128, and a
+  // mis-dispatched layer would compress a stream nothing ever reads.
+  //
+  // Absent from config.json means the vector stays empty and every layer runs
+  // SWA; see the note on RuntimeConfig::compress_ratios for why that, and not
+  // a guessed interleave, is the default.
+  std::vector<int64_t> compress_ratios;
 
   // ---- MLA geometry: only what the checkpoint actually publishes is
   //      overwritten. This config.json carries qk_rope_head_dim but NOT

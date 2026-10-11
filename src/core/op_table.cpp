@@ -76,26 +76,71 @@ const OpDeclaration kDeclarations[] = {
      "fused expert GEMM1 + clamped SwiGLU + MX requant (fused path)", false, false},
     {OpId::kGroupedMatmulFinalizeRoutingV3, "aclnnGroupedMatmulFinalizeRoutingV3",
      "fused GEMM2 + combine; unusable with scattered expert slots, see dsv4_pipeline.cpp", false, false},
-    // Vendored arch35 operators (third_party/ops_transformer, libcust_opapi.so
-    // in a CANN build): the mHC residual chain and the sparse-attention
-    // indexer. They are required -- this repository builds their host library
-    // itself, so a missing symbol is a build problem, not a toolkit variant.
+    // Vendored arch35 DSV4 operators (third_party/ops_dsv4, libcust_opapi.so
+    // in a CANN build): the mHC residual chain, both sparse-attention
+    // indexers, the token-level KV compressor, the shared-KV attention core
+    // and the two cache epilogs. They are required -- this repository builds
+    // their host library itself, so a missing symbol is a build problem, not a
+    // toolkit variant.
     {OpId::kMhcPre, "aclnnMhcPre", "vendored mHC pre-mapping (fold states into layer input + routing state)", true,
      false},
     {OpId::kMhcSinkhorn, "aclnnMhcSinkhorn", "vendored mHC doubly-stochastic normalization of hRes", true, false},
     {OpId::kMhcPost, "aclnnMhcPost", "vendored mHC residual combine after the attention/MLP layer", true, false},
+    // The vllm-ascend decomposition of the same mHC mapping, alongside the
+    // trio above rather than replacing it. HcPre fuses the whole prologue into
+    // one launch; HcPreInvRms + aclnnMatmul + HcPreSinkhorn is the staged
+    // alternative, and HcPost is the BSHD residual combine.
+    {OpId::kHcPre, "aclnnHcPre",
+     "vendored fused mHC prologue (inv-RMS + mixing projection + Sinkhorn in one launch)", true, false},
+    {OpId::kHcPreInvRms, "aclnnHcPreInvRms",
+     "vendored reciprocal-RMS prologue; the only producer of HcPreSinkhorn's rsqrt input", true, false},
+    {OpId::kHcPreSinkhorn, "aclnnHcPreSinkhorn",
+     "vendored mixing projection fused with the Sinkhorn normalization (no in-place Sinkhorn tensor)", true,
+     false},
+    {OpId::kHcPost, "aclnnHcPost", "vendored mHC residual combine, BSHD layout, no attributes", true, false},
     {OpId::kQuantLightningIndexer, "aclnnQuantLightningIndexer",
      "vendored sparse-flash indexer top-k + query/key quantization", true, false},
+    {OpId::kCompressor, "aclnnCompressor",
+     "vendored token-level KV compressor (softmax pooling + RMSNorm + RoPE, cmp_ratio 4/128)", true, false},
+    {OpId::kVllmQuantLightningIndexer, "aclnnVllmQuantLightningIndexer",
+     "vendored shared-KV indexer top-k (metadata input, compressed key stream)", true, false},
+    {OpId::kKvQuantSparseAttnSharedkv, "aclnnKvQuantSparseAttnSharedkv",
+     "vendored shared-KV MQA sparse attention over the hybrid quantized KV cache", true, false},
+    {OpId::kKvCompressEpilog, "aclnnKvCompressEpilog",
+     "vendored compressed-KV quantize + paged-cache scatter epilog", true, false},
+    {OpId::kIndexerCompressEpilogV2, "aclnnIndexerCompressEpilogV2",
+     "vendored indexer-cache scatter epilog", true, false},
 };
 
 // Resolve a symbol out of the libraries already on the loader path. The CANN
 // libraries are DT_NEEDED of this binary (see CMakeLists.txt), so RTLD_DEFAULT
 // finds them without a dlopen; the fallback covers a build where a split
 // libopapi_* was dropped from the link line.
-void* ResolveSymbol(const char* symbol, std::string* provider) {
+void* ResolveSymbol(const char* symbol, std::string* provider, bool custom = false) {
   ::dlerror();
-  void* address = ::dlsym(RTLD_DEFAULT, symbol);
-  if (address == nullptr) {
+  void* address = nullptr;
+#ifndef ASCEND_MOCK_RUNTIME
+  if (custom) {
+    // CANN also exports Compressor, with a DIFFERENT C ABI. Never fall
+    // through to that symbol when the vendored implementation is absent.
+    static void* custom_library = ::dlopen("libcust_opapi.so", RTLD_NOW | RTLD_LOCAL);
+    if (custom_library != nullptr) {
+      address = ::dlsym(custom_library, symbol);
+      // dlsym(handle) also searches that library's dependencies. Reject an
+      // identically named toolkit export if this custom package lacks it.
+      Dl_info info{};
+      if (address != nullptr &&
+          (::dladdr(address, &info) == 0 || info.dli_fname == nullptr ||
+           std::string(info.dli_fname).find("libcust_opapi.so") == std::string::npos)) {
+        address = nullptr;
+      }
+    }
+  } else
+#endif
+  {
+    address = ::dlsym(RTLD_DEFAULT, symbol);
+  }
+  if (address == nullptr && !custom) {
     static const char* const kCandidates[] = {"libopapi.so", "libopapi_nn.so", "libopapi_transformer.so",
                                               "libopapi_math.so", "libcust_opapi.so"};
     for (const char* candidate : kCandidates) {
@@ -154,8 +199,9 @@ void OpTable::Resolve(OpId id, const char* name, const char* role, bool required
   entry.role = role;
   entry.required = required;
   const std::string plan_symbol = std::string(name) + "GetWorkspaceSize";
-  entry.plan = ResolveSymbol(plan_symbol.c_str(), &entry.provider);
-  entry.launch = ResolveSymbol(name, entry.plan == nullptr ? &entry.provider : nullptr);
+  const bool custom = id >= OpId::kMhcPre;
+  entry.plan = ResolveSymbol(plan_symbol.c_str(), &entry.provider, custom);
+  entry.launch = ResolveSymbol(name, entry.plan == nullptr ? &entry.provider : nullptr, custom);
 }
 
 void OpTable::ResolveBare(OpId id, const char* name, const char* role, bool required) {
@@ -240,6 +286,39 @@ void StaticOpSlot::Adopt(OpId id, const char* label, uint64_t workspace_size, ac
   // Without this, the launch consumes the executor and the next step would have
   // to re-plan -- which is exactly the per-step host work the brief forbids.
   DSV4_ACL_CHECK(aclSetAclOpExecutorRepeatable(executor_));
+}
+
+void StaticOpSlot::NoteSingleUse(OpId id, const char* label, uint64_t workspace_size) {
+  DSV4_REQUIRE(executor_ == nullptr, label << ": this slot already holds a retained executor");
+  id_ = id;
+  label_ = label;
+  workspace_size_ = workspace_size;
+  single_use_ = true;
+}
+
+void StaticOpSlot::LaunchSingleUse(const OpTable& table, void* workspace, void* stream, aclOpExecutor* executor,
+                                   uint64_t workspace_size) const {
+  DSV4_REQUIRE(single_use_, label_ << ": LaunchSingleUse on a retained-executor stage");
+  DSV4_REQUIRE(executor != nullptr, label_ << ": LaunchSingleUse without a freshly planned executor");
+  // The fresh plan's own size is what the launch must carry, and it must not
+  // exceed what the probe at Build reserved -- a re-plan that grew would run
+  // past the shared workspace.
+  DSV4_REQUIRE(workspace_size <= workspace_size_,
+               label_ << ": the re-plan wants " << workspace_size << " workspace bytes but Build reserved "
+                      << workspace_size_);
+  DSV4_REQUIRE(workspace != nullptr || workspace_size == 0,
+               label_ << ": needs " << workspace_size << " workspace bytes but was given none");
+  CheckForInterrupt();
+  AclnnLaunchFn launch = table.launch_fn(id_);
+  const int status = launch(workspace_size == 0 ? nullptr : workspace, workspace_size, executor, stream);
+  if (status != 0) {
+    // The launch did not take ownership, so this plan has to be released here
+    // or it leaks on every failing step.
+    OpExecutorGuard orphan(executor);
+    throw AclError(label_, __FILE__, __LINE__, status);
+  }
+  // Success: a non-repeatable executor is consumed by its own launch, so there
+  // is deliberately nothing to destroy.
 }
 
 void StaticOpSlot::SetAddress(size_t index, aclTensor* tensor, void* address) const {
