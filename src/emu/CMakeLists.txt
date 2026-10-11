@@ -10,9 +10,16 @@
 # -----------------------------------------------------------------------------
 
 add_library(moe_emu STATIC
+  # the three fused decode operators
   mhc_fused_sinkhorn_gemv.cpp
   paged_compressor_decode.cpp
   fast_fp8_indexer_topk.cpp
+  # the surrounding layer machinery the semi-end-to-end harness threads them
+  # through: quantized GEMVs, shared-KV SWA attention, the MoE block
+  dsv4_quant_gemv.cpp
+  shared_kv_swa_attention.cpp
+  moe_block.cpp
+  semi_e2e_pipeline.cpp
 )
 
 target_include_directories(moe_emu PUBLIC

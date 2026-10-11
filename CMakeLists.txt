@@ -32,9 +32,11 @@
 #     cmake -S . -B build_emu -DENABLE_HOST_EMU=ON -DCMAKE_BUILD_TYPE=Release
 #     cmake --build build_emu -j && ctest --test-dir build_emu
 #     ./build_emu/apps/dsv4_layer0_emu_bench
+#     ./build_emu/apps/dsv4_semi_e2e_bench
 #
 # LAYOUT
-#   apps/       executables (moe_runner, dsv4_layer0_emu_bench)
+#   apps/       executables (moe_runner, dsv4_layer0_emu_bench,
+#               dsv4_semi_e2e_bench)
 #   include/    the engine's public headers (moe/...)
 #   src/        the engine library
 #   mock/       the symbolic libopapi_mock backend (headers + implementation)
@@ -181,12 +183,14 @@ if(ENABLE_HOST_EMU)
 
   add_subdirectory(src/emu)
 
-  add_executable(dsv4_layer0_emu_bench apps/dsv4_layer0_emu_bench.cpp)
-  target_link_libraries(dsv4_layer0_emu_bench PRIVATE moe_emu)
-  target_compile_options(dsv4_layer0_emu_bench PRIVATE ${MOE_EMU_WARNINGS})
-  set_target_properties(dsv4_layer0_emu_bench PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/apps"
-  )
+  foreach(emu_app dsv4_layer0_emu_bench dsv4_semi_e2e_bench)
+    add_executable(${emu_app} "apps/${emu_app}.cpp")
+    target_link_libraries(${emu_app} PRIVATE moe_emu)
+    target_compile_options(${emu_app} PRIVATE ${MOE_EMU_WARNINGS})
+    set_target_properties(${emu_app} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/apps"
+    )
+  endforeach()
 
   enable_testing()
   add_subdirectory(tests/emu)

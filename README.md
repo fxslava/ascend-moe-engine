@@ -9,7 +9,8 @@ this repository carries that subtree's full commit history (root-level here).
 ## Layout
 
 ```
-apps/       executables (moe_runner, dsv4_layer0_emu_bench)
+apps/       executables (moe_runner, dsv4_layer0_emu_bench,
+            dsv4_semi_e2e_bench)
 include/    engine public headers (moe/...), including moe/emu/ -- the
             header-only host emulation API, safetensors reader and FP8 types
 src/        engine library (static arena, exclusive staging, router engine,
@@ -18,8 +19,9 @@ src/        engine library (static arena, exclusive staging, router engine,
 src/emu/    plain C/C++ host emulation of the three fused decode operators
 mock/       symbolic libopapi_mock backend (zero-NPU contract validation)
 tests/      common test utilities plus sim/, mock/, npu/ and emu/ suites
-scripts/    download_dsv4_layer0.sh -- fetches the metadata and the shard that
-            holds Layer 0
+scripts/    download_dsv4_layer0.sh -- metadata + the shard holding Layer 0
+            download_dsv4_semi_e2e_weights.sh + dsv4_fetch_tensors.py --
+            per-tensor HTTP range fetch, repacked into one compact file
 python/     torch-free tokenizer + benchmark harness (tokenizers-only)
 ```
 
@@ -127,6 +129,77 @@ file as well-formed: the header parses in full and each `TensorView` carries an
 `available` flag, so a tensor outside the window is reported rather than
 faulted on. Use `--full` for the FP8 projections.
 
+### Semi-end-to-end multi-layer harness
+
+`apps/dsv4_semi_e2e_bench` threads one token through a representative slice of
+the stack, so the fused operators are exercised with real inter-stage data
+dependencies rather than in isolation:
+
+```text
+layer 0   mHC round -> shared-KV SWA attention (window 128) -> mHC fold-back
+layer 2   mHC round -> SWA attention
+          + 4:1 compressor cadence (HOLD x3, EMIT) + FP8 indexer top-512
+          -> mHC fold-back
+layer 1   mHC round -> MoE (hash router, 6 routed MXFP4 experts + 1 FP8
+          shared) -> mHC fold-back
+```
+
+```bash
+scripts/download_dsv4_semi_e2e_weights.sh     # 365 MB, 101 tensors
+./build_emu/apps/dsv4_semi_e2e_bench
+```
+
+Measured: **228 ms** wall clock, **334 MB** peak RSS (budgets 1.5 s / 4 GB).
+The weight file is mmap'd and every quantized matrix is dequantized one output
+row at a time; materializing FP32 copies would cost 4x for FP8 and 8x for FP4.
+`--no-dump`, `--decode-steps`, `--indexer-seq-len`, `--memory-budget-mb` and
+`--time-budget-ms` are all adjustable. Every stage prints a fidelity tag —
+`reference`, `reference*` (one convention assumed) or `synth-input` — so what
+is faithful and what is substituted is never implicit.
+
+**Selective tensor fetch.** A leading-window slice is useless here: in shard 3,
+expert 0 starts at byte 344,923,480 and expert 7 at 3,150,912,856, so the
+~100 MB of expert weights is spread across 3.4 GB. The script issues one HTTP
+range request per tensor and repacks the result into a *new, valid* safetensors
+file with regenerated offsets — not a sparse shard-shaped file, whose holes
+would read as zeros and be indistinguishable from real weights.
+
+**Layers 0–2 are hash layers, so "the first N experts" are the wrong ones.**
+`num_hash_layers: 3`, and for those layers the routed experts are a pure
+function of the token id — `indices = tid2eid[token_id]`, with
+`e_score_correction_bias = None`. The checkpoint corroborates it exactly:
+`ffn.gate.tid2eid` is present on precisely 3 layers and `ffn.gate.bias` on
+precisely the other 40. The script therefore fetches `tid2eid` first, reads the
+row for `--token-id`, and downloads exactly those six experts; token 3 routes to
+`[30, 205, 192, 177, 242, 102]`, none of which is in the first eight. The id and
+its expert row go into the file's `__metadata__`, and the bench refuses a
+different token rather than routing to experts the file does not carry.
+
+**Two quantization schemes that look alike.** Dense and shared-expert weights
+are `F8_E4M3` with one `F8_E8M0` scale per **128×128 block**
+(`wq_a [1024, 4096]` → `scale [8, 32]`). Routed experts are E2M1 nibbles with
+one scale per **row, per 32-element group** (`w1` logical `[2048, 4096]` →
+`scale [2048, 128]`). Reading one with the other's indexing yields finite,
+plausibly-scaled garbage, so `test_semi_e2e_pipeline` perturbs a single scale
+and asserts exactly which outputs move.
+
+Two things worth knowing about the expert weights: the packed payload is spelled
+`I8` in the header, not `F4_E2M1` — `expert_dtype: "fp4"` plus the scale-grid
+width is what establishes that the bytes are nibble pairs, and this repo's
+`src/core/weight_source.cpp:600` gates on `"F4_E2M1"`/`"MOE_F4"`, which would
+not match. And the **nibble order cannot be settled from the checkpoint**:
+swapping it permutes elements within each adjacent pair, leaving the value
+multiset — and so every distributional statistic, including the per-group max
+that sets the scale — completely unchanged. It is isolated in
+`kMxfp4LowNibbleFirst` (`include/moe/emu/dsv4_layers.h`) so a device run can
+settle it in one place.
+
+**Shared KV, not per-head.** `wkv` maps 4096 → 512, which is `head_dim`, *not*
+`n_heads * head_dim`: with `num_key_value_heads: 1` all 64 query heads score
+against the same 512-wide row per token. That is what the vendored
+`kv_quant_sparse_attn_sharedkv` is named for, and why the window cache is
+128×512 floats rather than 64× that.
+
 ### A measured caveat on the 20-iteration Sinkhorn bound
 
 With the **real** `layers.0.hc_attn_*` weights, 20 Sinkhorn iterations do *not*
@@ -157,6 +230,7 @@ the real-weight regime by its measured value instead.
 | `test_paged_compressor_emu` | columnar softmax, RMSNorm + half-mode RoPE on the last 64 lanes, HOLD/EMIT cadence and the coff=2 window overlap | no (emu build) |
 | `test_fp8_indexer_emu` | E4M3FN/E5M2/E8M0 round trips, per-head-relu ordering, top-512 identical to a full-sort baseline as a ranked list | no (emu build) |
 | `test_safetensors_loader` | offsets/dtypes/shapes, misaligned data segments, truncated slices, malformed headers; parses the real shard when present | no (emu build) |
+| `test_semi_e2e_pipeline` | FP8 128x128 vs MXFP4 group-32 scale indexing, window-cache eviction, hash vs noaux_tc routing, the asymmetric SwiGLU clamp, and the assembled multi-layer pass | no (emu build) |
 | `emu_standalone_linkage` | the emu bench links no CANN, Python or Torch library and has no undefined symbols | no (emu build) |
 
 `ENABLE_MOCK_RUNTIME=ON` builds the mock suite and the standalone CPU

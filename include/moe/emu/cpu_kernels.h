@@ -202,6 +202,53 @@ void mhc_fused_sinkhorn_gemv_traced(
     float eps = kHcEpsilon,
     int num_iters = kHcSinkhornIters);
 
+// THE PRE AND POST HALVES, SPLIT
+// ------------------------------
+// The fused entry point takes `h_out` as an INPUT, which is fine for an
+// operator-level contract but cannot express a real layer: the decoder does
+//
+//   h_in, h_post, B = hc_pre(x)        <- needs x only
+//   h_in            = RMSNorm(h_in)
+//   h_out           = sub_block(h_in)  <- needs h_in
+//   x_next          = hc_post(...)     <- needs h_out
+//
+// so h_out does not exist until after the sub-block has run on h_in. (See
+// DeepseekV2DecoderLayer.forward in vllm-ascend
+// vllm_ascend/models/deepseek_v4.py, which calls hc_pre, then
+// input_layernorm, then self_attn, then hc_post with the post/comb that
+// hc_pre returned.) Calling the fused operator with a dummy h_out just to
+// recover the trace would redo the 24x16384 projection and the Sinkhorn
+// solve for nothing, so the two halves are exposed separately.
+//
+// NOTE ON THE NORM'S POSITION: the RMSNorm between them applies to `h_in`,
+// the [1, D] mHC output -- NOT to the [1, n, D] stream bundle on the way in.
+// The bundle's own RMS reciprocal is computed inside hc_pre and applied to
+// the projection; `attn_norm.weight` / `ffn_norm.weight` are a separate,
+// later norm over 4096 lanes. Normalizing the bundle first instead would
+// produce a running pipeline with the wrong activation scale at every layer.
+
+// Everything up to and including the Sinkhorn solve and h_in. Writes the
+// trace; does not touch any output stream.
+void mhc_pre_sinkhorn_cpu(
+    const void* x_bf16,        // [1, n, D] BF16
+    const float* phi_fp32,     // [24, 16384] FP32
+    const float* alpha_fp32,   // [3] FP32
+    const float* bias_fp32,    // [24] FP32
+    MhcSinkhornTrace* trace,
+    float eps = kHcEpsilon,
+    int num_iters = kHcSinkhornIters,
+    float norm_eps = kRmsNormEpsilon);
+
+// The fold-back: x_next[j, :] = sum_i B[i, j] x[i, :] + h_post[j] * h_out[:].
+// `birkhoff` and `h_post` come from a preceding mhc_pre_sinkhorn_cpu call.
+// `x_next` may alias `x`.
+void mhc_post_cpu(
+    const void* x_bf16,        // [1, n, D] BF16, the residual going in
+    const float* birkhoff,     // [n, n] FP32, row-major
+    const float* h_post,       // [n] FP32
+    const void* h_out_bf16,    // [1, D] BF16, the sub-block FUNCTION output
+    void* x_next_bf16);        // [1, n, D] BF16
+
 // The declared entry point. Identical math; discards the trace.
 void mhc_fused_sinkhorn_gemv_cpu(
     const void* x_bf16,        // Input residual stream: [1, 4, 4096] BF16 (TND)

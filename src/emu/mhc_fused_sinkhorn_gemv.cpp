@@ -167,20 +167,18 @@ void sinkhorn_knopp_4x4(const float* logits, float* out, float eps, int num_iter
 // The fused operator
 // ---------------------------------------------------------------------------
 
-void mhc_fused_sinkhorn_gemv_traced(
+void mhc_pre_sinkhorn_cpu(
     const void* x_bf16,
     const float* phi_fp32,
     const float* alpha_fp32,
     const float* bias_fp32,
-    const void* h_out_bf16,
-    void* x_next_bf16,
     MhcSinkhornTrace* trace,
     float eps,
-    int num_iters) {
+    int num_iters,
+    float norm_eps) {
   if (x_bf16 == nullptr || phi_fp32 == nullptr || alpha_fp32 == nullptr ||
-      bias_fp32 == nullptr || h_out_bf16 == nullptr || x_next_bf16 == nullptr ||
-      trace == nullptr) {
-    throw std::invalid_argument("mhc_fused_sinkhorn_gemv: null argument");
+      bias_fp32 == nullptr || trace == nullptr) {
+    throw std::invalid_argument("mhc_pre_sinkhorn: null argument");
   }
   RequirePositive(num_iters, "num_iters");
 
@@ -189,16 +187,14 @@ void mhc_fused_sinkhorn_gemv_traced(
   constexpr int flat = kHcFlatWidth;
 
   const auto* x = static_cast<const std::uint16_t*>(x_bf16);
-  const auto* h_out = static_cast<const std::uint16_t*>(h_out_bf16);
-  auto* x_next = static_cast<std::uint16_t*>(x_next_bf16);
 
   // --- widen x once --------------------------------------------------------
-  // Every stage below reads x at least twice (RMS, projection, the two
-  // reductions), so widening once into a scratch buffer is both faster and
-  // the only way to keep all four reads bit-identical.
-  static thread_local float x_f32[flat];
+  // Every stage below reads x at least twice (RMS, projection, the h_in
+  // reduction), so widening once is both faster and the only way to keep all
+  // the reads bit-identical.
+  static thread_local float pre_x_f32[flat];
   for (int i = 0; i < flat; ++i) {
-    x_f32[i] = Bf16ToFloat(x[i]);
+    pre_x_f32[i] = Bf16ToFloat(x[i]);
   }
 
   // --- inv_rms over the flattened stream -----------------------------------
@@ -206,10 +202,10 @@ void mhc_fused_sinkhorn_gemv_traced(
                              // uses numpy's pairwise mean, which is at least
                              // this accurate, and FP32 here would drift.
   for (int i = 0; i < flat; ++i) {
-    sum_squares += static_cast<double>(x_f32[i]) * static_cast<double>(x_f32[i]);
+    sum_squares += static_cast<double>(pre_x_f32[i]) * static_cast<double>(pre_x_f32[i]);
   }
   const float mean_square = static_cast<float>(sum_squares / static_cast<double>(flat));
-  trace->inv_rms = 1.0F / std::sqrt(mean_square + kRmsNormEpsilon);
+  trace->inv_rms = 1.0F / std::sqrt(mean_square + norm_eps);
 
   // --- phi @ flat_x, then the RMS scale ------------------------------------
   // phi is [24, 16384] row-major, so each row is a contiguous 16384-element
@@ -220,7 +216,7 @@ void mhc_fused_sinkhorn_gemv_traced(
     const float* phi_row = phi_fp32 + static_cast<std::size_t>(row) * flat;
     float dot = 0.0F;
     for (int col = 0; col < flat; ++col) {
-      dot += phi_row[col] * x_f32[col];
+      dot += phi_row[col] * pre_x_f32[col];
     }
     trace->projection[row] = dot;
     normalized[row] = dot * trace->inv_rms;
@@ -247,12 +243,39 @@ void mhc_fused_sinkhorn_gemv_traced(
   for (int feature = 0; feature < d; ++feature) {
     float accumulator = 0.0F;
     for (int stream = 0; stream < n; ++stream) {
-      accumulator += x_f32[stream * d + feature] * trace->h_pre[stream];
+      accumulator += pre_x_f32[stream * d + feature] * trace->h_pre[stream];
     }
     trace->h_in[feature] = accumulator;
   }
+}
 
-  // --- the fused post update ----------------------------------------------
+void mhc_post_cpu(
+    const void* x_bf16,
+    const float* birkhoff,
+    const float* h_post,
+    const void* h_out_bf16,
+    void* x_next_bf16) {
+  if (x_bf16 == nullptr || birkhoff == nullptr || h_post == nullptr ||
+      h_out_bf16 == nullptr || x_next_bf16 == nullptr) {
+    throw std::invalid_argument("mhc_post: null argument");
+  }
+
+  constexpr int n = kHcStreams;
+  constexpr int d = kHiddenSize;
+  constexpr int flat = kHcFlatWidth;
+
+  const auto* x = static_cast<const std::uint16_t*>(x_bf16);
+  const auto* h_out = static_cast<const std::uint16_t*>(h_out_bf16);
+  auto* x_next = static_cast<std::uint16_t*>(x_next_bf16);
+
+  // Widened into its own buffer, NOT the one mhc_pre_sinkhorn_cpu uses: the
+  // declared contract allows x_next to alias x, so the source has to be read
+  // out before the first store lands.
+  static thread_local float post_x_f32[flat];
+  for (int i = 0; i < flat; ++i) {
+    post_x_f32[i] = Bf16ToFloat(x[i]);
+  }
+
   // y[j, :] = sum_i B[i, j] * x[i, :] + h_post[j] * h_out[:]
   //
   // Note B is indexed [i][j] while j is the output stream: this is B^T x, and
@@ -261,20 +284,38 @@ void mhc_fused_sinkhorn_gemv_traced(
   // stochastic too. test_mhc_sinkhorn_emu pins the orientation with an
   // asymmetric B.
   for (int out_stream = 0; out_stream < n; ++out_stream) {
-    const float gain = trace->h_post[out_stream];
+    const float gain = h_post[out_stream];
     float mix[n];
     for (int in_stream = 0; in_stream < n; ++in_stream) {
-      mix[in_stream] = trace->birkhoff[in_stream * n + out_stream];
+      mix[in_stream] = birkhoff[in_stream * n + out_stream];
     }
     std::uint16_t* out_row = x_next + static_cast<std::size_t>(out_stream) * d;
     for (int feature = 0; feature < d; ++feature) {
       float accumulator = gain * Bf16ToFloat(h_out[feature]);
       for (int in_stream = 0; in_stream < n; ++in_stream) {
-        accumulator += mix[in_stream] * x_f32[in_stream * d + feature];
+        accumulator += mix[in_stream] * post_x_f32[in_stream * d + feature];
       }
       out_row[feature] = FloatToBf16(accumulator);
     }
   }
+}
+
+void mhc_fused_sinkhorn_gemv_traced(
+    const void* x_bf16,
+    const float* phi_fp32,
+    const float* alpha_fp32,
+    const float* bias_fp32,
+    const void* h_out_bf16,
+    void* x_next_bf16,
+    MhcSinkhornTrace* trace,
+    float eps,
+    int num_iters) {
+  if (h_out_bf16 == nullptr || x_next_bf16 == nullptr) {
+    throw std::invalid_argument("mhc_fused_sinkhorn_gemv: null argument");
+  }
+  mhc_pre_sinkhorn_cpu(x_bf16, phi_fp32, alpha_fp32, bias_fp32, trace, eps, num_iters,
+                       kRmsNormEpsilon);
+  mhc_post_cpu(x_bf16, trace->birkhoff, trace->h_post, h_out_bf16, x_next_bf16);
 }
 
 void mhc_fused_sinkhorn_gemv_cpu(
