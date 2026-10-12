@@ -126,8 +126,20 @@ class Mxfp4ExpertGemv {
     // Alloc()'s tileSize is in ELEMENTS, not bytes (the implementation does
     // head_ += sizeof(DataType) * tileSize), so cols and kRowsPerTile are
     // passed as element counts.
-    xTensor_ = alloc_.Alloc<float>(tiling_.cols);
-    yTensor_ = alloc_.Alloc<float>(kRowsPerTile);
+    // The allocator is a function-local bump pointer, not a member: as a
+    // member its inline constructor has to be emitted from this class's own
+    // constructor, and the toolkit declares
+    // LocalMemAllocator::LocalMemAllocator() without a reachable definition
+    // (the body in impl/basic_api/kernel_tensor_impl.h sits behind an
+    // __NPU_ARCH__ guard that this include path does not satisfy). That
+    // produced two -Wundefined-inline warnings here while the other two SIMT
+    // operators, which allocate from locals, compiled clean. It links either
+    // way, but the gate's standard is zero warnings, and head_ starts at 0 on
+    // each instance so a local is equivalent: both tensors are allocated here,
+    // once, in this order.
+    LocalMemAllocator<> alloc;
+    xTensor_ = alloc.Alloc<float>(tiling_.cols);
+    yTensor_ = alloc.Alloc<float>(kRowsPerTile);
   }
 
   __aicore__ inline void Process() {
@@ -169,7 +181,6 @@ class Mxfp4ExpertGemv {
   // static UB is 0 B. Keeping a TBuf alongside LocalMemAllocator would risk
   // the two mechanisms overlapping, which the 950PR docs call out as
   // undefined -- and the old scalarState TBuf was never read anyway.
-  LocalMemAllocator<> alloc_;
   LocalTensor<float> xTensor_;
   LocalTensor<float> yTensor_;
 
