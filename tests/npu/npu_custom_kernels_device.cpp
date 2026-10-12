@@ -679,6 +679,282 @@ void DeviceMhcPreNormSinkhorn(Report& rep, aclrtStream stream) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// paged_compressor_rope: the full two-group (8-step) decode cadence.
+//
+// WHY EIGHT STEPS AND NOT ONE
+// The operator is stateful across a 4-step HOLD/EMIT group, and with coff=2
+// the eight rows reduced into one compressed token are the PREVIOUS group's
+// four a-half state rows followed by the CURRENT group's four b-half rows. A
+// fixture confined to one group leaves previous_kv_a / previous_score_a at
+// their initial kv 0 / score -inf, which contribute exactly nothing to the
+// column softmax -- so it exercises only the easy half of the cadence while
+// reporting a pass for the operator as a whole. Steps 0..7 drive
+// state_gm/state_meta_gm across the boundary, so the EMIT at step 7 is the
+// one that actually reads a populated previous-a region.
+//
+// What is asserted, per step:
+//   HOLD (0,1,2,4,5,6)  emitted == 0 AND the destination row is bit-for-bit
+//                       untouched -- the golden documents that a HOLD does not
+//                       touch the slot at all, so a canary is the right test.
+//   EMIT (3, 7)         emitted == 1 and the row matches the golden token.
+//
+// Each group writes its OWN destination row (compressed_index 0 then 1), which
+// is how a paged cache is actually addressed, and it also keeps the two EMITs
+// independently checkable instead of one overwriting the other's evidence.
+// ---------------------------------------------------------------------------
+void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
+  // The real C4A geometry, from the emu contract rather than the operator's
+  // private tiling header. Unlike tests/emu/test_paged_compressor_emu.cpp,
+  // which drives the golden at a deliberately small hidden size to stay fast,
+  // the device kernel's entry gate fixes these -- so the golden must be called
+  // at its defaults, which are exactly these values.
+  constexpr std::uint32_t kH = static_cast<std::uint32_t>(moe::emu::kHiddenSize);          // 4096
+  constexpr std::uint32_t kD = static_cast<std::uint32_t>(moe::emu::kCompressorHeadDim);   // 512
+  constexpr std::uint32_t kRatio = static_cast<std::uint32_t>(moe::emu::kCompressorRatio); // 4
+  constexpr std::uint32_t kStateW =
+      static_cast<std::uint32_t>(moe::emu::kCompressorStateWidth);                         // 1024
+  constexpr std::uint32_t kRopeDim = static_cast<std::uint32_t>(moe::emu::kRopeHeadDim);   // 64
+  constexpr std::uint32_t kSteps = 2 * kRatio;                                             // 8
+  constexpr std::uint32_t kGroups = 2;
+  // GM state ABI: kv_cur | gate_cur | prev_kv_a | prev_score_a, FP32.
+  constexpr std::uint32_t kStateFloats = 3u * kRatio * kStateW;              // 12,288
+  constexpr std::uint32_t kMetaElems = 4;
+
+  Rng rng(0xC4A0ULL);
+  const std::size_t proj = static_cast<std::size_t>(kStateW) * kH;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kH));
+  const std::vector<std::uint16_t> wkv = ToBf16(rng.normal(proj, 0.0F, scale));
+  const std::vector<std::uint16_t> wgate =
+      ToBf16(rng.normal(proj, 0.0F, scale));
+  const std::vector<float> ape =
+      rng.normal(static_cast<std::size_t>(kRatio) * kStateW, 0.0F, 0.5F);
+  const std::vector<std::uint16_t> norm_w =
+      ToBf16(rng.normal(kD, 1.0F, 0.25F));
+  const std::vector<float> rope_cos = rng.normal(kRopeDim, 0.0F, 1.0F);
+  const std::vector<float> rope_sin = rng.normal(kRopeDim, 0.0F, 1.0F);
+
+  std::vector<std::vector<std::uint16_t>> tokens(kSteps);
+  for (std::uint32_t s = 0; s < kSteps; ++s) {
+    tokens[s] = ToBf16(rng.normal(kH, 0.0F, 0.5F));
+  }
+
+  // --- golden, in memory, this run ----------------------------------------
+  // Driven step by step so its state evolves exactly as the device's does.
+  moe::emu::CompressorRingState golden_state;
+  std::vector<std::vector<std::uint16_t>> want(kGroups,
+                                               std::vector<std::uint16_t>(kD, 0));
+  std::vector<bool> golden_emitted(kSteps, false);
+  for (std::uint32_t s = 0; s < kSteps; ++s) {
+    const std::uint32_t g = s / kRatio;
+    const moe::emu::CompressorStepResult r = moe::emu::paged_compressor_decode_c4a(
+        tokens[s].data(), wkv.data(), wgate.data(), ape.data(), norm_w.data(),
+        static_cast<std::int32_t>(s), &golden_state, rope_cos.data(),
+        rope_sin.data(), want[g].data());
+    golden_emitted[s] = r.emitted;
+  }
+  if (!golden_emitted[kRatio - 1] || !golden_emitted[kSteps - 1] ||
+      !golden_state.have_previous) {
+    rep.fail("device paged_compressor_rope",
+             "the golden did not produce the expected two-group cadence; the "
+             "fixture is wrong, so no device claim can be made from it");
+    return;
+  }
+
+  // --- device -------------------------------------------------------------
+  // The canary must be a BF16 bit pattern the kernel would never write, so a
+  // HOLD that touched the row is detectable rather than plausibly equal.
+  constexpr std::uint16_t kCanary = 0x7FC1u;  // a BF16 NaN payload
+  const std::size_t slot_elems = static_cast<std::size_t>(kGroups) * kD;
+  const std::vector<std::uint16_t> canary(slot_elems, kCanary);
+
+  DeviceBuffer d_x, d_wkv, d_wgate, d_ape, d_norm, d_cos, d_sin;
+  DeviceBuffer d_state, d_meta, d_slots, d_emitted;
+  aclError rc = d_x.Alloc(kH * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_wkv.Alloc(proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_wgate.Alloc(proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_ape.Alloc(ape.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_norm.Alloc(kD * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_cos.Alloc(kRopeDim * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_sin.Alloc(kRopeDim * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_state.Alloc(kStateFloats * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_meta.Alloc(kMetaElems * sizeof(std::uint32_t));
+  if (rc == ACL_SUCCESS) rc = d_slots.Alloc(slot_elems * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_emitted.Alloc(sizeof(std::uint32_t));
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device paged_compressor_rope", AclFail("aclrtMalloc", rc));
+    return;
+  }
+
+  rc = d_wkv.Upload(wkv.data(), proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_wgate.Upload(wgate.data(), proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_ape.Upload(ape.data(), ape.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_norm.Upload(norm_w.data(), kD * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_cos.Upload(rope_cos.data(), kRopeDim * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_sin.Upload(rope_sin.data(), kRopeDim * sizeof(float));
+  // Zeroed state and meta are the documented cold start: have_previous = 0,
+  // tokens_seen = 0, and Launch requires step == tokens_seen.
+  if (rc == ACL_SUCCESS) rc = d_state.Zero();
+  if (rc == ACL_SUCCESS) rc = d_meta.Zero();
+  if (rc == ACL_SUCCESS) {
+    rc = d_slots.Upload(canary.data(), slot_elems * sizeof(std::uint16_t));
+  }
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device paged_compressor_rope", AclFail("aclrtMemcpy(H2D)", rc));
+    return;
+  }
+
+  bool cadence_ok = true;
+  std::string cadence_detail;
+  for (std::uint32_t s = 0; s < kSteps && cadence_ok; ++s) {
+    const std::uint32_t g = s / kRatio;
+    const bool expect_emit = ((s % kRatio) == kRatio - 1);
+
+    rc = d_x.Upload(tokens[s].data(), kH * sizeof(std::uint16_t));
+    if (rc == ACL_SUCCESS) rc = d_emitted.Zero();
+    if (rc != ACL_SUCCESS) {
+      rep.fail("device paged_compressor_rope",
+               AclFail("aclrtMemcpy(H2D, step)", rc));
+      return;
+    }
+
+    const Status st = LaunchPagedCompressorRope(
+        d_x.as<Bf16>(), d_wkv.as<Bf16>(), kH, d_wgate.as<Bf16>(), kH,
+        d_ape.as<float>(), kStateW, d_norm.as<Bf16>(), d_cos.as<float>(),
+        d_sin.as<float>(), s, d_state.as<float>(),
+        d_meta.as<std::uint32_t>(), d_slots.as<Bf16>() + g * kD,
+        d_emitted.as<std::uint32_t>(), nullptr, kPagedCompressorWorkspaceBytes,
+        stream);
+    if (st != Status::success) {
+      rep.fail("device paged_compressor_rope",
+               "step " + std::to_string(s) + ": " +
+                   LaunchFail("LaunchPagedCompressorRope", st));
+      return;
+    }
+
+    std::uint32_t emitted = 0xFFFFFFFFu;
+    rc = d_emitted.Download(&emitted, sizeof(emitted));
+    std::vector<std::uint16_t> slots(slot_elems, 0);
+    if (rc == ACL_SUCCESS) {
+      rc = d_slots.Download(slots.data(), slot_elems * sizeof(std::uint16_t));
+    }
+    if (rc != ACL_SUCCESS) {
+      rep.fail("device paged_compressor_rope", AclFail("aclrtMemcpy(D2H)", rc));
+      return;
+    }
+
+    const bool emit_flag_ok = (emitted == (expect_emit ? 1u : 0u));
+    if (!emit_flag_ok) {
+      cadence_ok = false;
+      cadence_detail = "step " + std::to_string(s) + ": emitted=" +
+                       std::to_string(emitted) + ", expected " +
+                       std::to_string(expect_emit ? 1 : 0);
+      break;
+    }
+    // The meta counter is a precondition for the NEXT call, so a drift here
+    // would make every later step silently invalid rather than fail.
+    std::uint32_t meta[kMetaElems] = {0, 0, 0, 0};
+    rc = d_meta.Download(meta, sizeof(meta));
+    if (rc == ACL_SUCCESS && meta[1] != s + 1u) {
+      cadence_ok = false;
+      cadence_detail = "step " + std::to_string(s) + ": state_meta[1] (tokens_seen)=" +
+                       std::to_string(meta[1]) + ", expected " +
+                       std::to_string(s + 1);
+      break;
+    }
+
+    if (!expect_emit) {
+      // A HOLD must not touch ANY lane of the destination row.
+      bool untouched = true;
+      for (std::uint32_t i = 0; i < kD; ++i) {
+        if (slots[g * kD + i] != kCanary) {
+          untouched = false;
+          break;
+        }
+      }
+      if (!untouched) {
+        cadence_ok = false;
+        cadence_detail = "step " + std::to_string(s) +
+                         " is a HOLD but wrote the destination row";
+      }
+    }
+  }
+  rep.check(cadence_ok,
+            "device paged_compressor_rope drives the 8-step cadence: HOLD "
+            "steps emit nothing and leave the row untouched, EMIT steps flag "
+            "once, tokens_seen advances every step",
+            cadence_ok ? ("steps 0..7, emit at 3 and 7, seed 0x" +
+                          std::to_string(rng.seed()))
+                       : cadence_detail);
+  if (!cadence_ok) {
+    return;
+  }
+
+  // --- the two emitted tokens ---------------------------------------------
+  std::vector<std::uint16_t> got_slots(slot_elems, 0);
+  rc = d_slots.Download(got_slots.data(), slot_elems * sizeof(std::uint16_t));
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device paged_compressor_rope", AclFail("aclrtMemcpy(D2H)", rc));
+    return;
+  }
+
+  for (std::uint32_t g = 0; g < kGroups; ++g) {
+    std::vector<std::uint16_t> got_row(got_slots.begin() + g * kD,
+                                       got_slots.begin() + (g + 1) * kD);
+    const std::vector<float> got_f = FromBf16(got_row);
+    const std::vector<float> want_f = FromBf16(want[g]);
+
+    const double cos = CosineSimilarity(got_f.data(), want_f.data(), kD);
+    const double l2 = RelativeL2(got_f.data(), want_f.data(), kD);
+    // Non-degeneracy on the REFERENCE, not a self-comparison (CLAUDE.md
+    // section 4.8): an all-zero or constant golden would make cosine
+    // meaningless, and the second group is the one that must differ from the
+    // first or the previous-a path is not actually contributing.
+    double rms = 0.0;
+    for (const float v : want_f) rms += static_cast<double>(v) * v;
+    rms = std::sqrt(rms / static_cast<double>(kD));
+    const bool non_degenerate = rms > 1e-6 && AllFinite(want_f.data(), kD);
+
+    // BF16 store on both sides: an 8-bit mantissa carries up to ~2e-3
+    // relative error per store, and this row is the product of a column
+    // softmax, an 8-row reduction, an RMSNorm and a RoPE rotation, each
+    // independently rounded -- so relative-L2 must stay loose while cosine
+    // stays strict. Rounding moves magnitude; a wrong reduction order or a
+    // dropped previous-a row moves direction.
+    char detail[300];
+    std::snprintf(detail, sizeof(detail),
+                  "group %u (compressed token %u): cos %.9f (floor 0.9999), "
+                  "relL2 %.3e (ceil 5e-3, BF16-store limited), golden rms "
+                  "%.3e, non-degenerate=%d",
+                  g, g, cos, l2, rms, static_cast<int>(non_degenerate));
+    rep.check(non_degenerate && AllFinite(got_f.data(), kD) &&
+                  cos >= 0.9999 && l2 <= 5e-3,
+              g == 0 ? "device paged_compressor_rope group 0 EMIT matches the "
+                       "golden (cold previous-a)"
+                     : "device paged_compressor_rope group 1 EMIT matches the "
+                       "golden ACROSS the group boundary (populated "
+                       "previous-a, the coff=2 path)",
+              detail);
+  }
+
+  // The two tokens must not be identical: if they were, the previous-a region
+  // would be contributing nothing and both EMITs would be the same easy case.
+  {
+    const std::vector<float> a = FromBf16(want[0]);
+    const std::vector<float> b = FromBf16(want[1]);
+    const double between = CosineSimilarity(a.data(), b.data(), kD);
+    char detail[200];
+    std::snprintf(detail, sizeof(detail),
+                  "cos(group0, group1) = %.9f; equality would mean the "
+                  "cross-boundary path changed nothing",
+                  between);
+    rep.check(between < 0.9999,
+              "the two compressed tokens differ, so the second EMIT really "
+              "exercised the previous-a path",
+              detail);
+  }
+}
+
 }  // namespace
 
 void RunDeviceCases(Report& rep) {
@@ -686,20 +962,7 @@ void RunDeviceCases(Report& rep) {
   DeviceMhcPostResidual(rep, g_stream);
   DeviceFp8IndexerTopK(rep, g_stream);
   DeviceMhcPreNormSinkhorn(rep, g_stream);
-
-  // Still a skip, with the specific reason rather than a blanket one. Writing
-  // a single-call comparison here would be worse than skipping: the operator
-  // is stateful across a 4-step HOLD/EMIT group, and with coff=2 the eight
-  // rows reduced into one compressed token are the PREVIOUS group's four
-  // a-half state rows followed by the CURRENT group's four b-half rows. A
-  // fixture that does not span two groups never exercises the cross-boundary
-  // previous-a path at all, so it would certify the easy half of the cadence
-  // and report a pass for the operator as a whole.
-  rep.skip("device paged_compressor_rope",
-           "needs a two-group (8-step) fixture driving state_gm/state_meta_gm "
-           "across the group boundary so the coff=2 previous-a path is "
-           "covered; moe::emu::paged_compressor_decode_c4a is the golden. A "
-           "single-call comparison would not certify the cadence.");
+  DevicePagedCompressorRope(rep, g_stream);
 }
 
 }  // namespace moe::kerntest

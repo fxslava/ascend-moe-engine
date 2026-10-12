@@ -13,10 +13,15 @@
 //
 // Device benchmarking goes through the Launch* host wrappers. Those now
 // exist, so this binary measures real hardware when an NPU is visible:
-// mxfp4_expert_gemv and fast_fp8_indexer_topk are wired, and the stream is
-// synchronized inside the timed region (see TimedLaunch -- a chevron dispatch
-// is asynchronous, so timing the launch call alone measures enqueue cost).
-// The other three kernels still print an explicit not-wired row.
+// mxfp4_expert_gemv, fast_fp8_indexer_topk and paged_compressor_rope are
+// wired, and the stream is synchronized inside the timed region (see
+// TimedLaunch -- a chevron dispatch is asynchronous, so timing the launch call
+// alone measures enqueue cost). fused_mhc_pre_norm_sinkhorn and
+// fused_mhc_post_residual still print an explicit not-wired row.
+//
+// paged_compressor_rope does not go through Measure() and reports HOLD and
+// EMIT separately; see BenchPagedCompressorDevice for why a stateful operator
+// cannot be timed by repeating an identical body.
 //
 // The host-reference figures are kept alongside, and are NOT comparable to the
 // device rows: they are the roofline the kernel is beating.
@@ -346,6 +351,182 @@ void BenchIndexerDevice(const DeviceCtx& ctx, int warmup, int iters) {
   }
 }
 
+// Summarize pre-collected samples. Needed because the compressor cannot use
+// Measure(): see BenchPagedCompressorDevice.
+Timing Summarize(std::vector<double> samples) {
+  Timing t;
+  t.iterations = static_cast<int>(samples.size());
+  if (samples.empty()) return t;
+  const double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+  t.mean_us = sum / static_cast<double>(samples.size());
+  double var = 0.0;
+  for (const double s : samples) var += (s - t.mean_us) * (s - t.mean_us);
+  t.stddev_us = std::sqrt(var / static_cast<double>(samples.size()));
+  std::sort(samples.begin(), samples.end());
+  t.min_us = samples.front();
+  t.p50_us = samples[samples.size() / 2];
+  return t;
+}
+
+// ---------------------------------------------------------------------------
+// device: paged_compressor_rope
+//
+// WHY THIS ONE DOES NOT USE Measure()
+// Measure() repeats an identical body, which is exactly wrong for a stateful
+// operator: LaunchPagedCompressorRope requires step == state_meta[1], so
+// calling it twice with the same step is a contract violation, and resetting
+// the state between iterations would put a device memset inside the timed
+// region. Instead the cadence is driven forward continuously -- steps
+// 0..8*groups-1, the way real decode does -- and each step is timed
+// individually.
+//
+// HOLD and EMIT are reported SEPARATELY because they are not the same kernel
+// path: a HOLD does the two projections and stores a state row, while an EMIT
+// additionally does the column softmax over 8 rows, the Hadamard reduction,
+// the RMSNorm and the RoPE rotation. Averaging them into one number would
+// report neither, and with a 3:1 HOLD:EMIT ratio the blend is dominated by
+// the cheaper path.
+//
+// Traffic is dominated by the two [coff*D, H] BF16 projection matrices, which
+// are read once per step -- 16.8 MB at the real geometry -- so GB/s here is
+// effectively measuring the weight stream, for both phases alike.
+// ---------------------------------------------------------------------------
+void BenchPagedCompressorDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  const std::uint32_t kH = static_cast<std::uint32_t>(moe::emu::kHiddenSize);
+  const std::uint32_t kD =
+      static_cast<std::uint32_t>(moe::emu::kCompressorHeadDim);
+  const std::uint32_t kRatio =
+      static_cast<std::uint32_t>(moe::emu::kCompressorRatio);
+  const std::uint32_t kStateW =
+      static_cast<std::uint32_t>(moe::emu::kCompressorStateWidth);
+  const std::uint32_t kRopeDim =
+      static_cast<std::uint32_t>(moe::emu::kRopeHeadDim);
+  const std::uint32_t kStateFloats = 3u * kRatio * kStateW;
+
+  // warmup groups are discarded, then `iters` groups are timed. At least two
+  // timed groups, so the cross-boundary EMIT (the one that reads a populated
+  // previous-a region) is always represented.
+  const std::uint32_t warm_groups = static_cast<std::uint32_t>(warmup < 0 ? 0 : warmup);
+  const std::uint32_t timed_groups =
+      static_cast<std::uint32_t>(iters < 2 ? 2 : iters);
+
+  const std::size_t proj = static_cast<std::size_t>(kStateW) * kH;
+  Rng rng(0xC4A8ULL);
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kH));
+  const std::vector<std::uint16_t> wkv = ToBf16(rng.normal(proj, 0.0F, scale));
+  const std::vector<std::uint16_t> wgate =
+      ToBf16(rng.normal(proj, 0.0F, scale));
+  const std::vector<float> ape =
+      rng.normal(static_cast<std::size_t>(kRatio) * kStateW, 0.0F, 0.5F);
+  const std::vector<std::uint16_t> norm_w = ToBf16(rng.normal(kD, 1.0F, 0.25F));
+  const std::vector<float> rope_cos = rng.normal(kRopeDim, 0.0F, 1.0F);
+  const std::vector<float> rope_sin = rng.normal(kRopeDim, 0.0F, 1.0F);
+  const std::vector<std::uint16_t> x = ToBf16(rng.normal(kH, 0.0F, 0.5F));
+
+  DeviceBuffer d_x, d_wkv, d_wgate, d_ape, d_norm, d_cos, d_sin;
+  DeviceBuffer d_state, d_meta, d_slot, d_emitted;
+  aclError rc = d_x.Alloc(kH * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_wkv.Alloc(proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_wgate.Alloc(proj * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_ape.Alloc(ape.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_norm.Alloc(kD * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_cos.Alloc(kRopeDim * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_sin.Alloc(kRopeDim * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_state.Alloc(kStateFloats * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_meta.Alloc(4 * sizeof(std::uint32_t));
+  if (rc == ACL_SUCCESS) rc = d_slot.Alloc(kD * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) rc = d_emitted.Alloc(sizeof(std::uint32_t));
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), kH * sizeof(std::uint16_t));
+  if (rc == ACL_SUCCESS) {
+    rc = d_wkv.Upload(wkv.data(), proj * sizeof(std::uint16_t));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_wgate.Upload(wgate.data(), proj * sizeof(std::uint16_t));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_ape.Upload(ape.data(), ape.size() * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_norm.Upload(norm_w.data(), kD * sizeof(std::uint16_t));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_cos.Upload(rope_cos.data(), kRopeDim * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_sin.Upload(rope_sin.data(), kRopeDim * sizeof(float));
+  }
+  // Cold start: have_previous = 0, tokens_seen = 0.
+  if (rc == ACL_SUCCESS) rc = d_state.Zero();
+  if (rc == ACL_SUCCESS) rc = d_meta.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] setup failed: %s\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  std::vector<double> hold_samples;
+  std::vector<double> emit_samples;
+  const std::uint32_t total_steps = (warm_groups + timed_groups) * kRatio;
+  for (std::uint32_t s = 0; s < total_steps; ++s) {
+    const bool is_emit = ((s % kRatio) == kRatio - 1);
+    const bool timed = (s >= warm_groups * kRatio);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const Status st = LaunchPagedCompressorRope(
+        d_x.as<Bf16>(), d_wkv.as<Bf16>(), kH, d_wgate.as<Bf16>(), kH,
+        d_ape.as<float>(), kStateW, d_norm.as<Bf16>(), d_cos.as<float>(),
+        d_sin.as<float>(), s, d_state.as<float>(), d_meta.as<std::uint32_t>(),
+        d_slot.as<Bf16>(), d_emitted.as<std::uint32_t>(), nullptr,
+        kPagedCompressorWorkspaceBytes, ctx.stream);
+    if (st == Status::success) {
+      const aclError sync_rc = aclrtSynchronizeStream(ctx.stream);
+      if (sync_rc != ACL_SUCCESS) {
+        std::printf("  [device] step %u: %s\n", s,
+                    AclFail("aclrtSynchronizeStream", sync_rc).c_str());
+        return;
+      }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (st != Status::success) {
+      const auto& f = LastLaunchFailure();
+      std::printf("  [device] step %u: FAILED Status=%u [op=%s, call=%s, "
+                  "aclError=%d]\n",
+                  s, static_cast<unsigned>(st),
+                  f.op != nullptr ? f.op : "-", f.call != nullptr ? f.call : "-",
+                  f.acl_error);
+      return;
+    }
+    if (timed) {
+      const double us =
+          std::chrono::duration<double, std::micro>(t1 - t0).count();
+      (is_emit ? emit_samples : hold_samples).push_back(us);
+    }
+  }
+
+  // Both projection matrices stream once per step; everything else is small.
+  const double weight_bytes =
+      2.0 * static_cast<double>(proj) * 2.0;  // two BF16 [coff*D, H]
+  const double bytes = weight_bytes +
+                       static_cast<double>(kH) * 2.0 +
+                       static_cast<double>(ape.size()) * 4.0 +
+                       static_cast<double>(kD) * 2.0;
+  // Two [coff*D, H] matrix-vector products, 2 flops per MAC.
+  const double flops = 2.0 * 2.0 * static_cast<double>(proj);
+
+  char geo[80];
+  std::snprintf(geo, sizeof(geo), "[device] HOLD step (%u)",
+                static_cast<unsigned>(hold_samples.size()));
+  Row(geo, Summarize(hold_samples), bytes, flops);
+  std::snprintf(geo, sizeof(geo), "[device] EMIT step (%u)",
+                static_cast<unsigned>(emit_samples.size()));
+  Row(geo, Summarize(emit_samples), bytes, flops);
+  std::printf("           HOLD and EMIT are separate kernel paths; EMIT adds "
+              "the 8-row column softmax,\n           the Hadamard reduction, "
+              "the RMSNorm and the RoPE rotation on top of the projections.\n");
+}
+
 #endif  // MOE_KERNEL_LAUNCH_LAYER_AVAILABLE
 
 // ---------------------------------------------------------------------------
@@ -366,6 +547,20 @@ void DeviceSectionMxfp4(const DeviceCtx& ctx, int warmup, int iters) {
   (void)iters;
 #endif
   DeviceRowUnavailable("mxfp4_expert_gemv", ctx);
+}
+
+void DeviceSectionPagedCompressor(const DeviceCtx& ctx, int warmup,
+                                  int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchPagedCompressorDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("paged_compressor_rope", ctx);
 }
 
 void DeviceSectionIndexer(const DeviceCtx& ctx, int warmup, int iters) {
@@ -583,12 +778,12 @@ void BenchMxfp4Gemv(const DeviceCtx& ctx, int warmup, int iters) {
 // steps), so a meaningful figure needs the full group of 4 steps driven in
 // order. Left to the device path rather than approximated here.
 // ---------------------------------------------------------------------------
-void BenchPagedCompressor(const DeviceCtx& ctx) {
+void BenchPagedCompressor(const DeviceCtx& ctx, int warmup, int iters) {
   Header("paged_compressor_rope");
   std::printf("  [host]   not benchmarked: the decode cadence is stateful "
               "across a 4-step group;\n           a per-call figure would "
               "misrepresent the hold/emit asymmetry.\n");
-  DeviceSectionNotWired("paged_compressor_rope", ctx);
+  DeviceSectionPagedCompressor(ctx, warmup, iters);
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +865,7 @@ int main(int argc, char** argv) {
   BenchMhcPost(ctx, warmup, iters);
   BenchIndexer(ctx, warmup, iters);
   BenchMxfp4Gemv(ctx, warmup, iters);
-  BenchPagedCompressor(ctx);
+  BenchPagedCompressor(ctx, warmup, iters);
   ReportScaling(ctx);
 
   std::printf("\nDone.\n");

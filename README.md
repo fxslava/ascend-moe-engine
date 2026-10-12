@@ -104,6 +104,23 @@ scripts/download_dsv4_layer0.sh --shard 4 --slice-mib 40   # layer 2's compresso
 ./build_emu/apps/dsv4_layer0_emu_bench       # ~0.14 s, writes the golden dump
 ```
 
+Nothing under `data/` is in version control, and no reference output ever will
+be. The checkpoint slices are **inputs**, fetched on demand by the scripts
+above; the references are computed in memory, per run, from a printed seed
+(CLAUDE.md section 4.5). That is deliberate and it is the whole basis of the
+device suite's claim: a pre-baked golden on disk can go stale and make a broken
+kernel pass, which is exactly the failure mode no amount of care downstream can
+detect. `test_custom_kernels_npu_device` prints `references: generated per run,
+no disk fixtures` for the same reason.
+
+So a remote NPU host needs **no fixture transfer and no Git LFS**. Build
+`moe_emu` there -- it links nothing but libstdc++/libm and needs no CANN, so it
+runs anywhere -- and it computes the golden alongside the device result in the
+same process. Only the tests that read the real checkpoint
+(`test_safetensors_loader`, `test_semi_e2e_pipeline`, `dsv4_layer0_emu_bench`)
+want `data/`, they SKIP cleanly when it is absent, and the fix is to run the
+same download script on that host rather than to commit the weights.
+
 Three things about the checkpoint that the obvious assumption gets wrong, all
 read out of `model.safetensors.index.json` rather than guessed:
 
