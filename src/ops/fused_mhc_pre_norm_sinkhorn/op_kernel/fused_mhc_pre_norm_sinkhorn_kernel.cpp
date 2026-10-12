@@ -24,8 +24,8 @@
 // GM scratch workspace: 0 bytes (the workspace argument is unused).
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/fused_mhc_pre_norm_sinkhorn_ub_layout.hpp"
-#include "moe/kernels/arch35/tiling_data.hpp"
+#include "fused_mhc_pre_norm_sinkhorn_arch35.h"
+#include "fused_mhc_pre_norm_sinkhorn_tiling.h"
 
 namespace moe::kernels::arch35::fused_mhc_pre_norm_sinkhorn {
 

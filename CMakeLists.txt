@@ -204,16 +204,19 @@ if(ENABLE_HOST_EMU)
   enable_testing()
   add_subdirectory(tests/emu)
 
-  # The two custom-kernel binaries need nothing but moe_emu, so they are
-  # available in this host-only mode as well as in a full CANN build. This is
-  # the mode in which they can actually be run without a device.
-  #
   # The device launch layer is optional even here: it needs BiSheng, not an
   # NPU, so it can be built alongside the host emulation for a build check.
+  # When it is on, tests/npu contributes test_custom_kernels_npu_device, which
+  # builds without hardware and skips at runtime without it.
   if(ENABLE_ARCH35_DEVICE_LAUNCH)
     include("${CMAKE_SOURCE_DIR}/cmake/arch35_device.cmake")
+    add_subdirectory(tests/npu)
   endif()
-  add_subdirectory(tests/custom_kernels)
+
+  # Benchmarks need nothing but moe_emu, so they are available in this
+  # host-only mode too -- and this is the mode in which they can actually be
+  # run without a device. Timing only, never a gate (CLAUDE.md section 4).
+  add_subdirectory(tests/bench)
 
   # The standalone claim, verified against the artifacts. `ldd` on the bench
   # must show no CANN, no Python and no torch library; a static moe_emu plus a
@@ -460,9 +463,12 @@ if(TARGET cust_opapi)
 endif()
 
 # -----------------------------------------------------------------------------
-# Standalone fused mHC/Sinkhorn operator and portable CPU reference
+# Operators. src/ops/CMakeLists.txt aggregates the five arch35 / dav-3510
+# operators (publishing MOE_ARCH35_OP_ASC_SOURCES and
+# MOE_ARCH35_OP_INCLUDE_DIRS for cmake/arch35_device.cmake below) and the
+# deprecated mhc_fused_sinkhorn_gemv. See CLAUDE.md section 1.
 # -----------------------------------------------------------------------------
-add_subdirectory(src/ops/mhc_fused_sinkhorn_gemv)
+add_subdirectory(src/ops)
 
 # -----------------------------------------------------------------------------
 # Executables and tests

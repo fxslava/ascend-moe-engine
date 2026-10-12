@@ -78,7 +78,7 @@ if ! command -v bisheng >/dev/null 2>&1; then
   exit 3
 fi
 
-INC="-Iinclude"
+INC="-Iinclude -Isrc/kernels/arch35"
 for d in \
   "$ROOT/x86_64-linux/asc/include" \
   "$ROOT/x86_64-linux/asc/include/simt_api" \
@@ -102,12 +102,19 @@ mxfp4_expert_gemv
 "
 
 pass=0; fail=0
-for k in $KERNELS; do
-  src="src/ops/$k.cpp"
-  obj="$OUT_DIR/$k.dav-3510.o"
-  log="$OUT_DIR/$k.log"
-  printf '%-34s ' "$k"
-  if bisheng -O2 --npu-arch=dav-3510 --asc-aicore-lang $INC \
+
+# One compile unit: $1 label, $2 source, $3 extra include dirs.
+compile_one() {
+  label="$1"; src="$2"; extra_inc="$3"
+  obj="$OUT_DIR/$(echo "$label" | tr '/' '_').dav-3510.o"
+  log="$OUT_DIR/$(echo "$label" | tr '/' '_').log"
+  printf '%-52s ' "$label"
+  if [ ! -f "$src" ]; then
+    printf 'MISSING (%s)\n' "$src"
+    fail=$((fail+1))
+    return
+  fi
+  if bisheng -O2 --npu-arch=dav-3510 --asc-aicore-lang $INC $extra_inc \
        -c "$src" -o "$obj" > "$log" 2>&1 ; then
     warns=$(grep -ciE 'warning' "$log" || true)
     printf 'PASS  %7s B  warnings=%s\n' "$(stat -c%s "$obj")" "$warns"
@@ -117,7 +124,24 @@ for k in $KERNELS; do
     sed 's/^/    /' "$log" | grep -iE 'error|fatal' | head -10
     fail=$((fail+1))
   fi
+}
+
+# Per the operator layout in CLAUDE.md §1, each operator contributes TWO ASC
+# translation units: the device kernel in op_kernel/ and the chevron-dispatch
+# launch wrapper in op_host/. Both must be compiled by BiSheng (§3.3), so both
+# belong in this gate -- a launcher that does not compile is just as broken as
+# a kernel that does not.
+for k in $KERNELS; do
+  d="src/ops/$k"
+  inc="-I$d/op_kernel -I$d/op_host"
+  compile_one "$k/op_kernel/${k}_kernel.cpp" "$d/op_kernel/${k}_kernel.cpp" "$inc"
+  compile_one "$k/op_host/${k}.cpp"          "$d/op_host/${k}.cpp"          "$inc"
+  compile_one "$k/op_host/${k}_tiling.cpp"   "$d/op_host/${k}_tiling.cpp"   "$inc"
 done
+
+# The shared launch-layer TU: the failure record and Status::ToString.
+compile_one "kernels/arch35/launch_common.cpp" \
+            "src/kernels/arch35/launch_common.cpp" ""
 
 echo
 echo "dav-3510 device compilation: pass=$pass fail=$fail"

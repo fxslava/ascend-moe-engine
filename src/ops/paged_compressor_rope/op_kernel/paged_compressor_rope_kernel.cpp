@@ -24,8 +24,8 @@
 // MTE2_MTE3 WAR pairing. GM scratch: 0 bytes.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/paged_compressor_rope_ub_layout.hpp"
-#include "moe/kernels/arch35/tiling_data.hpp"
+#include "paged_compressor_rope_arch35.h"
+#include "paged_compressor_rope_tiling.h"
 
 namespace moe::kernels::arch35::paged_compressor_rope {
 

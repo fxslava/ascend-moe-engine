@@ -48,16 +48,21 @@ set(CMAKE_ASC_ARCHITECTURES "${ARCH35_NPU_ARCH}")
 # ascendc_library() marks its own sources LANGUAGE ASC individually.
 enable_language(ASC)
 
+# The source list comes from the operator directories themselves, which each
+# publish their own TUs (CLAUDE.md section 1); src/ops/CMakeLists.txt collects
+# them. Per operator that is three ASC TUs -- the device kernel in op_kernel/,
+# the chevron launch wrapper in op_host/, and the host-side tiling builder it
+# calls -- plus the shared launch_common.cpp.
+include("${CMAKE_SOURCE_DIR}/cmake/arch35_ops.cmake")
+
 ascendc_library(arch35_device_launch STATIC
-  "${CMAKE_SOURCE_DIR}/src/ops/fused_mhc_pre_norm_sinkhorn.cpp"
-  "${CMAKE_SOURCE_DIR}/src/ops/fused_mhc_post_residual.cpp"
-  "${CMAKE_SOURCE_DIR}/src/ops/paged_compressor_rope.cpp"
-  "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk.cpp"
-  "${CMAKE_SOURCE_DIR}/src/ops/mxfp4_expert_gemv.cpp"
-  "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch.cpp"
+  ${MOE_ARCH35_OP_ASC_SOURCES}
 )
+# Each operator's private headers (op_kernel/ and op_host/) are on the include
+# path so the bare-filename includes the layout mandates resolve.
 ascendc_include_directories(arch35_device_launch PRIVATE
   "${CMAKE_SOURCE_DIR}/include"
+  ${MOE_ARCH35_OP_INCLUDE_DIRS}
 )
 
 # Consumers get the public header and <acl/acl.h>; ascendc_library() already

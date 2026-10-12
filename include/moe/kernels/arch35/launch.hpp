@@ -45,6 +45,8 @@
 #ifndef MOE_KERNELS_ARCH35_LAUNCH_HPP
 #define MOE_KERNELS_ARCH35_LAUNCH_HPP
 
+#include "moe/kernels/arch35/status.hpp"
+
 #include <acl/acl.h>
 
 #include <cstddef>
@@ -52,21 +54,35 @@
 
 namespace moe::kernels::arch35 {
 
-// Storage-bit typedefs, exactly as the contract spells them.
-using Bf16 = std::uint16_t;      // round-to-nearest-even on store
-using Fp8E4M3 = std::uint8_t;    // storage bits
-using Mxfp4Pair = std::uint8_t;  // low nibble = even logical column
-using E8M0 = std::uint8_t;       // one exponent scale code
+// `Status`, `ToString` and the storage-bit typedefs (Bf16, Fp8E4M3,
+// Mxfp4Pair, E8M0) come from status.hpp, which is deliberately ACL-free so
+// the per-op op_host/<op>_tiling.h headers can be included from a device TU.
 
-enum class Status : std::uint32_t {
-  success = 0,
-  invalid_argument = 1,
-  unsupported_shape = 2,
-  launch_error = 3,
+// ---------------------------------------------------------------------------
+// Why Status::launch_error alone is not enough
+//
+// A chevron launch returns void, so nothing is observable at the call site;
+// the first chance to see a failure is the following stream synchronization.
+// By then a tiling allocation failure, a tiling H2D copy failure, a rejected
+// grid and a device-side fault all look identical. This record says WHICH ACL
+// call failed and with what code, so an on-device failure can be acted on
+// instead of guessed at.
+//
+// Valid only immediately after a wrapper returned Status::launch_error.
+// `op` and `call` are string literals owned by the launch layer, never null
+// after a recorded failure; both are nullptr when nothing has failed.
+//
+// Not synchronized: the v1 wrappers are not safe to call concurrently (each
+// synchronizes its own stream before freeing its staging buffer), so this
+// single record matches how they may legally be used.
+// ---------------------------------------------------------------------------
+struct LaunchFailure {
+  const char* op = nullptr;
+  const char* call = nullptr;
+  int acl_error = 0;  // aclError, widened; 0 when nothing has failed
 };
 
-// Human-readable form, for test output and logs.
-const char* ToString(Status status) noexcept;
+const LaunchFailure& LastLaunchFailure() noexcept;
 
 // Workspace sizes the contract fixes. Querying them lets a caller allocate
 // without hardcoding the formula at every call site.

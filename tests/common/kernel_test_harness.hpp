@@ -15,6 +15,7 @@
 // pre-generated disk dump, so a stale fixture cannot make a broken kernel pass.
 // -----------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -108,6 +109,63 @@ inline bool AllFinite(const float* v, std::size_t n) {
     if (!std::isfinite(v[i])) return false;
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Non-degeneracy of a REFERENCE tensor
+//
+// Cosine similarity is vacuous on a degenerate golden: cosine(c*1, c*1) == 1
+// for any constant c, so a kernel that merely wrote the right constant --- or
+// an all-zero buffer compared against an all-zero golden --- scores a perfect
+// pass. A tolerance on a comparison is only meaningful when the reference
+// itself carries magnitude AND variation, so that is what this measures.
+//
+// It measures the REFERENCE, not a vector against itself. Comparing a vector
+// with itself cannot work: CosineSimilarity(want, want) computes
+// dot / (sqrt(na) * sqrt(nb)) with na == nb == dot, and sqrt(s) * sqrt(s) is
+// not exactly s in binary floating point, so an `== 1.0` test on it reports
+// "degenerate" for ordinary, perfectly varied data. A check that fails on
+// good input is worse than no check.
+// ---------------------------------------------------------------------------
+struct Spread {
+  double rms = 0.0;      // sqrt(mean(v^2)) -- is there any magnitude at all
+  double stddev = 0.0;   // is there any variation around the mean
+  double min = 0.0;
+  double max = 0.0;
+  bool finite = true;
+
+  // Thresholds are absolute because the callers synthesize inputs at a known
+  // scale (unit-ish normal draws), so "essentially zero" and "essentially
+  // constant" are well defined without reference to a dynamic range.
+  bool NonDegenerate(double min_rms = 1e-6, double min_stddev = 1e-6) const {
+    return finite && rms >= min_rms && stddev >= min_stddev;
+  }
+};
+
+inline Spread MeasureSpread(const float* v, std::size_t n) {
+  Spread s;
+  if (n == 0) {
+    s.finite = false;
+    return s;
+  }
+  double sum = 0.0, sum_sq = 0.0;
+  s.min = std::numeric_limits<double>::infinity();
+  s.max = -std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < n; ++i) {
+    const double x = v[i];
+    if (!std::isfinite(x)) s.finite = false;
+    sum += x;
+    sum_sq += x * x;
+    s.min = std::min(s.min, x);
+    s.max = std::max(s.max, x);
+  }
+  const double mean = sum / static_cast<double>(n);
+  const double mean_sq = sum_sq / static_cast<double>(n);
+  s.rms = std::sqrt(mean_sq);
+  // max(0, .) because catastrophic cancellation can make this a tiny
+  // negative for a near-constant vector.
+  s.stddev = std::sqrt(std::max(0.0, mean_sq - mean * mean));
+  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,15 +283,16 @@ class Rng {
 // Two independent gates, reported separately because they fail for different
 // reasons and want different fixes:
 //
-//   * kDeviceLaunchLayerAvailable -- whether the host-side Launch* wrappers in
-//     docs/kernel_contracts_spec.md are IMPLEMENTED. As of this writing they
-//     are specified but absent from the tree, so no amount of hardware makes
-//     an on-device comparison possible. Flip this on with
-//     -DMOE_KERNEL_LAUNCH_LAYER_AVAILABLE once they land.
+//   * kDeviceLaunchLayerAvailable -- whether this binary was LINKED against
+//     the launch layer. The wrappers themselves are implemented (one
+//     op_host/<op>.cpp per operator, see CLAUDE.md section 3), but they must
+//     be compiled by BiSheng, so a build without a CANN toolkit has no
+//     arch35_device_launch to link and this stays false. The define comes
+//     from that target's INTERFACE, so it is never set by hand.
 //
-//   * physical NPU presence -- a runtime question, answered only in a CANN
-//     build. tests/npu/npu_test_support.hpp owns that probe; this header does
-//     not duplicate it, so the host-emu build stays free of any acl include.
+//   * physical NPU presence -- a runtime question. tests/npu owns that probe;
+//     this header does not duplicate it, so the host-emu build stays free of
+//     any acl include.
 // ---------------------------------------------------------------------------
 #if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
 inline constexpr bool kDeviceLaunchLayerAvailable = true;
@@ -242,10 +301,11 @@ inline constexpr bool kDeviceLaunchLayerAvailable = false;
 #endif
 
 inline const char* DeviceUnavailableReason() {
-  return "host-side Launch* wrappers for the five arch35 kernels are specified "
-         "in docs/kernel_contracts_spec.md but not implemented in the tree, so "
-         "kernel output cannot be produced for comparison. Build with "
-         "-DMOE_KERNEL_LAUNCH_LAYER_AVAILABLE once they exist.";
+  return "this binary was not linked against the arch35 launch layer, so no "
+         "kernel output can be produced. The wrappers are implemented but "
+         "must be built by BiSheng: configure with "
+         "-DENABLE_ARCH35_DEVICE_LAUNCH=ON and a CANN 9.2 toolkit on PATH "
+         "(that needs no NPU; running the result does).";
 }
 
 }  // namespace moe::kerntest

@@ -1,0 +1,60 @@
+# -----------------------------------------------------------------------------
+# arch35_ops.cmake -- the arch35 / dav-3510 operator registry.
+#
+# One list, and the file paths derived from it by the layout rule in
+# CLAUDE.md section 1. Deliberately NOT built out of per-operator
+# add_subdirectory() scope: arch35_device.cmake is included from two different
+# places in the root CMakeLists (the host-emu branch and the full build), and
+# a variable that has to be published upward from a subdirectory would make
+# the result depend on which ran first. Deriving the paths here is
+# order-independent and fails loudly if a file is missing.
+#
+# Adding an operator: create src/ops/<op>/ following the layout, add it to
+# MOE_ARCH35_OPS below, and add it to scripts/device_compile_kernels.sh.
+# -----------------------------------------------------------------------------
+
+set(MOE_ARCH35_OPS
+  fused_mhc_pre_norm_sinkhorn
+  fused_mhc_post_residual
+  paged_compressor_rope
+  fast_fp8_indexer_topk
+  mxfp4_expert_gemv
+)
+
+set(MOE_ARCH35_OP_ASC_SOURCES "")
+set(MOE_ARCH35_OP_INCLUDE_DIRS "")
+
+foreach(_op IN LISTS MOE_ARCH35_OPS)
+  set(_dir "${CMAKE_SOURCE_DIR}/src/ops/${_op}")
+  # Three ASC translation units per operator: the device kernel, the chevron
+  # launch wrapper, and the host-side tiling builder the wrapper calls. All
+  # three must be compiled by BiSheng (CLAUDE.md section 3.3); the tiling TU
+  # is listed here rather than built as a separate host library so that no
+  # binary can end up with two copies of it.
+  foreach(_src
+      "${_dir}/op_kernel/${_op}_kernel.cpp"
+      "${_dir}/op_host/${_op}.cpp"
+      "${_dir}/op_host/${_op}_tiling.cpp")
+    if(NOT EXISTS "${_src}")
+      message(FATAL_ERROR
+        "arch35 operator '${_op}' is missing ${_src}. The layout in "
+        "CLAUDE.md section 1 is mandatory; either add the file or remove the "
+        "operator from MOE_ARCH35_OPS.")
+    endif()
+    list(APPEND MOE_ARCH35_OP_ASC_SOURCES "${_src}")
+  endforeach()
+  list(APPEND MOE_ARCH35_OP_INCLUDE_DIRS
+    "${_dir}/op_kernel"
+    "${_dir}/op_host"
+  )
+endforeach()
+
+# The shared launch-layer TU (the failure record and Status::ToString) belongs
+# to no single operator but is an ASC TU for the same reason the op_host
+# wrappers are.
+list(APPEND MOE_ARCH35_OP_ASC_SOURCES
+  "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+)
+list(APPEND MOE_ARCH35_OP_INCLUDE_DIRS
+  "${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+)

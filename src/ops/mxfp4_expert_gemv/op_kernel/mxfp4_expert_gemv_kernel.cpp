@@ -30,8 +30,8 @@
 // registers instead; the UB budget stays at 18,688 B <= 19,456 B.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/mxfp4_expert_gemv_ub_layout.hpp"
-#include "moe/kernels/arch35/tiling_data.hpp"
+#include "mxfp4_expert_gemv_arch35.h"
+#include "mxfp4_expert_gemv_tiling.h"
 
 namespace moe::kernels::arch35::mxfp4_expert_gemv {
 

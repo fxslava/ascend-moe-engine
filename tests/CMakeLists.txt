@@ -24,7 +24,14 @@ if(NOT TARGET moe_emu)
   add_subdirectory("${CMAKE_SOURCE_DIR}/src/emu" "${CMAKE_BINARY_DIR}/src/emu")
 endif()
 
-add_subdirectory(custom_kernels)
+# The host emulation suite -- the golden oracle (CLAUDE.md section 4). In a
+# host-emu build the root CMakeLists adds this itself and then return()s, so
+# this call is only ever reached in a mock or CANN build, where the suite has
+# not been added yet. It needs nothing but moe_emu, bootstrapped above.
+add_subdirectory(emu)
+
+# Timing only, never a gate (CLAUDE.md section 4).
+add_subdirectory(bench)
 
 # dsv4_operator_hypotheses_test.cpp deliberately sits here rather than in either
 # suite directory: it is registered by BOTH tests/mock and tests/npu, because it

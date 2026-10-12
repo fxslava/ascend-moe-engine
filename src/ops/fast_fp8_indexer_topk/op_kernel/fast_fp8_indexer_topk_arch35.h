@@ -74,6 +74,30 @@ static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
 inline constexpr std::uint32_t kSimtThreads = 512;  // 16 warps
 inline constexpr std::uint32_t kWarpSize = 32;
 
+// Register blocking for the selection network: thread t holds sequence
+// indices [t*kKeysPerThread, (t+1)*kKeysPerThread) in registers. This is what
+// lets SelectTopKSimt split the 66 bitonic levels into a register tier
+// (jj < kKeysPerThread), a warp-shuffle tier
+// (kKeysPerThread <= jj < kKeysPerThread*kWarpSize) and a cross-warp UB tier.
+inline constexpr std::uint32_t kKeysPerThread = kSortLength / kSimtThreads;
+
+// The tiering above is only valid under these four properties, so they are
+// asserted rather than assumed:
+static_assert(kSortLength == kSimtThreads * kKeysPerThread,
+              "every sort slot must be owned by exactly one thread");
+static_assert(kKeysPerThread >= 2u && (kKeysPerThread &
+                                       (kKeysPerThread - 1u)) == 0u,
+              "kKeysPerThread must be a power of two >= 2, or the register "
+              "tier's r ^ jj partner indexing is not a permutation");
+static_assert((kSortLength & (kSortLength - 1u)) == 0u,
+              "a bitonic network requires a power-of-two length");
+static_assert(kSimtThreads % kWarpSize == 0u,
+              "the warp-shuffle tier assumes whole warps");
+// asc_shfl_xor takes lane_mask in [0, 32) and it must be < width. The largest
+// mask the warp tier emits is (kKeysPerThread*kWarpSize/2)/kKeysPerThread.
+static_assert(kWarpSize / 2u < kWarpSize,
+              "the largest warp-tier lane_mask must stay below warpSize");
+
 inline constexpr std::int32_t kEvMte2ToV = 0;
 inline constexpr std::int32_t kEvVToMte3 = 1;
 

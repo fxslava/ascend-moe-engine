@@ -1,33 +1,35 @@
 // -----------------------------------------------------------------------------
-// test_custom_kernels_verification -- Target A.
+// test_custom_kernels_cpu_ref -- Target A, the pure CPU oracle.
 //
-// Functional and numerical correctness of the five arch35 kernels against the
-// bit-exact CPU algorithmic reference in src/emu, with every reference value
-// generated in memory on this run. No disk dumps, no pre-baked fixtures.
+// Properties of the arch35 kernel contracts that are decidable WITHOUT any
+// hardware: the algebraic invariants of the CPU golden in src/emu, the Birkhoff
+// polytope bounds, the top-k selection and tie-breaking rules, the E2M1 / E8M0
+// decode, and the metric machinery the device suite's thresholds rest on.
 //
-// Structure of each case:
-//   1. synthesize inputs from a printed seed (reproducible),
-//   2. compute the golden in memory via moe::emu,
-//   3. compute the kernel result -- on device, via the Launch* wrappers,
-//   4. assert cosine similarity / relative-L2 / Birkhoff bounds on the pair.
+// Every reference value is generated in memory on this run from a printed
+// seed. No disk dumps, no pre-baked fixtures, so a stale asset cannot make a
+// broken reference pass.
 //
-// Step 3 is currently unavailable: the Launch* host wrappers are specified in
-// docs/kernel_contracts_spec.md but not implemented, so those comparisons
-// report SKIP with that reason rather than silently passing. Everything that
-// does NOT need the device -- reference invariants, the Birkhoff bounds, the
-// edge-case contract, and the metric machinery itself -- runs for real here and
-// will fail the binary if it breaks.
+// ZERO DEVICE DEPENDENCY, deliberately and checkably:
+//   * no <acl/acl.h>, no device headers,
+//   * does not link libascendcl.so,
+//   * does not link any host CPU debug/interpretation runtime (no cpudebug,
+//     no tikicpulib, no libascendc_cpudebug.so),
+//   * builds with a stock host g++/clang++ and no CANN toolkit present.
 //
-// This binary never loads a host CPU debug runtime (cpudebug / tikicpulib).
+// It therefore must pass on any machine, NPU or not, and it is this binary --
+// not the device one -- that gates CI. On-device comparison against these same
+// references lives in test_npu_device.cpp (Target B).
 // -----------------------------------------------------------------------------
 
-#include "device_cases.hpp"
 #include "kernel_test_harness.hpp"
 
 #include "moe/emu/cpu_kernels.h"
 #include "moe/emu/dsv4_layers.h"
 
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <set>
 
 namespace {
@@ -562,7 +564,188 @@ void VerifyMxfp4Gemv(Report& rep) {
 }
 
 // ===========================================================================
-// 5. Metric self-test
+// 5. fast_fp8_indexer_topk -- the SIMT selection network, simulated
+//
+// SelectTopKSimt (src/ops/fast_fp8_indexer_topk/op_kernel/...) sorts 2048
+// composite keys with a bitonic network whose 66 levels are split into three
+// tiers by how far the compare-exchange partner lives: this thread's own
+// registers (jj < 4), another lane of the same warp via asc_shfl_xor
+// (4 <= jj < 128), or another warp via UB (jj >= 128).
+//
+// That tiering is an indexing argument, and an indexing argument is exactly
+// the kind of thing that is wrong the first time. It is also pure integer
+// logic with no device dependency, so it can be checked HERE rather than
+// hoped about: the loop below is a faithful transcription of the kernel's
+// network -- same tier boundaries, same blocked ownership (thread t owns
+// [4t, 4t+4)), same exchange rule -- run over 512 simulated threads, and its
+// output is compared against std::sort of the same keys.
+//
+// This does not prove the kernel runs correctly on hardware. It proves the
+// network it implements is a correct sort, which is the part that would
+// otherwise only be discovered on an NPU.
+// ===========================================================================
+void VerifyIndexerSelectionNetwork(Report& rep) {
+  section("fast_fp8_indexer_topk: SIMT selection network (host simulation)");
+
+  // Must match the kernel's geometry constants exactly.
+  constexpr std::uint32_t kSortLength = 2048;
+  constexpr std::uint32_t kSimtThreads = 512;
+  constexpr std::uint32_t kWarpSize = 32;
+  constexpr std::uint32_t kKeysPerThread = kSortLength / kSimtThreads;  // 4
+
+  // A faithful transcription of SelectTopKSimt's network. `keys` is the
+  // cross-warp staging buffer; `reg[t][r]` stands in for thread t's
+  // registers. Barriers are implicit: each tier-3 level reads a snapshot
+  // taken after every thread has stored, which is what the two
+  // asc_syncthreads() calls around it guarantee.
+  const auto run_network = [&](std::vector<std::uint32_t> initial) {
+    std::vector<std::array<std::uint32_t, kKeysPerThread>> reg(kSimtThreads);
+    for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+      for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+        reg[t][r] = initial[t * kKeysPerThread + r];
+      }
+    }
+    std::vector<std::uint32_t> staging(kSortLength, 0);
+
+    for (std::uint32_t k = 2; k <= kSortLength; k <<= 1) {
+      for (std::uint32_t jj = k >> 1; jj > 0; jj >>= 1) {
+        if (jj < kKeysPerThread) {
+          for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+            for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+              const std::uint32_t pr = r ^ jj;
+              if (pr > r) {
+                const std::uint32_t i = t * kKeysPerThread + r;
+                const std::uint32_t a = reg[t][r], b = reg[t][pr];
+                const std::uint32_t hi = a > b ? a : b;
+                const std::uint32_t lo = a > b ? b : a;
+                const bool want_desc = ((i & k) == 0u);
+                reg[t][r] = want_desc ? hi : lo;
+                reg[t][pr] = want_desc ? lo : hi;
+              }
+            }
+          }
+        } else if (jj < kKeysPerThread * kWarpSize) {
+          // Warp shuffle: partner lane is lane ^ (jj / kKeysPerThread), same
+          // r slot. Snapshot first, because a shuffle reads every lane's
+          // pre-exchange value.
+          const std::uint32_t lane_mask = jj / kKeysPerThread;
+          const auto before = reg;
+          for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+            const std::uint32_t warp_base = (t / kWarpSize) * kWarpSize;
+            const std::uint32_t lane = t % kWarpSize;
+            const std::uint32_t partner_t = warp_base + (lane ^ lane_mask);
+            for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+              const std::uint32_t i = t * kKeysPerThread + r;
+              const std::uint32_t a = before[t][r];
+              const std::uint32_t b = before[partner_t][r];
+              const std::uint32_t hi = a > b ? a : b;
+              const std::uint32_t lo = a > b ? b : a;
+              const bool want_desc = ((i & k) == 0u);
+              const bool i_is_low = ((i & jj) == 0u);
+              reg[t][r] = (i_is_low == want_desc) ? hi : lo;
+            }
+          }
+        } else {
+          for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+            for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+              staging[t * kKeysPerThread + r] = reg[t][r];
+            }
+          }
+          for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+            for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+              const std::uint32_t i = t * kKeysPerThread + r;
+              const std::uint32_t a = reg[t][r];
+              const std::uint32_t b = staging[i ^ jj];
+              const std::uint32_t hi = a > b ? a : b;
+              const std::uint32_t lo = a > b ? b : a;
+              const bool want_desc = ((i & k) == 0u);
+              const bool i_is_low = ((i & jj) == 0u);
+              reg[t][r] = (i_is_low == want_desc) ? hi : lo;
+            }
+          }
+        }
+      }
+    }
+
+    std::vector<std::uint32_t> out(kSortLength);
+    for (std::uint32_t t = 0; t < kSimtThreads; ++t) {
+      for (std::uint32_t r = 0; r < kKeysPerThread; ++r) {
+        out[t * kKeysPerThread + r] = reg[t][r];
+      }
+    }
+    return out;
+  };
+
+  struct Case {
+    const char* name;
+    std::vector<std::uint32_t> keys;
+  };
+  std::vector<Case> cases;
+
+  // Random composites built the way the kernel builds them, so the low 16
+  // bits are the inverted index and every key is distinct.
+  {
+    Rng rng(0x70F0ULL);
+    const std::vector<float> scores = rng.normal(kSortLength, 0.0F, 2.0F);
+    std::vector<std::uint32_t> keys(kSortLength);
+    for (std::uint32_t j = 0; j < kSortLength; ++j) {
+      const std::uint16_t bf = Fp32ToBf16(scores[j]);
+      const std::uint16_t mono =
+          static_cast<std::uint16_t>(bf ^ ((bf & 0x8000u) != 0u ? 0xFFFFu : 0x8000u));
+      keys[j] = (static_cast<std::uint32_t>(mono) << 16) | (0xFFFFu ^ j);
+    }
+    cases.push_back({"random BF16 composites", keys});
+  }
+  // Already sorted, and reverse sorted: the two orders a buggy direction
+  // flag passes or fails asymmetrically.
+  {
+    std::vector<std::uint32_t> asc(kSortLength), desc(kSortLength);
+    for (std::uint32_t j = 0; j < kSortLength; ++j) {
+      asc[j] = j + 1u;
+      desc[j] = kSortLength - j;
+    }
+    cases.push_back({"ascending input (worst case for a direction bug)", asc});
+    cases.push_back({"already descending (must be a no-op)", desc});
+  }
+  // Heavy padding: a short sequence leaves mostly kSelectionPadKey == 0,
+  // which must all sink to the tail.
+  {
+    std::vector<std::uint32_t> keys(kSortLength, 0u);
+    for (std::uint32_t j = 0; j < 37u; ++j) {
+      keys[j] = (static_cast<std::uint32_t>(0x4000u + j * 7u) << 16) | (0xFFFFu ^ j);
+    }
+    cases.push_back({"seq_len 37 of 2048, rest padding", keys});
+  }
+
+  for (const auto& c : cases) {
+    const std::vector<std::uint32_t> got = run_network(c.keys);
+    std::vector<std::uint32_t> want = c.keys;
+    std::sort(want.begin(), want.end(), std::greater<std::uint32_t>());
+
+    std::size_t first_diff = kSortLength;
+    for (std::size_t i = 0; i < kSortLength; ++i) {
+      if (got[i] != want[i]) {
+        first_diff = i;
+        break;
+      }
+    }
+    char detail[260];
+    if (first_diff == kSortLength) {
+      std::snprintf(detail, sizeof(detail),
+                    "all %u ranks match std::sort descending", kSortLength);
+    } else {
+      std::snprintf(detail, sizeof(detail),
+                    "first mismatch at rank %zu: network 0x%08X, std::sort "
+                    "0x%08X",
+                    first_diff, got[first_diff], want[first_diff]);
+    }
+    rep.check(first_diff == kSortLength,
+              std::string("tiered bitonic network sorts: ") + c.name, detail);
+  }
+}
+
+// ===========================================================================
+// 6. Metric self-test
 //
 // The thresholds above are only meaningful if the metrics themselves are
 // right. A metric that returns 1.0 for everything would make this whole
@@ -617,9 +800,10 @@ void VerifyMetrics(Report& rep) {
 }  // namespace
 
 int main() {
-  std::printf("test_custom_kernels_verification\n");
+  std::printf("test_custom_kernels_cpu_ref\n");
+  std::printf("  scope: host-only invariants of the CPU golden (no device)\n");
   std::printf("  references: in-memory per run (moe_emu), no disk fixtures\n");
-  std::printf("  host CPU debug runtimes (cpudebug/tikicpulib): not linked\n");
+  std::printf("  AscendCL: not linked   host CPU debug runtimes: not linked\n");
 
   Report rep;
   VerifyMetrics(rep);
@@ -627,14 +811,16 @@ int main() {
   VerifyMhcPostStructure(rep);
   VerifyIndexerEdgeCases(rep);
   VerifyMxfp4Gemv(rep);
-  RunDeviceCases(rep);
+  VerifyIndexerSelectionNetwork(rep);
 
   std::printf("\n---------------------------------------------------------\n");
-  std::printf("checks: %d   failures: %d   skipped: %d\n", rep.checks,
-              rep.failures, rep.skipped);
+  std::printf("checks: %d   failures: %d\n", rep.checks, rep.failures);
+  // This target has no device gate and no conditional sections, so a skip here
+  // would mean a case silently opted out. Treat it as a failure of the suite.
   if (rep.skipped > 0) {
-    std::printf("NOTE: %d device comparison(s) skipped -- see the reason above.\n",
+    std::printf("RESULT: FAIL (%d skipped; the CPU oracle must not skip)\n",
                 rep.skipped);
+    return 1;
   }
   std::printf("%s\n", rep.failures == 0 ? "RESULT: PASS" : "RESULT: FAIL");
   return rep.exit_code();

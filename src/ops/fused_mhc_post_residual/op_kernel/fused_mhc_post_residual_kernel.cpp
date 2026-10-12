@@ -19,8 +19,8 @@
 // accumulate (Add), so no product scratch tile is needed.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/fused_mhc_post_residual_ub_layout.hpp"
-#include "moe/kernels/arch35/tiling_data.hpp"
+#include "fused_mhc_post_residual_arch35.h"
+#include "fused_mhc_post_residual_tiling.h"
 
 namespace moe::kernels::arch35::fused_mhc_post_residual {
 
