@@ -1,4 +1,4 @@
-// ker02_ub_layout.hpp -- unified-buffer layout and event plan for KER-02
+// fused_mhc_post_residual_ub_layout.hpp -- unified-buffer layout and event plan for fused_mhc_post_residual
 // fused_mhc_post_residual (4 AIVs, one output stream per block, pure SIMD).
 //
 // Segment table (per core; 512-element feature tiles, 8 tiles per stream):
@@ -26,14 +26,14 @@
 // Four blocks write disjoint y rows; there is no inter-core barrier and no
 // SyncAll. In-place x==y is rejected host-side (contract: forbidden).
 
-#ifndef MOE_KERNELS_ARCH35_KER02_UB_LAYOUT_HPP
-#define MOE_KERNELS_ARCH35_KER02_UB_LAYOUT_HPP
+#ifndef MOE_KERNELS_ARCH35_FUSED_MHC_POST_RESIDUAL_UB_LAYOUT_HPP
+#define MOE_KERNELS_ARCH35_FUSED_MHC_POST_RESIDUAL_UB_LAYOUT_HPP
 
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 
-namespace moe::kernels::arch35::ker02 {
+namespace moe::kernels::arch35::fused_mhc_post_residual {
 
 inline constexpr std::uint32_t kStreams = 4;
 inline constexpr std::uint32_t kHidden = 4096;
@@ -53,17 +53,17 @@ inline constexpr std::uint32_t kTotalUbBytes =
 // The contract's v1 budget for the five resident compute tiles.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 13440;
 
-static_assert(kTotalUbBytes == 15488, "KER-02 UB layout must sum to 15,488 B");
+static_assert(kTotalUbBytes == 15488, "fused_mhc_post_residual UB layout must sum to 15,488 B");
 static_assert(kTotalUbBytes <= kUsableUbBytes,
-              "KER-02 UB layout exceeds the arch35 usable UB ceiling");
+              "fused_mhc_post_residual UB layout exceeds the arch35 usable UB ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
                   kUbDataCacheMinBytes,
-              "KER-02 UB layout starves the SIMT DataCache below 32 KiB");
+              "fused_mhc_post_residual UB layout starves the SIMT DataCache below 32 KiB");
 
 inline constexpr std::int32_t kEvMte2ToV = 0;
 inline constexpr std::int32_t kEvVToMte3 = 1;
 inline constexpr std::int32_t kEvVToMte2 = 2;
 
-}  // namespace moe::kernels::arch35::ker02
+}  // namespace moe::kernels::arch35::fused_mhc_post_residual
 
-#endif  // MOE_KERNELS_ARCH35_KER02_UB_LAYOUT_HPP
+#endif  // MOE_KERNELS_ARCH35_FUSED_MHC_POST_RESIDUAL_UB_LAYOUT_HPP

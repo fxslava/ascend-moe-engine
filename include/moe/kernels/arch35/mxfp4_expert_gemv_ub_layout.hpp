@@ -1,4 +1,4 @@
-// ker05_ub_layout.hpp -- unified-buffer layout and event plan for KER-05
+// mxfp4_expert_gemv_ub_layout.hpp -- unified-buffer layout and event plan for mxfp4_expert_gemv
 // mxfp4 expert GEMV (32 AIVs, grid-stride over 32-row tiles, hybrid).
 //
 // Segment table (per core; cols = tiling.cols, worst case 4,096):
@@ -35,14 +35,14 @@
 //   EVENT_ID1  V    -> MTE3 yTile store readiness (once per 32-row tile)
 // Phase boundaries around each SIMT launch use DataSyncBarrier<ALL>.
 
-#ifndef MOE_KERNELS_ARCH35_KER05_UB_LAYOUT_HPP
-#define MOE_KERNELS_ARCH35_KER05_UB_LAYOUT_HPP
+#ifndef MOE_KERNELS_ARCH35_MXFP4_EXPERT_GEMV_UB_LAYOUT_HPP
+#define MOE_KERNELS_ARCH35_MXFP4_EXPERT_GEMV_UB_LAYOUT_HPP
 
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 
-namespace moe::kernels::arch35::ker05 {
+namespace moe::kernels::arch35::mxfp4_expert_gemv {
 
 inline constexpr std::uint32_t kRowsPerTile = 32;  // one tile per SIMT launch
 inline constexpr std::uint32_t kLanesPerRow = 16;  // 512 threads / 32 rows
@@ -61,11 +61,11 @@ inline constexpr std::uint32_t kContractUbBudgetBytes = 19456;
 // The directive's Stage-1 target footprint.
 inline constexpr std::uint32_t kDirectiveUbTargetBytes = 35 * 1024;
 
-static_assert(kTotalUbBytes == 18688, "KER-05 UB layout must sum to 18,688 B");
+static_assert(kTotalUbBytes == 18688, "mxfp4_expert_gemv UB layout must sum to 18,688 B");
 static_assert(kTotalUbBytes <= kContractUbBudgetBytes,
-              "KER-05 UB layout exceeds the contract v1 budget");
+              "mxfp4_expert_gemv UB layout exceeds the contract v1 budget");
 static_assert(kTotalUbBytes <= kDirectiveUbTargetBytes,
-              "KER-05 UB layout exceeds the 35 KiB directive target");
+              "mxfp4_expert_gemv UB layout exceeds the 35 KiB directive target");
 
 // SIMT launch geometry: 32 rows x 16 lanes.
 inline constexpr std::uint32_t kSimtThreads = kRowsPerTile * kLanesPerRow;  // 512
@@ -73,6 +73,6 @@ inline constexpr std::uint32_t kSimtThreads = kRowsPerTile * kLanesPerRow;  // 5
 inline constexpr std::int32_t kEvMte2ToV = 0;
 inline constexpr std::int32_t kEvVToMte3 = 1;
 
-}  // namespace moe::kernels::arch35::ker05
+}  // namespace moe::kernels::arch35::mxfp4_expert_gemv
 
-#endif  // MOE_KERNELS_ARCH35_KER05_UB_LAYOUT_HPP
+#endif  // MOE_KERNELS_ARCH35_MXFP4_EXPERT_GEMV_UB_LAYOUT_HPP

@@ -109,14 +109,14 @@ struct SemiE2eReport {
   std::vector<std::uint16_t> layer2_compressed_tokens;
 
   // Stage boundaries that v3 does NOT serialize, captured so the isolated
-  // arch35 kernel fixtures (KER-01's h_norm, KER-02's h_out) can be built
+  // arch35 kernel fixtures (fused_mhc_pre_norm_sinkhorn's h_norm, fused_mhc_post_residual's h_out) can be built
   // without re-deriving them. Purely diagnostic: nothing here feeds the
   // pipeline, so the golden file is unaffected.
   //
   //   *_h_norm  the activation RMSNorm of h_in with the stage's norm weight,
-  //             i.e. exactly KER-01's `h_norm` output before the BF16 store
+  //             i.e. exactly fused_mhc_pre_norm_sinkhorn's `h_norm` output before the BF16 store
   //   *_h_out   the sub-block FUNCTION output alone (attention output, or the
-  //             scaled routed sum plus shared expert), i.e. KER-02's `h_out`
+  //             scaled routed sum plus shared expert), i.e. fused_mhc_post_residual's `h_out`
   std::vector<float> layer0_h_norm;
   std::vector<float> layer2_h_norm;
   std::vector<float> moe_h_norm;

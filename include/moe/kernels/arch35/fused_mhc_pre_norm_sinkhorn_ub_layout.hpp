@@ -1,4 +1,4 @@
-// ker01_ub_layout.hpp -- unified-buffer layout and event plan for KER-01
+// fused_mhc_pre_norm_sinkhorn_ub_layout.hpp -- unified-buffer layout and event plan for fused_mhc_pre_norm_sinkhorn
 // fused_mhc_pre_norm_sinkhorn (single AIV, hybrid SIMD/SIMT).
 //
 // Segment table (all offsets 512-B aligned, distinct bank offsets; every
@@ -32,14 +32,14 @@
 // DataSyncBarrier<MemDsbT::ALL>() (the asc_vf_call executes inline in the
 // vector instruction stream on __DAV_VEC__).
 
-#ifndef MOE_KERNELS_ARCH35_KER01_UB_LAYOUT_HPP
-#define MOE_KERNELS_ARCH35_KER01_UB_LAYOUT_HPP
+#ifndef MOE_KERNELS_ARCH35_FUSED_MHC_PRE_NORM_SINKHORN_UB_LAYOUT_HPP
+#define MOE_KERNELS_ARCH35_FUSED_MHC_PRE_NORM_SINKHORN_UB_LAYOUT_HPP
 
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 
-namespace moe::kernels::arch35::ker01 {
+namespace moe::kernels::arch35::fused_mhc_pre_norm_sinkhorn {
 
 inline constexpr std::uint32_t kStreams = 4;
 inline constexpr std::uint32_t kHidden = 4096;
@@ -70,14 +70,14 @@ inline constexpr std::uint32_t kTotalUbBytes =
 // The contract's correctness-first v1 budget for this kernel.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 182464;
 
-static_assert(kTotalUbBytes == 174'336, "KER-01 UB layout must sum to 174,336 B");
+static_assert(kTotalUbBytes == 174'336, "fused_mhc_pre_norm_sinkhorn UB layout must sum to 174,336 B");
 static_assert(kTotalUbBytes <= kContractUbBudgetBytes,
-              "KER-01 UB layout exceeds the contract v1 budget");
+              "fused_mhc_pre_norm_sinkhorn UB layout exceeds the contract v1 budget");
 static_assert(kTotalUbBytes <= kUsableUbBytes,
-              "KER-01 UB layout exceeds the arch35 usable UB ceiling");
+              "fused_mhc_pre_norm_sinkhorn UB layout exceeds the arch35 usable UB ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
                   kUbDataCacheMinBytes,
-              "KER-01 UB layout starves the SIMT DataCache below 32 KiB");
+              "fused_mhc_pre_norm_sinkhorn UB layout starves the SIMT DataCache below 32 KiB");
 
 // Event IDs (arch35: only EVENT_ID0..EVENT_ID3 exist).
 inline constexpr std::int32_t kEvMte2ToV = 0;
@@ -85,6 +85,6 @@ inline constexpr std::int32_t kEvVToMte2 = 1;
 inline constexpr std::int32_t kEvVToS = 2;
 inline constexpr std::int32_t kEvVToMte3 = 3;
 
-}  // namespace moe::kernels::arch35::ker01
+}  // namespace moe::kernels::arch35::fused_mhc_pre_norm_sinkhorn
 
-#endif  // MOE_KERNELS_ARCH35_KER01_UB_LAYOUT_HPP
+#endif  // MOE_KERNELS_ARCH35_FUSED_MHC_PRE_NORM_SINKHORN_UB_LAYOUT_HPP

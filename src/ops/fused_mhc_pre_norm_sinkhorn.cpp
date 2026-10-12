@@ -1,4 +1,4 @@
-// ker01_mhc_pre_norm_sinkhorn.cpp -- KER-01 device kernel (Ascend 950PR,
+// fused_mhc_pre_norm_sinkhorn.cpp -- fused_mhc_pre_norm_sinkhorn device kernel (Ascend 950PR,
 // arch35 / dav-3510, single AIV, hybrid SIMD/SIMT).
 //
 // Math (docs/kernel_contracts_spec.md, oracle src/emu/mhc_fused_sinkhorn_gemv.cpp):
@@ -24,10 +24,10 @@
 // GM scratch workspace: 0 bytes (the workspace argument is unused).
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/ker01_ub_layout.hpp"
+#include "moe/kernels/arch35/fused_mhc_pre_norm_sinkhorn_ub_layout.hpp"
 #include "moe/kernels/arch35/tiling_data.hpp"
 
-namespace moe::kernels::arch35::ker01 {
+namespace moe::kernels::arch35::fused_mhc_pre_norm_sinkhorn {
 
 using namespace AscendC;
 
@@ -375,7 +375,7 @@ class MhcPreNormSinkhorn {
 
 // GM_ADDR parameter order mirrors LaunchMhcPreNormSinkhorn (workspace unused:
 // the contract's GM scratch for this kernel is 0 bytes).
-extern "C" __global__ __aicore__ void ker01_mhc_pre_norm_sinkhorn(
+extern "C" __global__ __aicore__ void fused_mhc_pre_norm_sinkhorn(
     GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias, GM_ADDR gamma,
     GM_ADDR h_raw, GM_ADDR h_norm, GM_ADDR post, GM_ADDR birkhoff,
     GM_ADDR workspace, GM_ADDR tiling) {
@@ -402,4 +402,4 @@ extern "C" __global__ __aicore__ void ker01_mhc_pre_norm_sinkhorn(
   op.Process();
 }
 
-}  // namespace moe::kernels::arch35::ker01
+}  // namespace moe::kernels::arch35::fused_mhc_pre_norm_sinkhorn

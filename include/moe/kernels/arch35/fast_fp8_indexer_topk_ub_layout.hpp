@@ -1,4 +1,4 @@
-// ker04_ub_layout.hpp -- unified-buffer layout and event plan for KER-04
+// fast_fp8_indexer_topk_ub_layout.hpp -- unified-buffer layout and event plan for fast_fp8_indexer_topk
 // fused_fp8_indexer_topk (single AIV, hybrid SIMD/SIMT, deterministic order).
 //
 // Segment table:
@@ -35,14 +35,14 @@
 //   EVENT_ID1  V    -> MTE3 indices store readiness
 // SIMT-internal ordering uses asc_syncthreads / DataSyncBarrier.
 
-#ifndef MOE_KERNELS_ARCH35_KER04_UB_LAYOUT_HPP
-#define MOE_KERNELS_ARCH35_KER04_UB_LAYOUT_HPP
+#ifndef MOE_KERNELS_ARCH35_FAST_FP8_INDEXER_TOPK_UB_LAYOUT_HPP
+#define MOE_KERNELS_ARCH35_FAST_FP8_INDEXER_TOPK_UB_LAYOUT_HPP
 
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 
-namespace moe::kernels::arch35::ker04 {
+namespace moe::kernels::arch35::fast_fp8_indexer_topk {
 
 inline constexpr std::uint32_t kHeads = 64;
 inline constexpr std::uint32_t kHeadDim = 128;
@@ -63,12 +63,12 @@ inline constexpr std::uint32_t kTotalUbBytes =
 // The contract's v1 UB cap (vector-scoring shape); see the header comment.
 inline constexpr std::uint32_t kContractUbCapBytes = 44064;
 
-static_assert(kTotalUbBytes == 49664, "KER-04 UB layout must sum to 49,664 B");
+static_assert(kTotalUbBytes == 49664, "fast_fp8_indexer_topk UB layout must sum to 49,664 B");
 static_assert(kTotalUbBytes <= kUsableUbBytes,
-              "KER-04 UB layout exceeds the arch35 usable UB ceiling");
+              "fast_fp8_indexer_topk UB layout exceeds the arch35 usable UB ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
                   kUbDataCacheMinBytes,
-              "KER-04 UB layout starves the SIMT DataCache below 32 KiB");
+              "fast_fp8_indexer_topk UB layout starves the SIMT DataCache below 32 KiB");
 
 // SIMT launch geometry.
 inline constexpr std::uint32_t kSimtThreads = 512;  // 16 warps
@@ -77,6 +77,6 @@ inline constexpr std::uint32_t kWarpSize = 32;
 inline constexpr std::int32_t kEvMte2ToV = 0;
 inline constexpr std::int32_t kEvVToMte3 = 1;
 
-}  // namespace moe::kernels::arch35::ker04
+}  // namespace moe::kernels::arch35::fast_fp8_indexer_topk
 
-#endif  // MOE_KERNELS_ARCH35_KER04_UB_LAYOUT_HPP
+#endif  // MOE_KERNELS_ARCH35_FAST_FP8_INDEXER_TOPK_UB_LAYOUT_HPP

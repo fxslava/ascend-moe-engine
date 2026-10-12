@@ -1,4 +1,4 @@
-// ker03_ub_layout.hpp -- unified-buffer layout and event plan for KER-03
+// paged_compressor_rope_ub_layout.hpp -- unified-buffer layout and event plan for paged_compressor_rope
 // fused_paged_compressor_rope (single AIV, hybrid SIMD/SIMT, coff=2 C4A).
 //
 // Segment table:
@@ -46,14 +46,14 @@
 // The persistent GM state is 49,168 B (state + meta), an owned
 // input/output allocation, NOT scratch: GM scratch is 0 B.
 
-#ifndef MOE_KERNELS_ARCH35_KER03_UB_LAYOUT_HPP
-#define MOE_KERNELS_ARCH35_KER03_UB_LAYOUT_HPP
+#ifndef MOE_KERNELS_ARCH35_PAGED_COMPRESSOR_ROPE_UB_LAYOUT_HPP
+#define MOE_KERNELS_ARCH35_PAGED_COMPRESSOR_ROPE_UB_LAYOUT_HPP
 
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 
-namespace moe::kernels::arch35::ker03 {
+namespace moe::kernels::arch35::paged_compressor_rope {
 
 inline constexpr std::uint32_t kHidden = 4096;
 inline constexpr std::uint32_t kHeadDim = 512;
@@ -70,7 +70,7 @@ inline constexpr std::uint32_t kKvCurRegionFloats = kRatio * kStateWidth;  // 4,
 inline constexpr std::uint32_t kGateCurRegionFloats = kRatio * kStateWidth;
 inline constexpr std::uint32_t kPrevARegionFloats = kRatio * kHeadDim;     // 2,048
 static_assert(2 * kKvCurRegionFloats + 2 * kPrevARegionFloats == kStateFloats,
-              "KER-03 state ABI regions must tile the 12,288-float buffer");
+              "paged_compressor_rope state ABI regions must tile the 12,288-float buffer");
 
 inline constexpr std::uint32_t kApeBytes = kRatio * kStateWidth * 4;        // 16,384
 inline constexpr std::uint32_t kOutF32Bytes = kHeadDim * 4;                 // 2,048
@@ -89,14 +89,14 @@ inline constexpr std::uint32_t kTotalUbBytes =
 // The contract's padded emit-phase figure (83,968 B + 1 KiB); see above.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 84992;
 
-static_assert(kTotalUbBytes == 73216, "KER-03 UB layout must sum to 73,216 B");
+static_assert(kTotalUbBytes == 73216, "paged_compressor_rope UB layout must sum to 73,216 B");
 static_assert(kTotalUbBytes <= kContractUbBudgetBytes,
-              "KER-03 UB layout exceeds the contract emit-phase budget");
+              "paged_compressor_rope UB layout exceeds the contract emit-phase budget");
 static_assert(kTotalUbBytes <= kUsableUbBytes,
-              "KER-03 UB layout exceeds the arch35 usable UB ceiling");
+              "paged_compressor_rope UB layout exceeds the arch35 usable UB ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
                   kUbDataCacheMinBytes,
-              "KER-03 UB layout starves the SIMT DataCache below 32 KiB");
+              "paged_compressor_rope UB layout starves the SIMT DataCache below 32 KiB");
 
 // SIMT launch geometry: one thread per feature lane.
 inline constexpr std::uint32_t kSimtThreads = kHeadDim;  // 512
@@ -106,6 +106,6 @@ inline constexpr std::int32_t kEvVToMte3 = 1;
 inline constexpr std::int32_t kEvMte2ToMte3 = 2;
 inline constexpr std::int32_t kEvMte3ToMte2 = 3;
 
-}  // namespace moe::kernels::arch35::ker03
+}  // namespace moe::kernels::arch35::paged_compressor_rope
 
-#endif  // MOE_KERNELS_ARCH35_KER03_UB_LAYOUT_HPP
+#endif  // MOE_KERNELS_ARCH35_PAGED_COMPRESSOR_ROPE_UB_LAYOUT_HPP

@@ -1,5 +1,5 @@
 // arch35_common.hpp -- device-side shared helpers for the Stage-1 arch35
-// kernels (KER-01..KER-05).
+// kernels (fused_mhc_pre_norm_sinkhorn..mxfp4_expert_gemv).
 //
 // Included only from device translation units after "kernel_operator.h".
 // Everything here is register-level arithmetic: no UB traffic, no GM traffic,
@@ -12,7 +12,7 @@
 //     oracle returns NaN -- garbage-in-garbage-in either way, documented).
 //   * FP32->BF16 rounds to nearest even and quiets NaNs into the top mantissa
 //     bit, exactly like moe::emu::FloatToBf16.
-//   * The KER-04 selection composite packs (orderable BF16 score, ~index)
+//   * The fast_fp8_indexer_topk selection composite packs (orderable BF16 score, ~index)
 //     into one uint32 so a single unsigned compare realizes the golden's
 //     "score descending, then logical index ascending" total order.
 
@@ -128,7 +128,7 @@ __simt_callee__ __aicore__ inline float DecodeFp8E4M3(std::uint8_t code) {
 }
 
 // ---------------------------------------------------------------------------
-// BF16 rounding (KER-04 selection): round-to-nearest-even, NaN quieted
+// BF16 rounding (fast_fp8_indexer_topk selection): round-to-nearest-even, NaN quieted
 // ---------------------------------------------------------------------------
 __simt_callee__ __aicore__ inline std::uint16_t FloatToBf16Bits(float value) {
   std::uint32_t bits = FloatToBits(value);
@@ -142,7 +142,7 @@ __simt_callee__ __aicore__ inline std::uint16_t FloatToBf16Bits(float value) {
 }
 
 // ---------------------------------------------------------------------------
-// KER-04 selection composite
+// fast_fp8_indexer_topk selection composite
 // ---------------------------------------------------------------------------
 // Order a (possibly negative) BF16 score with one unsigned compare by
 // flipping the sign bit for positives and all bits for negatives, then pack

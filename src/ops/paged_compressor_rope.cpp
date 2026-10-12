@@ -1,4 +1,4 @@
-// ker03_paged_compressor_rope.cpp -- KER-03 device kernel (Ascend 950PR,
+// paged_compressor_rope.cpp -- paged_compressor_rope device kernel (Ascend 950PR,
 // arch35 / dav-3510, single AIV, hybrid SIMD/SIMT), the C4A coff=2 branch
 // of the paged compressor exactly as the oracle emulates it
 // (src/emu/paged_compressor_decode.cpp :: paged_compressor_decode_c4a).
@@ -24,10 +24,10 @@
 // MTE2_MTE3 WAR pairing. GM scratch: 0 bytes.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/ker03_ub_layout.hpp"
+#include "moe/kernels/arch35/paged_compressor_rope_ub_layout.hpp"
 #include "moe/kernels/arch35/tiling_data.hpp"
 
-namespace moe::kernels::arch35::ker03 {
+namespace moe::kernels::arch35::paged_compressor_rope {
 
 using namespace AscendC;
 
@@ -403,7 +403,7 @@ class PagedCompressorRope {
 
 // GM_ADDR parameter order mirrors LaunchPagedCompressorRope (workspace
 // unused: GM scratch is 0 bytes; the 49,168 B state is an owned allocation).
-extern "C" __global__ __aicore__ void ker03_paged_compressor_rope(
+extern "C" __global__ __aicore__ void paged_compressor_rope(
     GM_ADDR x, GM_ADDR wkv, GM_ADDR wgate, GM_ADDR ape, GM_ADDR norm_weight,
     GM_ADDR rope_cos, GM_ADDR rope_sin, GM_ADDR state, GM_ADDR state_meta,
     GM_ADDR cache_slot, GM_ADDR emitted, std::uint32_t step,
@@ -432,4 +432,4 @@ extern "C" __global__ __aicore__ void ker03_paged_compressor_rope(
   op.Process();
 }
 
-}  // namespace moe::kernels::arch35::ker03
+}  // namespace moe::kernels::arch35::paged_compressor_rope

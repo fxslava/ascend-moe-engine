@@ -1,4 +1,4 @@
-// ker04_fp8_indexer_topk.cpp -- KER-04 device kernel (Ascend 950PR,
+// fast_fp8_indexer_topk.cpp -- fast_fp8_indexer_topk device kernel (Ascend 950PR,
 // arch35 / dav-3510, single AIV, hybrid SIMD/SIMT).
 //
 // Math (oracle src/emu/fast_fp8_indexer_topk.cpp):
@@ -26,10 +26,10 @@
 // slots hold the winners in rank order; the rest of the output is -1.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/ker04_ub_layout.hpp"
+#include "moe/kernels/arch35/fast_fp8_indexer_topk_ub_layout.hpp"
 #include "moe/kernels/arch35/tiling_data.hpp"
 
-namespace moe::kernels::arch35::ker04 {
+namespace moe::kernels::arch35::fast_fp8_indexer_topk {
 
 using namespace AscendC;
 
@@ -262,7 +262,7 @@ class Fp8IndexerTopK {
 
 // GM_ADDR parameter order mirrors LaunchFp8IndexerTopK. workspace must be
 // non-null and at least align_up(4*seq_len, 32) bytes when seq_len > 0.
-extern "C" __global__ __aicore__ void ker04_fp8_indexer_topk(
+extern "C" __global__ __aicore__ void fast_fp8_indexer_topk(
     GM_ADDR query, GM_ADDR key_cache, GM_ADDR dequant_scales,
     GM_ADDR block_table, GM_ADDR indices, GM_ADDR workspace, GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
@@ -290,4 +290,4 @@ extern "C" __global__ __aicore__ void ker04_fp8_indexer_topk(
   op.Process();
 }
 
-}  // namespace moe::kernels::arch35::ker04
+}  // namespace moe::kernels::arch35::fast_fp8_indexer_topk

@@ -1,4 +1,4 @@
-// ker05_mxfp4_expert_gemv.cpp -- KER-05 device kernel (Ascend 950PR,
+// mxfp4_expert_gemv.cpp -- mxfp4_expert_gemv device kernel (Ascend 950PR,
 // arch35 / dav-3510, 32 AIVs, hybrid SIMD/SIMT).
 //
 // Math (oracle src/emu/dsv4_quant_gemv.cpp :: mxfp4_gemv_cpu):
@@ -30,10 +30,10 @@
 // registers instead; the UB budget stays at 18,688 B <= 19,456 B.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/ker05_ub_layout.hpp"
+#include "moe/kernels/arch35/mxfp4_expert_gemv_ub_layout.hpp"
 #include "moe/kernels/arch35/tiling_data.hpp"
 
-namespace moe::kernels::arch35::ker05 {
+namespace moe::kernels::arch35::mxfp4_expert_gemv {
 
 using namespace AscendC;
 
@@ -158,7 +158,7 @@ class Mxfp4ExpertGemv {
 
 // GM_ADDR parameter order mirrors LaunchMxfp4ExpertGemv (workspace unused:
 // GM scratch is 0 bytes for this kernel).
-extern "C" __global__ __aicore__ void ker05_mxfp4_expert_gemv(
+extern "C" __global__ __aicore__ void mxfp4_expert_gemv(
     GM_ADDR packed, GM_ADDR scale, GM_ADDR x, GM_ADDR y, GM_ADDR workspace,
     GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
@@ -186,4 +186,4 @@ extern "C" __global__ __aicore__ void ker05_mxfp4_expert_gemv(
   op.Process();
 }
 
-}  // namespace moe::kernels::arch35::ker05
+}  // namespace moe::kernels::arch35::mxfp4_expert_gemv

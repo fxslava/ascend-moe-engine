@@ -1,4 +1,4 @@
-// ker02_mhc_post_residual.cpp -- KER-02 device kernel (Ascend 950PR,
+// fused_mhc_post_residual.cpp -- fused_mhc_post_residual device kernel (Ascend 950PR,
 // arch35 / dav-3510, 4 AIVs, pure SIMD).
 //
 // Math (oracle src/emu/mhc_fused_sinkhorn_gemv.cpp :: mhc_post_cpu):
@@ -19,10 +19,10 @@
 // accumulate (Add), so no product scratch tile is needed.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
-#include "moe/kernels/arch35/ker02_ub_layout.hpp"
+#include "moe/kernels/arch35/fused_mhc_post_residual_ub_layout.hpp"
 #include "moe/kernels/arch35/tiling_data.hpp"
 
-namespace moe::kernels::arch35::ker02 {
+namespace moe::kernels::arch35::fused_mhc_post_residual {
 
 using namespace AscendC;
 
@@ -141,7 +141,7 @@ class MhcPostResidual {
 
 // GM_ADDR parameter order mirrors LaunchMhcPostResidual (workspace unused:
 // GM scratch is 0 bytes for this kernel).
-extern "C" __global__ __aicore__ void ker02_mhc_post_residual(
+extern "C" __global__ __aicore__ void fused_mhc_post_residual(
     GM_ADDR x, GM_ADDR birkhoff, GM_ADDR post, GM_ADDR h_out, GM_ADDR y,
     GM_ADDR workspace, GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -164,4 +164,4 @@ extern "C" __global__ __aicore__ void ker02_mhc_post_residual(
   op.Process();
 }
 
-}  // namespace moe::kernels::arch35::ker02
+}  // namespace moe::kernels::arch35::fused_mhc_post_residual

@@ -195,6 +195,11 @@ if(ENABLE_HOST_EMU)
   enable_testing()
   add_subdirectory(tests/emu)
 
+  # The two custom-kernel binaries need nothing but moe_emu, so they are
+  # available in this host-only mode as well as in a full CANN build. This is
+  # the mode in which they can actually be run without a device.
+  add_subdirectory(tests/custom_kernels)
+
   # The standalone claim, verified against the artifacts. `ldd` on the bench
   # must show no CANN, no Python and no torch library; a static moe_emu plus a
   # host-only link line should leave only libstdc++/libm/libc/libgcc.

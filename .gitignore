@@ -26,3 +26,6 @@ data/
 # Isolated arch35 kernel fixtures: ~50 MiB of weight and activation slices,
 # regenerated on demand by apps/dsv4_extract_kernel_fixtures.
 data/dsv4_layer0/kernel_fixtures/
+
+# Device-compile gate output (scripts/device_compile_kernels.sh)
+build_dav3510/

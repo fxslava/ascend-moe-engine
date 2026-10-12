@@ -1,5 +1,5 @@
 // tiling_data.hpp -- versioned, fixed-width tiling PODs for the arch35
-// Stage-1 direct kernels (KER-01..KER-05, docs/kernel_contracts_spec.md).
+// Stage-1 direct kernels (fused_mhc_pre_norm_sinkhorn..mxfp4_expert_gemv, docs/kernel_contracts_spec.md).
 //
 // Every struct is a standard-layout, trivially-copyable POD of 32-bit fields
 // only, so host and device translation units see the identical layout with no
@@ -21,7 +21,7 @@ namespace moe::kernels::arch35 {
 inline constexpr std::uint32_t kTilingAbiVersion = 1;
 
 // ---------------------------------------------------------------------------
-// KER-01 -- fused_mhc_pre_norm_sinkhorn (sizeof == 64)
+// fused_mhc_pre_norm_sinkhorn -- fused_mhc_pre_norm_sinkhorn (sizeof == 64)
 // ---------------------------------------------------------------------------
 struct MhcPreNormTilingData {
   std::uint32_t abi_version;          // 1
@@ -43,7 +43,7 @@ struct MhcPreNormTilingData {
 };
 
 // ---------------------------------------------------------------------------
-// KER-02 -- fused_mhc_post_residual (sizeof == 32)
+// fused_mhc_post_residual -- fused_mhc_post_residual (sizeof == 32)
 // ---------------------------------------------------------------------------
 struct MhcPostTilingData {
   std::uint32_t abi_version;       // 1
@@ -57,7 +57,7 @@ struct MhcPostTilingData {
 };
 
 // ---------------------------------------------------------------------------
-// KER-03 -- fused_paged_compressor_rope, C4A coff=2 (sizeof == 64)
+// paged_compressor_rope -- fused_paged_compressor_rope, C4A coff=2 (sizeof == 64)
 // ---------------------------------------------------------------------------
 struct CompressorTilingData {
   std::uint32_t abi_version;         // 1
@@ -79,7 +79,7 @@ struct CompressorTilingData {
 };
 
 // ---------------------------------------------------------------------------
-// KER-04 -- fused_fp8_indexer_topk (sizeof == 48)
+// fast_fp8_indexer_topk -- fused_fp8_indexer_topk (sizeof == 48)
 // ---------------------------------------------------------------------------
 struct IndexerTilingData {
   std::uint32_t abi_version;       // 1
@@ -97,7 +97,7 @@ struct IndexerTilingData {
 };
 
 // ---------------------------------------------------------------------------
-// KER-05 -- mxfp4 expert GEMV (sizeof == 40)
+// mxfp4_expert_gemv -- mxfp4 expert GEMV (sizeof == 40)
 // ---------------------------------------------------------------------------
 struct Mxfp4GemvTilingData {
   std::uint32_t abi_version;       // 1
@@ -113,26 +113,26 @@ struct Mxfp4GemvTilingData {
 };
 
 // The fixed-size ABI. Host and device TUs must compile matching asserts.
-static_assert(sizeof(MhcPreNormTilingData) == 64, "KER-01 tiling must be 64 B");
-static_assert(sizeof(MhcPostTilingData) == 32, "KER-02 tiling must be 32 B");
-static_assert(sizeof(CompressorTilingData) == 64, "KER-03 tiling must be 64 B");
-static_assert(sizeof(IndexerTilingData) == 48, "KER-04 tiling must be 48 B");
-static_assert(sizeof(Mxfp4GemvTilingData) == 40, "KER-05 tiling must be 40 B");
+static_assert(sizeof(MhcPreNormTilingData) == 64, "fused_mhc_pre_norm_sinkhorn tiling must be 64 B");
+static_assert(sizeof(MhcPostTilingData) == 32, "fused_mhc_post_residual tiling must be 32 B");
+static_assert(sizeof(CompressorTilingData) == 64, "paged_compressor_rope tiling must be 64 B");
+static_assert(sizeof(IndexerTilingData) == 48, "fast_fp8_indexer_topk tiling must be 48 B");
+static_assert(sizeof(Mxfp4GemvTilingData) == 40, "mxfp4_expert_gemv tiling must be 40 B");
 static_assert(std::is_standard_layout<MhcPreNormTilingData>::value &&
                   std::is_trivially_copyable<MhcPreNormTilingData>::value,
-              "KER-01 tiling must be a standard-layout trivially-copyable POD");
+              "fused_mhc_pre_norm_sinkhorn tiling must be a standard-layout trivially-copyable POD");
 static_assert(std::is_standard_layout<MhcPostTilingData>::value &&
                   std::is_trivially_copyable<MhcPostTilingData>::value,
-              "KER-02 tiling must be a standard-layout trivially-copyable POD");
+              "fused_mhc_post_residual tiling must be a standard-layout trivially-copyable POD");
 static_assert(std::is_standard_layout<CompressorTilingData>::value &&
                   std::is_trivially_copyable<CompressorTilingData>::value,
-              "KER-03 tiling must be a standard-layout trivially-copyable POD");
+              "paged_compressor_rope tiling must be a standard-layout trivially-copyable POD");
 static_assert(std::is_standard_layout<IndexerTilingData>::value &&
                   std::is_trivially_copyable<IndexerTilingData>::value,
-              "KER-04 tiling must be a standard-layout trivially-copyable POD");
+              "fast_fp8_indexer_topk tiling must be a standard-layout trivially-copyable POD");
 static_assert(std::is_standard_layout<Mxfp4GemvTilingData>::value &&
                   std::is_trivially_copyable<Mxfp4GemvTilingData>::value,
-              "KER-05 tiling must be a standard-layout trivially-copyable POD");
+              "mxfp4_expert_gemv tiling must be a standard-layout trivially-copyable POD");
 
 }  // namespace moe::kernels::arch35
 
