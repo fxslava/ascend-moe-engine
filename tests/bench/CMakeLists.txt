@@ -40,3 +40,16 @@ set_tests_properties(bench_custom_kernels_performance_smoke PROPERTIES
   LABELS "bench;smoke"
   TIMEOUT 600
 )
+
+# The --device-only path is the one a profiling session actually uses, and it
+# takes a different route through every section (host loops skipped, device
+# sections still dispatched). Smoke it separately so the flag cannot rot
+# unnoticed behind the default run -- on a host with no device it does almost
+# nothing and costs almost nothing, which is exactly why it is cheap to keep.
+add_test(NAME bench_custom_kernels_performance_device_only_smoke
+         COMMAND bench_custom_kernels_performance 1 2 --device-only)
+set_tests_properties(bench_custom_kernels_performance_device_only_smoke
+  PROPERTIES
+  LABELS "bench;smoke"
+  TIMEOUT 600
+)

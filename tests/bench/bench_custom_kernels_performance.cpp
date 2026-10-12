@@ -12,16 +12,29 @@
 //     visible rather than averaged away.
 //
 // Device benchmarking goes through the Launch* host wrappers. Those now
-// exist, so this binary measures real hardware when an NPU is visible:
-// mxfp4_expert_gemv, fast_fp8_indexer_topk and paged_compressor_rope are
-// wired, and the stream is synchronized inside the timed region (see
-// TimedLaunch -- a chevron dispatch is asynchronous, so timing the launch call
-// alone measures enqueue cost). fused_mhc_pre_norm_sinkhorn and
-// fused_mhc_post_residual still print an explicit not-wired row.
+// exist, so this binary measures real hardware when an NPU is visible: all
+// five arch35 operators are wired, and the stream is synchronized inside the
+// timed region (see TimedLaunch -- a chevron dispatch is asynchronous, so
+// timing the launch call alone measures enqueue cost).
 //
 // paged_compressor_rope does not go through Measure() and reports HOLD and
 // EMIT separately; see BenchPagedCompressorDevice for why a stateful operator
 // cannot be timed by repeating an identical body.
+//
+// Not every device row is comparable to the host rows above it, and two are
+// not even on the same axis: the Sinkhorn host sweep varies the iteration
+// count, which is baked into the kernel and is not a device parameter, so
+// fused_mhc_pre_norm_sinkhorn reports a single device row against four host
+// rows. fused_mhc_post_residual does share its axis (tokens per step).
+//
+// --device-only skips the host reference rooflines entirely. They are scalar
+// single-threaded C++ and cost ~0.7 s of wall clock at the default 3/20
+// counts (measured on the dev workstation; the 2048x4096 MXFP4 GEMV at
+// ~6.4 ms/call and the seq_len=2048 indexer scan at ~10 ms/call are most of
+// it), scaling linearly with --iters. The device kernels they sit next to are
+// microseconds, so in a profile-and-tune loop the host rooflines are
+// effectively the entire run time while being a fixed baseline that does not
+// move between runs.
 //
 // The host-reference figures are kept alongside, and are NOT comparable to the
 // device rows: they are the roofline the kernel is beating.
@@ -117,6 +130,13 @@ void Row(const std::string& geometry, const Timing& t, double bytes,
   const double gflops = secs > 0.0 ? flops / secs / 1e9 : 0.0;
   std::printf("%-26s %10.2f %9.2f %10.2f %12.2f %12.2f\n", geometry.c_str(),
               t.mean_us, t.stddev_us, t.min_us, gbs, gflops);
+}
+
+// Printed in --device-only mode in place of the host reference rows, so a
+// section is never silently short: the rows are absent because they were asked
+// for to be, not because a measurement failed.
+void HostSkipped() {
+  std::printf("  [host]   skipped (--device-only)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +371,230 @@ void BenchIndexerDevice(const DeviceCtx& ctx, int warmup, int iters) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// device: fused_mhc_pre_norm_sinkhorn
+//
+// Geometry is FIXED by the contract -- 4 streams x 4096, a [24, 16384] phi --
+// so there is no device sweep to run. The host section above sweeps Sinkhorn
+// iteration counts, which is NOT a device axis: the iteration count is baked
+// into the kernel, so there is exactly one device row here and it is not
+// row-comparable to the four host rows.
+//
+// Traffic is phi: [24, 16384] FP32 is 1.5 MB read once per call and everything
+// else together is under 50 KB, so the GB/s column is effectively measuring
+// the projection-matrix stream. The 16-thread register-resident Sinkhorn solve
+// contributes essentially no traffic, which is the point of fusing it.
+// ---------------------------------------------------------------------------
+void BenchMhcPreNormDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  constexpr std::uint32_t kStreams = moe::emu::kHcStreams;      // 4
+  constexpr std::uint32_t kHidden = moe::emu::kHiddenSize;      // 4096
+  constexpr std::uint32_t kRows = moe::emu::kHcProjectionRows;  // 24
+  constexpr std::uint32_t kFlat = moe::emu::kHcFlatWidth;       // 16384
+  const std::size_t n = static_cast<std::size_t>(kStreams) * kHidden;
+  const std::size_t phi_elems = static_cast<std::size_t>(kRows) * kFlat;
+
+  Rng rng(0xD9E0ULL);
+  const std::vector<std::uint16_t> x = ToBf16(rng.normal(n, 0.0F, 0.5F));
+  // 1/sqrt(16384) == 1/128, so a row's 16384-term projection stays O(1) and
+  // the measured path is the same arithmetic regime the verification suite
+  // checks, not a denormal/overflow corner.
+  const std::vector<float> phi = rng.normal(phi_elems, 0.0F, 1.0F / 128.0F);
+  const std::vector<float> alpha = rng.uniform(3, 0.5F, 1.5F);
+  const std::vector<float> bias = rng.normal(kRows, 0.0F, 0.25F);
+  const std::vector<std::uint16_t> gamma =
+      ToBf16(rng.uniform(kHidden, 0.5F, 1.5F));
+
+  DeviceBuffer d_x, d_phi, d_alpha, d_bias, d_gamma;
+  DeviceBuffer d_h_raw, d_h_norm, d_post, d_birkhoff;
+  aclError rc = d_x.Alloc(n * 2);
+  if (rc == ACL_SUCCESS) rc = d_phi.Alloc(phi_elems * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_alpha.Alloc(alpha.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_bias.Alloc(bias.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_gamma.Alloc(kHidden * 2);
+  if (rc == ACL_SUCCESS) rc = d_h_raw.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_h_norm.Alloc(kHidden * 2);
+  if (rc == ACL_SUCCESS) rc = d_post.Alloc(kStreams * sizeof(float));
+  if (rc == ACL_SUCCESS) {
+    rc = d_birkhoff.Alloc(kStreams * kStreams * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), n * 2);
+  if (rc == ACL_SUCCESS) {
+    rc = d_phi.Upload(phi.data(), phi_elems * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_alpha.Upload(alpha.data(), alpha.size() * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) {
+    rc = d_bias.Upload(bias.data(), bias.size() * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) rc = d_gamma.Upload(gamma.data(), kHidden * 2);
+  if (rc == ACL_SUCCESS) rc = d_h_raw.Zero();
+  if (rc == ACL_SUCCESS) rc = d_h_norm.Zero();
+  if (rc == ACL_SUCCESS) rc = d_post.Zero();
+  if (rc == ACL_SUCCESS) rc = d_birkhoff.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] setup failed: %s\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  Timing t;
+  std::string why;
+  const bool ok = TimedLaunch(
+      [&] {
+        return LaunchMhcPreNormSinkhorn(
+            d_x.as<Bf16>(), kHidden, d_phi.as<float>(), kFlat,
+            d_alpha.as<float>(), d_bias.as<float>(), d_gamma.as<Bf16>(),
+            d_h_raw.as<float>(), d_h_norm.as<Bf16>(), d_post.as<float>(),
+            d_birkhoff.as<float>(), nullptr, kMhcPreNormWorkspaceBytes,
+            ctx.stream);
+      },
+      ctx.stream, warmup, iters, &t, &why);
+  if (!ok) {
+    std::printf("  [device] %ux%u: FAILED -- %s\n", kStreams, kHidden,
+                why.c_str());
+    return;
+  }
+
+  // phi read once, x read once, gamma read once, then the four outputs.
+  const double bytes = static_cast<double>(phi_elems) * 4.0 +
+                       static_cast<double>(n) * 2.0 +
+                       static_cast<double>(kHidden) * 2.0 +
+                       static_cast<double>(kHidden) * 4.0 +
+                       static_cast<double>(kHidden) * 2.0 +
+                       static_cast<double>(kStreams) * 4.0 +
+                       static_cast<double>(kStreams) * kStreams * 4.0;
+  // The [24, 16384] projection, plus the pre-gated mix h_in = sum_i pre[i]*x[i]
+  // over 4x4096. The Sinkhorn solve is 4x4 and is not worth counting against
+  // 393,216 projection MACs.
+  const double flops = 2.0 * (static_cast<double>(phi_elems) +
+                              static_cast<double>(n));
+  char geo[64];
+  std::snprintf(geo, sizeof(geo), "[device] %ux%u, phi %ux%u", kStreams,
+                kHidden, kRows, kFlat);
+  Row(geo, t, bytes, flops);
+}
+
+// ---------------------------------------------------------------------------
+// device: fused_mhc_post_residual
+//
+// Bandwidth-bound and stateless, so unlike the compressor it can be repeated
+// with an identical body. The sweep is over TOKENS per timed body, the same
+// axis the host section sweeps and the one decode actually varies.
+//
+// WHAT THIS DOES NOT MEASURE: the v1 wrapper synchronizes the stream itself
+// before releasing its tiling staging buffer (CLAUDE.md section 3.7), so
+// `tokens` launches are `tokens` full host/device round trips, each with its
+// own tiling malloc, H2D, dispatch, sync and free. Nothing is amortized or
+// pipelined across them, and the expectation is therefore that mean time
+// scales linearly and the GB/s column stays FLAT across the three rows. A
+// flat row set is the correct result here, not a missing optimization; a
+// superlinear row is the signal worth chasing. Measuring real per-launch
+// amortization needs the pipelined wrapper variant with caller-owned tiling,
+// which section 3.7 says not to invent.
+//
+// Re-launching over the same operand buffers is legitimate here precisely
+// because this kernel carries no state across calls (contrast
+// BenchPagedCompressorDevice, which cannot do this).
+// ---------------------------------------------------------------------------
+void BenchMhcPostDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  constexpr std::uint32_t kStreams = moe::emu::kHcStreams;  // 4, fixed
+  constexpr std::uint32_t kHidden = moe::emu::kHiddenSize;  // 4096, fixed
+  const std::size_t n = static_cast<std::size_t>(kStreams) * kHidden;
+
+  Rng rng(0xD9057ULL);
+  const std::vector<std::uint16_t> x = ToBf16(rng.normal(n, 0.0F, 0.5F));
+  const std::vector<std::uint16_t> h_out =
+      ToBf16(rng.normal(kHidden, 0.0F, 0.5F));
+  // A real Birkhoff matrix, not arbitrary floats: the post-mix reads B as a
+  // doubly-stochastic operator and a non-stochastic B would change the
+  // magnitudes the accumulator sees.
+  std::vector<float> B(static_cast<std::size_t>(kStreams) * kStreams);
+  {
+    const std::vector<float> logits =
+        rng.normal(static_cast<std::size_t>(kStreams) * kStreams, 0.0F, 2.0F);
+    moe::emu::sinkhorn_knopp_4x4(logits.data(), B.data(), moe::emu::kHcEpsilon,
+                                 moe::emu::kHcSinkhornIters);
+  }
+  const std::vector<float> post =
+      rng.uniform(static_cast<std::size_t>(kStreams), 0.2F, 1.8F);
+
+  DeviceBuffer d_x, d_b, d_post, d_h, d_y;
+  aclError rc = d_x.Alloc(n * 2);
+  if (rc == ACL_SUCCESS) rc = d_b.Alloc(B.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_post.Alloc(post.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_h.Alloc(kHidden * 2);
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(n * 2);
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), n * 2);
+  if (rc == ACL_SUCCESS) rc = d_b.Upload(B.data(), B.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) {
+    rc = d_post.Upload(post.data(), post.size() * sizeof(float));
+  }
+  if (rc == ACL_SUCCESS) rc = d_h.Upload(h_out.data(), kHidden * 2);
+  if (rc == ACL_SUCCESS) rc = d_y.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] setup failed: %s\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  for (const int tokens : {1, 8, 64}) {
+    // One timed body = `tokens` launches. The trailing synchronize is a
+    // belt-and-braces guard, not part of the cost being attributed: the
+    // wrapper has already synchronized on its way out of the last launch, so
+    // this call finds the stream idle and returns immediately. It is kept so
+    // the body does not depend on that internal detail staying true.
+    bool ok = true;
+    std::string why;
+    const auto body = [&] {
+      if (!ok) return;
+      for (int i = 0; i < tokens; ++i) {
+        const Status st = LaunchMhcPostResidual(
+            d_x.as<Bf16>(), kHidden, d_b.as<float>(), kStreams,
+            d_post.as<float>(), d_h.as<Bf16>(), d_y.as<Bf16>(), kHidden,
+            nullptr, kMhcPostWorkspaceBytes, ctx.stream);
+        if (st != Status::success) {
+          const auto& f = LastLaunchFailure();
+          why = "launch returned Status=" +
+                std::to_string(static_cast<unsigned>(st)) + " [op=" +
+                std::string(f.op != nullptr ? f.op : "-") + ", call=" +
+                std::string(f.call != nullptr ? f.call : "-") +
+                ", aclError=" + std::to_string(f.acl_error) + "]";
+          ok = false;
+          return;
+        }
+      }
+      const aclError sync_rc = aclrtSynchronizeStream(ctx.stream);
+      if (sync_rc != ACL_SUCCESS) {
+        why = AclFail("aclrtSynchronizeStream", sync_rc);
+        ok = false;
+      }
+    };
+
+    const Timing t = Measure(warmup, iters, body);
+    if (!ok) {
+      std::printf("  [device] %d tok: FAILED -- %s\n", tokens, why.c_str());
+      continue;
+    }
+
+    // Per launch: x and y are the full 4x4096 BF16 operands, h_out is read
+    // once. Matches the host row's accounting so the two columns mean the
+    // same thing.
+    const double elems = static_cast<double>(n) * tokens;
+    const double bytes = elems * 2.0 * 2.0 +
+                         static_cast<double>(kHidden) * 2.0 * tokens;
+    const double flops = elems * (kStreams + 1) * 2.0;
+    char geo[64];
+    std::snprintf(geo, sizeof(geo), "[device] %d tok x %ux%u", tokens,
+                  kStreams, kHidden);
+    Row(geo, t, bytes, flops);
+  }
+}
+
 // Summarize pre-collected samples. Needed because the compressor cannot use
 // Measure(): see BenchPagedCompressorDevice.
 Timing Summarize(std::vector<double> samples) {
@@ -533,9 +777,7 @@ void BenchPagedCompressorDevice(const DeviceCtx& ctx, int warmup, int iters) {
 // Device dispatchers
 // ---------------------------------------------------------------------------
 // Always defined so the host sections can call them unconditionally; each one
-// either measures or prints why it did not. The two wired kernels are the ones
-// whose operand set is self-contained: mxfp4_expert_gemv (32 AIVs,
-// bandwidth-bound) and fast_fp8_indexer_topk (single AIV, paged key cache).
+// either measures or prints why it did not. All five kernels are now wired.
 void DeviceSectionMxfp4(const DeviceCtx& ctx, int warmup, int iters) {
 #if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
   if (ctx.usable) {
@@ -576,17 +818,30 @@ void DeviceSectionIndexer(const DeviceCtx& ctx, int warmup, int iters) {
   DeviceRowUnavailable("fast_fp8_indexer_topk", ctx);
 }
 
-// The remaining three are not wired to the device yet. Said plainly rather
-// than reported as a missing device, so the row does not blame the host for a
-// gap in this harness.
-void DeviceSectionNotWired(const char* kernel, const DeviceCtx& ctx) {
+void DeviceSectionMhcPreNorm(const DeviceCtx& ctx, int warmup, int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
   if (ctx.usable) {
-    std::printf("  [device] %s: NOT MEASURED -- a device is open, but this "
-                "kernel's operand setup is not wired into the benchmark yet\n",
-                kernel);
+    BenchMhcPreNormDevice(ctx, warmup, iters);
     return;
   }
-  DeviceRowUnavailable(kernel, ctx);
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("fused_mhc_pre_norm_sinkhorn", ctx);
+}
+
+void DeviceSectionMhcPost(const DeviceCtx& ctx, int warmup, int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchMhcPostDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("fused_mhc_post_residual", ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,8 +850,15 @@ void DeviceSectionNotWired(const char* kernel, const DeviceCtx& ctx) {
 // The Sinkhorn solve alone, across iteration counts, since that is the part
 // the kernel keeps entirely in registers across 16 SIMT threads.
 // ---------------------------------------------------------------------------
-void BenchSinkhorn(const DeviceCtx& ctx, int warmup, int iters) {
+void BenchSinkhorn(const DeviceCtx& ctx, int warmup, int iters,
+                   bool device_only) {
   Header("fused_mhc_pre_norm_sinkhorn (host reference: Sinkhorn solve)");
+
+  if (device_only) {
+    HostSkipped();
+    DeviceSectionMhcPreNorm(ctx, warmup, iters);
+    return;
+  }
 
   for (const int n_iters : {5, 10, 20, 40}) {
     Rng rng(0x51C0ULL + static_cast<std::uint64_t>(n_iters));
@@ -615,7 +877,7 @@ void BenchSinkhorn(const DeviceCtx& ctx, int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "4x4, %d iters", n_iters);
     Row(geo, t, bytes, flops);
   }
-  DeviceSectionNotWired("fused_mhc_pre_norm_sinkhorn", ctx);
+  DeviceSectionMhcPreNorm(ctx, warmup, iters);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,8 +891,15 @@ void BenchSinkhorn(const DeviceCtx& ctx, int warmup, int iters) {
 // TOKENS per step -- one 4x4096 post-mix per token, which is the axis that
 // actually varies at decode time.
 // ---------------------------------------------------------------------------
-void BenchMhcPost(const DeviceCtx& ctx, int warmup, int iters) {
+void BenchMhcPost(const DeviceCtx& ctx, int warmup, int iters,
+                  bool device_only) {
   Header("fused_mhc_post_residual (host reference: 4-stream post-mix)");
+
+  if (device_only) {
+    HostSkipped();
+    DeviceSectionMhcPost(ctx, warmup, iters);
+    return;
+  }
 
   constexpr int kStreams = moe::emu::kHcStreams;   // 4, fixed by the reference
   constexpr int kHidden = moe::emu::kHiddenSize;   // 4096, fixed likewise
@@ -679,7 +948,7 @@ void BenchMhcPost(const DeviceCtx& ctx, int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "%d tok x %dx%d", tokens, kStreams, kHidden);
     Row(geo, t, bytes, flops);
   }
-  DeviceSectionNotWired("fused_mhc_post_residual", ctx);
+  DeviceSectionMhcPost(ctx, warmup, iters);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,8 +956,15 @@ void BenchMhcPost(const DeviceCtx& ctx, int warmup, int iters) {
 //
 // Scales with sequence length; the scoring half dominates.
 // ---------------------------------------------------------------------------
-void BenchIndexer(const DeviceCtx& ctx, int warmup, int iters) {
+void BenchIndexer(const DeviceCtx& ctx, int warmup, int iters,
+                  bool device_only) {
   Header("fast_fp8_indexer_topk (host reference: score + select)");
+
+  if (device_only) {
+    HostSkipped();
+    DeviceSectionIndexer(ctx, warmup, iters);
+    return;
+  }
 
   constexpr int kHeads = moe::emu::kIndexerHeads;
   constexpr int kHeadDim = moe::emu::kIndexerHeadDim;
@@ -732,8 +1008,15 @@ void BenchIndexer(const DeviceCtx& ctx, int warmup, int iters) {
 //
 // The contract geometries: 2048x4096 and 4096x2048.
 // ---------------------------------------------------------------------------
-void BenchMxfp4Gemv(const DeviceCtx& ctx, int warmup, int iters) {
+void BenchMxfp4Gemv(const DeviceCtx& ctx, int warmup, int iters,
+                    bool device_only) {
   Header("mxfp4_expert_gemv (host reference: MXFP4 GEMV)");
+
+  if (device_only) {
+    HostSkipped();
+    DeviceSectionMxfp4(ctx, warmup, iters);
+    return;
+  }
 
   constexpr int kGroup = moe::emu::kMxfp4GroupSize;
   const std::pair<int, int> geometries[] = {{2048, 4096}, {4096, 2048}};
@@ -824,8 +1107,35 @@ void ReportScaling(const DeviceCtx& ctx) {
 int main(int argc, char** argv) {
   int warmup = 3;
   int iters = 20;
-  if (argc >= 2) warmup = std::atoi(argv[1]);
-  if (argc >= 3) iters = std::atoi(argv[2]);
+  bool device_only = false;
+
+  // Positional [warmup] [iters] as before, plus --device-only anywhere. The
+  // host references are single-threaded scalar C++ costing ~0.7 s at the
+  // default counts and scaling linearly with `iters`, and they are a fixed
+  // roofline that does not change between runs. When the question is "did
+  // this kernel get faster on hardware", re-measuring that roofline is pure
+  // wall-clock cost, so --device-only drops it.
+  {
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "--device-only") {
+        device_only = true;
+      } else if (arg == "--help" || arg == "-h") {
+        std::printf("usage: %s [warmup] [iters] [--device-only]\n", argv[0]);
+        std::printf("  --device-only  skip the host reference rooflines and "
+                    "measure only the device rows\n");
+        return 0;
+      } else if (++positional == 1) {
+        warmup = std::atoi(arg.c_str());
+      } else if (positional == 2) {
+        iters = std::atoi(arg.c_str());
+      } else {
+        std::printf("unrecognized argument '%s' (try --help)\n", arg.c_str());
+        return 2;
+      }
+    }
+  }
   if (warmup < 0) warmup = 0;
   if (iters < 1) iters = 1;
 
@@ -833,8 +1143,12 @@ int main(int argc, char** argv) {
   std::printf("  warmup=%d (discarded), timed iterations=%d\n", warmup, iters);
   std::printf("  allocation and setup are outside the timed region\n");
   std::printf("  host CPU debug runtimes (cpudebug/tikicpulib): not linked\n");
-  std::printf("  NOTE: host-reference figures are a roofline baseline, NOT "
-              "device numbers.\n");
+  if (device_only) {
+    std::printf("  --device-only: host reference rooflines are SKIPPED\n");
+  } else {
+    std::printf("  NOTE: host-reference figures are a roofline baseline, NOT "
+                "device numbers.\n");
+  }
 
   // Open the device once. A benchmark is never a gate (CLAUDE.md section
   // 4.6), so neither "no NPU" nor a bring-up failure is fatal here -- both
@@ -861,10 +1175,19 @@ int main(int argc, char** argv) {
   std::printf("  device: %s\n", ctx.reason.c_str());
 #endif
 
-  BenchSinkhorn(ctx, warmup, iters);
-  BenchMhcPost(ctx, warmup, iters);
-  BenchIndexer(ctx, warmup, iters);
-  BenchMxfp4Gemv(ctx, warmup, iters);
+  // --device-only with no usable device measures nothing at all. Still not a
+  // failure -- a benchmark is never a gate (CLAUDE.md section 4.6) -- but say
+  // so plainly, because "every row empty" otherwise looks like a broken run
+  // rather than two flags that cancel out.
+  if (device_only && !ctx.usable) {
+    std::printf("  WARNING: --device-only was given but no device is usable, "
+                "so nothing will be measured.\n");
+  }
+
+  BenchSinkhorn(ctx, warmup, iters, device_only);
+  BenchMhcPost(ctx, warmup, iters, device_only);
+  BenchIndexer(ctx, warmup, iters, device_only);
+  BenchMxfp4Gemv(ctx, warmup, iters, device_only);
   BenchPagedCompressor(ctx, warmup, iters);
   ReportScaling(ctx);
 
