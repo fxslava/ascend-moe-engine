@@ -56,6 +56,8 @@ ScoreKeysSimt(__ubuf__ const float* query_f32,     // [64*128]
               __gm__ std::uint8_t* key_cache_gm,   // PA_BSND
               __gm__ std::int32_t* block_table,    // may be null
               std::uint32_t block_size, std::uint32_t seq_len,
+              std::uint32_t key_block_stride,
+              std::uint32_t num_physical_blocks,
               __gm__ float* scores_ws) {
   const std::uint32_t t = threadIdx.x;
   const std::uint32_t warp = t / kWarpSize;
@@ -63,17 +65,54 @@ ScoreKeysSimt(__ubuf__ const float* query_f32,     // [64*128]
   const std::uint32_t num_warps = kSimtThreads / kWarpSize;  // 16
 
   for (std::uint32_t j = warp; j < seq_len; j += num_warps) {
-    // PA_BSND with num_kv_heads == 1: row stride is head_dim, block stride
-    // is block_size * head_dim; logical j resolves through the table.
+    // PA_BSND with num_kv_heads == 1: row stride is head_dim, block stride is
+    // key_block_stride. The stride comes from the tiling rather than being
+    // recomputed as block_size*kHeadDim: the ABI validates it as
+    // >= block_size*128, so a PADDED cache is legal, and assuming the dense
+    // value silently resolves the wrong row for every block past the first.
     const std::uint32_t logical_block = j / block_size;
     const std::uint32_t within_block = j % block_size;
-    const std::uint32_t physical_block =
-        (block_table != nullptr)
-            ? static_cast<std::uint32_t>(block_table[logical_block])
-            : logical_block;
+
+    // The block table is CALLER data, not tiling, so MakeIndexerTiling()
+    // cannot vet its contents -- it can only check the table's length. An
+    // entry is therefore bounded here, on the SIGNED value before any cast:
+    // the entries are int32 and casting first turns -1 into 4,294,967,295,
+    // whose row offset then wraps 32-bit arithmetic and lands on an arbitrary
+    // address instead of an obviously invalid one. An unchecked entry is an
+    // unbounded GM read, i.e. a device memory fault rather than a wrong
+    // number. A rejected key is scored -inf so it falls to the tail of the
+    // descending selection and is never emitted, which is the same treatment
+    // the padding keys already get.
+    // Host-validated as BlockEntryIsAdmissible() in
+    // tests/emu/test_kernel_addressing_emu.cpp (CLAUDE.md section 5.5).
+    //
+    // The skip is warp-UNIFORM and must stay that way: j is a per-warp loop
+    // variable, so all 32 lanes resolve the same logical_block and reach the
+    // same conclusion. Nothing here diverges, which is what keeps the
+    // asc_shfl_xor butterfly below well-defined -- a lane-dependent skip
+    // would leave inactive lanes in the reduction and silently corrupt the
+    // score instead of failing.
+    std::uint32_t physical_block = logical_block;
+    if (block_table != nullptr) {
+      const std::int32_t entry = block_table[logical_block];
+      if (unlikely(entry < 0 ||
+                   static_cast<std::uint32_t>(entry) >= num_physical_blocks)) {
+        if (lane == 0u) {
+          asc_stcg(scores_ws + j, -__builtin_inff());
+        }
+        continue;
+      }
+      physical_block = static_cast<std::uint32_t>(entry);
+    } else if (unlikely(logical_block >= num_physical_blocks)) {
+      if (lane == 0u) {
+        asc_stcg(scores_ws + j, -__builtin_inff());
+      }
+      continue;
+    }
+
     __gm__ std::uint8_t* key_row =
-        key_cache_gm +
-        (physical_block * block_size + within_block) * kHeadDim;
+        key_cache_gm + physical_block * key_block_stride +
+        within_block * kHeadDim;
 
     // The lane covers heads {lane, lane+32}; ReLU is per head and comes
     // BEFORE the qw weighting -- summing heads first is a different,
@@ -257,6 +296,8 @@ class Fp8IndexerTopK {
     tiling_.top_k = tiling->top_k;
     tiling_.seq_len = tiling->seq_len;
     tiling_.block_size = tiling->block_size;
+    tiling_.key_block_stride = tiling->key_block_stride;
+    tiling_.num_physical_blocks = tiling->num_physical_blocks;
 
     queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ std::uint8_t*>(query),
                              kHeads * kHeadDim);
@@ -317,7 +358,8 @@ class Fp8IndexerTopK {
             : const_cast<__gm__ std::int32_t*>(
                   reinterpret_cast<const __gm__ std::int32_t*>(
                       blockTableGm_.GetPhyAddr())),
-        tiling_.block_size, seq_len, scoresWs_);
+        tiling_.block_size, seq_len, tiling_.key_block_stride,
+        tiling_.num_physical_blocks, scoresWs_);
     // The v1 contract deliberately round-trips the FP32 scores through GM
     // so the selection reads a stable copy; settle the stores first.
     DataSyncBarrier<MemDsbT::DDR>();
@@ -367,7 +409,13 @@ extern "C" __global__ __aicore__ void fast_fp8_indexer_topk(
                td->top_k > kTopK || td->top_k == 0 ||
                td->seq_len > kMaxSeqLen ||
                td->block_size == 0 ||
-               td->key_block_stride < td->block_size * kHeadDim ||
+               td->num_physical_blocks == 0 ||
+               // Widened before multiplying (CLAUDE.md section 2.7):
+               // block_size is caller-supplied and block_size*128 overflows
+               // uint32 above 2^25, which would turn an absurd block_size
+               // into a SMALL product and let the stride check pass.
+               static_cast<std::uint64_t>(td->key_block_stride) <
+                   static_cast<std::uint64_t>(td->block_size) * kHeadDim ||
                td->block_table_len <
                    (td->seq_len + td->block_size - 1) / td->block_size)) {
     return;

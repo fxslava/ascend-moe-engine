@@ -9,7 +9,30 @@ set(MOE_EMU_TESTS
   test_safetensors_loader
   test_semi_e2e_pipeline
   test_custom_kernels_emu
+  test_kernel_addressing_emu
 )
+
+# -----------------------------------------------------------------------------
+# Optional ASan/UBSan pass over the suite (-D MOE_EMU_SANITIZE=ON).
+#
+# OFF by default on purpose: the emu suite is the CI gate (CLAUDE.md section
+# 4.1) and must build with a stock host g++/clang++ with no toolkit present,
+# which a hard dependency on a sanitizer runtime would weaken. Turned on, it
+# gives test_kernel_addressing_emu a second, independent witness -- the
+# explicit extent check names the broken contract, the sanitizer proves the
+# access was genuinely past the allocation.
+#
+# Sanitizers must reach both compile and link, hence the two property sets.
+# -----------------------------------------------------------------------------
+option(MOE_EMU_SANITIZE "Build the emu suite with AddressSanitizer + UBSan" OFF)
+if(MOE_EMU_SANITIZE)
+  set(MOE_EMU_SANITIZE_FLAGS
+    -fsanitize=address,undefined
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=all
+    -g
+  )
+endif()
 
 foreach(emu_test IN LISTS MOE_EMU_TESTS)
   add_executable(${emu_test} "${emu_test}.cpp")
@@ -32,6 +55,10 @@ foreach(emu_test IN LISTS MOE_EMU_TESTS)
   # implementations of identical arithmetic, so the host side must not be free
   # to contract a * b + c into an FMA at its own discretion.
   target_compile_options(${emu_test} PRIVATE -ffp-contract=off)
+  if(MOE_EMU_SANITIZE)
+    target_compile_options(${emu_test} PRIVATE ${MOE_EMU_SANITIZE_FLAGS})
+    target_link_options(${emu_test} PRIVATE ${MOE_EMU_SANITIZE_FLAGS})
+  endif()
   add_test(NAME ${emu_test}
            COMMAND ${emu_test}
            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
