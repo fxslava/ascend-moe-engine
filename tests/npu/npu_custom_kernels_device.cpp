@@ -745,6 +745,10 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
   std::vector<std::vector<std::uint16_t>> want(kGroups,
                                                std::vector<std::uint16_t>(kD, 0));
   std::vector<bool> golden_emitted(kSteps, false);
+  // A snapshot of the oracle's ring state after EVERY step, so the device's GM
+  // state can be compared region by region rather than inferred from the
+  // emitted token. See the state-region diff below for why that matters.
+  std::vector<moe::emu::CompressorRingState> golden_snapshot(kSteps);
   for (std::uint32_t s = 0; s < kSteps; ++s) {
     const std::uint32_t g = s / kRatio;
     const moe::emu::CompressorStepResult r = moe::emu::paged_compressor_decode_c4a(
@@ -752,6 +756,7 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
         static_cast<std::int32_t>(s), &golden_state, rope_cos.data(),
         rope_sin.data(), want[g].data());
     golden_emitted[s] = r.emitted;
+    golden_snapshot[s] = golden_state;
   }
   if (!golden_emitted[kRatio - 1] || !golden_emitted[kSteps - 1] ||
       !golden_state.have_previous) {
@@ -806,7 +811,12 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
 
   bool cadence_ok = true;
   std::string cadence_detail;
-  for (std::uint32_t s = 0; s < kSteps && cadence_ok; ++s) {
+  // Kept apart from the cadence verdict: "the HOLD/EMIT rhythm is wrong" and
+  // "a state region did not survive the launch boundary" are different
+  // defects and must not be reported under one name.
+  bool state_ok = true;
+  std::string state_detail;
+  for (std::uint32_t s = 0; s < kSteps && cadence_ok && state_ok; ++s) {
     const std::uint32_t g = s / kRatio;
     const bool expect_emit = ((s % kRatio) == kRatio - 1);
 
@@ -878,6 +888,97 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
                          " is a HOLD but wrote the destination row";
       }
     }
+
+    // --- the persistent state, region by region --------------------------
+    // WHY THIS IS CHECKED SEPARATELY FROM THE TOKEN
+    // The emitted token is a lossy witness of the state: it is the output of a
+    // column softmax, an 8-row reduction, an RMSNorm and a RoPE, so a damaged
+    // state region shows up as one cosine with no indication of WHICH region,
+    // row or lane is wrong. Worse, group 0's token cannot witness the prev_a
+    // regions at all -- with have_previous = 0 those rows carry score -inf and
+    // therefore softmax weight exactly 0, so the whole prev_a path is first
+    // exercised at step 7. A group-0 pass is not evidence that the roll works.
+    //
+    // tests/emu/test_paged_compressor_state_emu.cpp simulates this state
+    // machine on the host and reproduces the oracle through the group
+    // boundary, so the region offsets and the roll indexing are known-good
+    // arithmetic. What that simulation cannot model is ordering and
+    // visibility on real hardware -- which is exactly what this diff measures,
+    // and the reason it reports a per-region number instead of a verdict: a
+    // zeroed or stale region scores ~1.0 and FP32 projection noise scores
+    // ~1e-6, so the two are never ambiguous.
+    std::vector<float> state_host(kStateFloats, 0.0F);
+    rc = d_state.Download(state_host.data(), kStateFloats * sizeof(float));
+    if (rc != ACL_SUCCESS) {
+      rep.fail("device paged_compressor_rope",
+               AclFail("aclrtMemcpy(D2H, state)", rc));
+      return;
+    }
+    const moe::emu::CompressorRingState& gref = golden_snapshot[s];
+    struct Region {
+      const char* name;
+      std::uint32_t offset;  // in FP32 elements
+      std::uint32_t rows;
+      std::uint32_t row_len;   // elements per row in the GM region
+      const float* src;        // golden, row-major with stride src_stride
+      std::uint32_t src_stride;
+      bool live;               // false before the first EMIT rolls it
+    };
+    const Region regions[4] = {
+        {"kv_cur", 0u, kRatio, kStateW, &gref.kv_rows[0][0], kStateW, true},
+        {"gate_cur", kRatio * kStateW, kRatio, kStateW, &gref.score_rows[0][0],
+         kStateW, true},
+        {"prev_kv_a", 2u * kRatio * kStateW, kRatio, kD,
+         &gref.previous_kv_a[0][0], kD, gref.have_previous},
+        {"prev_gate_a", 2u * kRatio * kStateW + kRatio * kD, kRatio, kD,
+         &gref.previous_score_a[0][0], kD, gref.have_previous},
+    };
+    for (const Region& reg : regions) {
+      if (!reg.live) {
+        continue;  // the oracle has not populated it yet; nothing to compare
+      }
+      double dif = 0.0;
+      double ref = 0.0;
+      std::uint32_t worst_row = 0;
+      std::uint32_t worst_lane = 0;
+      double worst_abs = -1.0;
+      for (std::uint32_t r = 0; r < reg.rows; ++r) {
+        for (std::uint32_t l = 0; l < reg.row_len; ++l) {
+          const double got_v =
+              state_host[reg.offset + r * reg.row_len + l];
+          const double want_v = reg.src[r * reg.src_stride + l];
+          const double d = got_v - want_v;
+          dif += d * d;
+          ref += want_v * want_v;
+          if (std::fabs(d) > worst_abs) {
+            worst_abs = std::fabs(d);
+            worst_row = r;
+            worst_lane = l;
+          }
+        }
+      }
+      const double rel = ref > 0.0 ? std::sqrt(dif / ref) : std::sqrt(dif);
+      // The projection is a 4,096-term FP32 dot on both sides, in the same
+      // order, so the bound is FP32 accumulation error: 4096 * 2^-24 = 2.4e-4
+      // worst case. 1e-3 leaves margin for an FMA contraction on the device
+      // and is still three orders of magnitude below a lost region.
+      if (rel > 1e-3) {
+        state_ok = false;
+        char d[260];
+        std::snprintf(d, sizeof(d),
+                      "step %u: state region %s diverged, relL2 %.3e (ceil "
+                      "1e-3); largest absolute delta %.6e at row %u lane %u "
+                      "(device %.6e, golden %.6e)",
+                      s, reg.name, rel, worst_abs, worst_row, worst_lane,
+                      static_cast<double>(
+                          state_host[reg.offset + worst_row * reg.row_len +
+                                     worst_lane]),
+                      static_cast<double>(
+                          reg.src[worst_row * reg.src_stride + worst_lane]));
+        state_detail = d;
+        break;
+      }
+    }
   }
   rep.check(cadence_ok,
             "device paged_compressor_rope drives the 8-step cadence: HOLD "
@@ -886,7 +987,15 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
             cadence_ok ? ("steps 0..7, emit at 3 and 7, seed 0x" +
                           std::to_string(rng.seed()))
                        : cadence_detail);
-  if (!cadence_ok) {
+  rep.check(state_ok,
+            "device paged_compressor_rope keeps all four GM state regions in "
+            "step with the oracle across every launch boundary",
+            state_ok ? std::string("kv_cur, gate_cur, prev_kv_a, prev_gate_a "
+                                   "all within relL2 1e-3 of the oracle at "
+                                   "every step (prev_a compared from the "
+                                   "first EMIT onward)")
+                     : state_detail);
+  if (!cadence_ok || !state_ok) {
     return;
   }
 

@@ -5,6 +5,7 @@
 set(MOE_EMU_TESTS
   test_mhc_sinkhorn_emu
   test_paged_compressor_emu
+  test_paged_compressor_state_emu
   test_fp8_indexer_emu
   test_safetensors_loader
   test_semi_e2e_pipeline
