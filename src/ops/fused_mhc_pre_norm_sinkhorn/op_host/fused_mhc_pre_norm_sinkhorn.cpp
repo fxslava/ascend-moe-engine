@@ -15,13 +15,6 @@
 namespace moe::kernels::arch35 {
 namespace {
 
-// The device entry point, as defined in op_kernel/.
-//
-// Declared with GM_ADDR (an address-space-qualified __gm__ uint8_t*) because
-// that is the kernel ABI. Host-side arguments are handed to the chevron call
-// as plain uint8_t*; BiSheng performs the conversion as part of lowering the
-// launch, which is why no cast to GM_ADDR appears at the call site (and why
-// one would not compile -- void* cannot be cast to a __gm__ pointer).
 extern "C" __global__ __aicore__ void fused_mhc_pre_norm_sinkhorn(
     GM_ADDR x, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias, GM_ADDR gamma,
     GM_ADDR h_raw, GM_ADDR h_norm, GM_ADDR post, GM_ADDR birkhoff,
@@ -45,9 +38,6 @@ Status LaunchMhcPreNormSinkhorn(
       stream == nullptr) {
     return Status::invalid_argument;
   }
-  // GM scratch is 0 B for this kernel, so a null workspace is correct and a
-  // caller passing a buffer is not an error. What WOULD be an error is asking
-  // for a nonzero scratch size this kernel does not have.
   if (workspace_bytes != kMhcPreNormWorkspaceBytes) {
     return Status::invalid_argument;
   }
@@ -65,7 +55,9 @@ Status LaunchMhcPreNormSinkhorn(
     return staged;
   }
 
-  fused_mhc_pre_norm_sinkhorn<<<tiling.block_dim, nullptr, stream>>>(
+  const std::uint32_t dyn_ub_bytes = MhcPreNormDynamicUbBytes();
+
+  fused_mhc_pre_norm_sinkhorn<<<tiling.block_dim, dyn_ub_bytes, stream>>>(
       detail::Gm(x_gm), detail::Gm(phi_gm), detail::Gm(alpha_gm),
       detail::Gm(bias_gm), detail::Gm(gamma_gm), detail::Gm(h_raw_gm),
       detail::Gm(h_norm_gm), detail::Gm(post_gm), detail::Gm(birkhoff_gm),

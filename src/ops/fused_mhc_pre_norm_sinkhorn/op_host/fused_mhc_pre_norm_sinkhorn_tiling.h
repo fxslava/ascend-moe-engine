@@ -30,6 +30,11 @@ inline constexpr std::uint32_t kMhcFlatWidth = kMhcStreams * kMhcHidden;  // 163
 inline constexpr float kMhcHcEps = 1e-6F;
 inline constexpr float kMhcNormEps = 1e-6F;
 
+// Dynamic UB layout for SIMT-visible scalar buffers (u[24] + pre[4])
+inline constexpr std::uint32_t MhcPreNormDynamicUbBytes() noexcept {
+  return 256;  // 24 dots + 4 pre outputs + slack, 32-byte aligned
+}
+
 // ---------------------------------------------------------------------------
 // sizeof == 64
 // ---------------------------------------------------------------------------
@@ -54,9 +59,6 @@ struct MhcPreNormTilingData {
 
 MOE_ARCH35_ASSERT_TILING_POD(MhcPreNormTilingData, 64);
 
-// Validates the geometry against the v1 contract and fills `out`. Host-side,
-// because the kernel rejects bad tiling by returning early -- which on device
-// is a silent no-op, so a wrong shape has to be caught before the enqueue.
 Status MakeMhcPreNormTiling(std::uint32_t x_stream_stride,
                             std::uint32_t phi_row_stride,
                             MhcPreNormTilingData* out) noexcept;
