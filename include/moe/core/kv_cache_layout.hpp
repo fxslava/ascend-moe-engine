@@ -22,12 +22,10 @@
 // `aclnnCompressor` emits one pooled row per window; `aclnnKvCompressEpilog`
 // quantizes that row and scatters it into the paged cache; and
 // `aclnnKvQuantSparseAttnSharedkv` reads the cache back. All three address the
-// cache through an axis-0 stride passed as a plain int64 attribute, with no
-// cross-check anywhere in the vendored wrappers (dsv4_operator_hypotheses_test
-// H3 records the attribute as UNGUARDED on the CANN backend: a stale value
-// pools or scatters into the wrong block with no diagnostic). So the row width
-// is load-bearing twice over -- once to size the reservation, once as the
-// number the kernels address with -- and it is written down exactly once, here.
+// cache through an axis-0 stride passed as a plain int64 attribute. A stale
+// value pools or scatters into the wrong block, so the row width is load-bearing
+// twice over -- once to size the reservation, once as the number the kernels
+// address with -- and it is written down exactly once, here.
 //
 // THE 604-BYTE ENTRY, AND WHAT IS AND IS NOT SETTLED ABOUT IT
 // -----------------------------------------------------------

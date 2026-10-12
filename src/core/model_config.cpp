@@ -233,9 +233,8 @@ void ModelConfig::Validate() const {
 
   // compress_ratios: present means complete and admissible. The deployed
   // arch35 compressor refuses any cmpRatio outside {4, 128}
-  // (dsv4_operator_hypotheses_test H3 checks the refusal at 8), so a ratio
-  // this binary would have to pass through is caught here rather than at the
-  // first layer that tries to plan it.
+  // so a ratio this binary would have to pass through is caught here rather
+  // than at the first layer that tries to plan it.
   if (!compress_ratios.empty()) {
     DSV4_REQUIRE(static_cast<int64_t>(compress_ratios.size()) == num_hidden_layers,
                  "compress_ratios has " << compress_ratios.size() << " entries but the model has "

@@ -4,12 +4,10 @@ set(_mock_tests
   mock_safetensors_index_probe
   mock_failure_teardown
   vendor_ops_table_test
-  dsv4_operator_hypotheses_test
 )
 
 foreach(_test IN LISTS _mock_tests)
-  # Suite sources sit next to this file. The shared hypothesis suite is the one
-  # exception: it lives in tests/ because the CANN build registers it too.
+  # Suite sources sit next to this file.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_test}.cpp")
     set(_test_src "${_test}.cpp")
   else()

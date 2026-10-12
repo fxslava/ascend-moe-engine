@@ -71,9 +71,8 @@ inline constexpr int64_t kNhcStreams = 4;
 inline constexpr int64_t kMhcMixRows = kNhcStreams * kNhcStreams + 2 * kNhcStreams;  // 24
 inline constexpr int64_t kMhcMixCols = kNhcStreams * kHiddenSize;                    // 16384
 inline constexpr int64_t kMhcAlphaElements = 3;
-// Inside the wrapper's [1, 100] bound; dsv4_operator_hypotheses_test H2.3
-// checks both ends of it and H2.4 shows 20 reaches the Birkhoff invariant
-// within 1e-5.
+// Inside the wrapper's [1, 100] bound; 20 iterations keep the normalization
+// passes within the configured Birkhoff tolerance.
 inline constexpr int64_t kMhcSinkhornIters = 20;
 inline constexpr float kMhcSinkhornEps = 1e-6f;
 inline constexpr double kMhcHcEpsilon = 1e-6;
