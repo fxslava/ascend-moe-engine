@@ -33,16 +33,9 @@ Status LaunchFp8IndexerTopK(
       indices_gm == nullptr || stream == nullptr) {
     return Status::invalid_argument;
   }
-  // seq_len may legitimately be 0 (the output is then all -1), in which case
-  // the key cache and page table are never read.
   if (seq_len > 0 && (key_cache_gm == nullptr || block_table_gm == nullptr)) {
     return Status::invalid_argument;
   }
-  // This is the one kernel with real GM scratch. The scores workspace is
-  // mandatory whenever there is anything to score, and must be at least
-  // align_up(4 * seq_len, 32) B. Aliasing it with an operand would also be
-  // wrong, which the host cannot check for the caller -- but a null or short
-  // buffer it can, and that is the common mistake.
   const std::size_t required_ws = Fp8IndexerWorkspaceBytes(seq_len);
   if (required_ws > 0 &&
       (workspace == nullptr || workspace_bytes < required_ws)) {
@@ -63,7 +56,9 @@ Status LaunchFp8IndexerTopK(
     return staged;
   }
 
-  fast_fp8_indexer_topk<<<tiling.block_dim, nullptr, stream>>>(
+  const std::uint32_t dyn_ub_bytes = IndexerDynamicUbBytes();
+
+  fast_fp8_indexer_topk<<<tiling.block_dim, dyn_ub_bytes, stream>>>(
       detail::Gm(query_gm), detail::Gm(key_cache_gm),
       detail::Gm(dequant_scales_gm), detail::Gm(block_table_gm),
       detail::Gm(indices_gm), detail::Gm(workspace),

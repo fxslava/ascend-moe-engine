@@ -20,6 +20,14 @@ inline constexpr std::uint32_t kIndexerMaxSeqLen = 2048;
 // GM scratch alignment, and the alignment the tiling staging buffer uses.
 inline constexpr std::size_t kIndexerGmAlignBytes = 32;
 
+// Dynamic UB layout for SIMT-visible buffers
+inline constexpr std::uint32_t IndexerDynamicUbBytes() noexcept {
+  return (kIndexerHeads * kIndexerHeadDim) * sizeof(std::uint8_t) +     // query_fp8: 8,192 B
+         (kIndexerHeads * kIndexerHeadDim) * sizeof(float) +            // query_f32: 32,768 B
+         (kIndexerHeads) * sizeof(float) +                             // head_scales: 256 B
+         (kIndexerMaxSeqLen) * sizeof(std::uint32_t);                  // sort_keys: 8,192 B
+}                                                                      // Total: 49,408 B
+
 // ---------------------------------------------------------------------------
 // sizeof == 48
 // ---------------------------------------------------------------------------
@@ -40,10 +48,6 @@ struct IndexerTilingData {
 
 MOE_ARCH35_ASSERT_TILING_POD(IndexerTilingData, 48);
 
-// Every shape guard the v1 contract states, in one place. `seq_len == 0` is
-// legal (the output is then all -1) and the key cache and page table are not
-// read, so the block geometry is only constrained when there is something to
-// score.
 Status MakeIndexerTiling(std::uint32_t query_head_stride,
                          std::uint32_t key_block_stride,
                          std::uint32_t block_table_len,
