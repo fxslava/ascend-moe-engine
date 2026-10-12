@@ -225,8 +225,10 @@ class MhcPreNormSinkhorn {
     }
   }
 
+  // --- SIMT launch: pre/post gates + the register Sinkhorn -----------------
   __aicore__ inline void RunSimtGatesAndSinkhorn(LocalTensor<float>& u) {
-    DataSyncBarrier<MemDsbT::UB>();
+    // Settle dynamic UB before the SIMT launch
+    DataSyncBarrier<MemDsbT::ALL>();
     __ubuf__ float* uPtr = reinterpret_cast<__ubuf__ float*>(u.GetPhyAddr());
     __ubuf__ float* prePtr = uPtr + kProjectionRows;
     asc_vf_call<GatesAndSinkhorn16>(
@@ -242,11 +244,13 @@ class MhcPreNormSinkhorn {
         const_cast<__gm__ float*>(
             reinterpret_cast<const __gm__ float*>(birkhoffGm_.GetPhyAddr())));
     DataSyncBarrier<MemDsbT::ALL>();
-    pre_[0] = prePtr[0];
-    pre_[1] = prePtr[1];
-    pre_[2] = prePtr[2];
-    pre_[3] = prePtr[3];
-    DataSyncBarrier<MemDsbT::UB>();
+    
+    // Read back pre coefficients via LocalTensor accessor instead of raw pointer
+    pre_[0] = u.GetValue(kProjectionRows + 0);
+    pre_[1] = u.GetValue(kProjectionRows + 1);
+    pre_[2] = u.GetValue(kProjectionRows + 2);
+    pre_[3] = u.GetValue(kProjectionRows + 3);
+    DataSyncBarrier<MemDsbT::ALL>();
   }
 
   __aicore__ inline void EmitNormedActivation() {
