@@ -138,14 +138,13 @@ class MhcPreNormSinkhorn {
     float dots[kProjectionRows];
     ProjectionDots(dots);
 
-    // Allocate SIMT-visible scalar buffers from dynamic UB
-    LocalMemAllocator<> dynAlloc;
+    LocalMemAllocator dynAlloc;
     LocalTensor<float> scalarBuf = dynAlloc.Alloc<float>(kScalarStateBytes / sizeof(float));
 
-    // u = (phi @ flat_x) * inv_rms, staged in dynamic UB for the SIMT phase.
     for (std::uint32_t row = 0; row < kProjectionRows; ++row) {
       scalarBuf.SetValue(row, dots[row] * inv_rms);
     }
+
     RunSimtGatesAndSinkhorn(scalarBuf);
     EmitNormedActivation();
   }
@@ -226,30 +225,37 @@ class MhcPreNormSinkhorn {
   }
 
   // --- SIMT launch: pre/post gates + the register Sinkhorn -----------------
-  __aicore__ inline void RunSimtGatesAndSinkhorn(LocalTensor<float>& u) {
-    // Settle dynamic UB before the SIMT launch
+  __aicore__ inline void RunSimtGatesAndSinkhorn(LocalTensor<float>& scalarBuf) {
     DataSyncBarrier<MemDsbT::ALL>();
-    __ubuf__ float* uPtr = reinterpret_cast<__ubuf__ float*>(u.GetPhyAddr());
+
+    __ubuf__ float* uPtr = reinterpret_cast<__ubuf__ float*>(scalarBuf.GetPhyAddr());
     __ubuf__ float* prePtr = uPtr + kProjectionRows;
+
     asc_vf_call<GatesAndSinkhorn16>(
-        dim3(kStreams * kStreams), uPtr,
+        dim3(kStreams * kStreams),
+        uPtr,
         const_cast<__gm__ float*>(
             reinterpret_cast<const __gm__ float*>(alphaGm_.GetPhyAddr())),
         const_cast<__gm__ float*>(
             reinterpret_cast<const __gm__ float*>(biasGm_.GetPhyAddr())),
         tiling_.hc_eps,
-        static_cast<std::int32_t>(tiling_.sinkhorn_iterations), prePtr,
+        static_cast<std::int32_t>(tiling_.sinkhorn_iterations),
+        prePtr,
         const_cast<__gm__ float*>(
             reinterpret_cast<const __gm__ float*>(postGm_.GetPhyAddr())),
         const_cast<__gm__ float*>(
             reinterpret_cast<const __gm__ float*>(birkhoffGm_.GetPhyAddr())));
+
     DataSyncBarrier<MemDsbT::ALL>();
-    
-    // Read back pre coefficients via LocalTensor accessor instead of raw pointer
-    pre_[0] = u.GetValue(kProjectionRows + 0);
-    pre_[1] = u.GetValue(kProjectionRows + 1);
-    pre_[2] = u.GetValue(kProjectionRows + 2);
-    pre_[3] = u.GetValue(kProjectionRows + 3);
+
+    SetFlag<HardEvent::V_S>(kEvVToS);
+    WaitFlag<HardEvent::V_S>(kEvVToS);
+
+    pre_[0] = scalarBuf.GetValue(kProjectionRows + 0);
+    pre_[1] = scalarBuf.GetValue(kProjectionRows + 1);
+    pre_[2] = scalarBuf.GetValue(kProjectionRows + 2);
+    pre_[3] = scalarBuf.GetValue(kProjectionRows + 3);
+
     DataSyncBarrier<MemDsbT::ALL>();
   }
 
