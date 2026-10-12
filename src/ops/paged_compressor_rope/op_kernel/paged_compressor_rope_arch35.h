@@ -5,12 +5,17 @@
 //
 // Both SIMT VFs (CompressorProjectSimt, CompressorEmitSimt) dereference UB
 // pointers, and a buffer a SIMT VF touches must live in the DYNAMIC region
-// whose size the host declares as the second chevron argument. TPipe/TBuf
-// allocates from the STATIC region, so the two BF16 staging buffers below --
-// the only ones no SIMT VF ever sees -- are the only TBufs this kernel has.
-// Everything else comes from LocalMemAllocator, and the byte total is derived
-// once in op_host/paged_compressor_rope_tiling.h so host and device cannot
-// disagree about it.
+// whose size the host declares as the second chevron argument.
+//
+// There is NO TPipe here and the static region is 0 B. Not for tidiness:
+// TPipe/TBuf and LocalMemAllocator bump a head pointer from the same UB base,
+// so a TBuf aliases the allocator's leading segments. This kernel kept its two
+// BF16 staging buffers as TBufs, and they sat on top of kvCur_ row 0 --
+// normWBf16 over lanes [0,256), outBf16 over [256,512) -- corrupting the
+// persistent state on every step. The kernel's Init() carries the full
+// account. Everything now comes from LocalMemAllocator, and the byte total is
+// derived once in op_host/paged_compressor_rope_tiling.h so host and device
+// cannot disagree about it.
 //
 // DYNAMIC segments (LocalMemAllocator; allocation order IS the layout, and it
 // must match the order documented in the tiling header):
@@ -26,21 +31,19 @@
 //   67,840   256     ropeSin      sin[64] FP32
 //   68,096   2,048   outF32       compressed token [512] FP32
 //   70,144   256     reduceSlack  16 warp partials + block inv-rms scalar
+//   70,400   1,024   normWBf16    BF16 norm gain [512], cast into normWF32
+//   71,424   1,024   outBf16      BF16 [512] cache-slot token, MTE3 source
 //
-//   dynamic total: 70,400 B
+//   dynamic total: 72,448 B
 //
-// STATIC segments (TPipe/TBuf, SIMD-private):
-//
-//   1,024  normWBf16  BF16 norm gain [512], cast into normWF32
-//   1,024  outBf16    BF16 [512] cache-slot token, MTE3 source
-//
-//   static total: 2,048 B
+// STATIC segments: NONE. The last two were TBufs until they were found to be
+// aliasing kvCur_ row 0; they are appended at the END of the allocator's order
+// so every offset above them is unchanged from before the move.
 //
 // Total: 72,448 B -- inside the contract's padded emit-phase figure of
 // 84,992 B and far below kUsableUbBytes (221,184 B). A `scalarState` segment
 // of 768 B used to sit at the end of this table; the TBuf existed but nothing
-// ever read or wrote it, so it is gone rather than carried as a static-region
-// allocation this kernel does not use. The four state regions
+// ever read or wrote it, so it is gone. The four state regions
 // mirror the GM ring-state ABI one-to-one (kv [0,16K), gate [16K,32K),
 // prev-a kv [32K,40K), prev-a gate [40K,48K) in GM), so the state crosses
 // the boundary as four whole-region MTE2/MTE3 copies. Weight rows are NOT
@@ -113,23 +116,26 @@ inline constexpr std::uint32_t kOutBf16Bytes = kHeadDim * 2;                // 1
 inline constexpr std::uint32_t kReduceSlackFloats = kCompressorReduceSlackFloats;
 inline constexpr std::uint32_t kReduceSlackBytes = kReduceSlackFloats * 4;  // 256
 
-// Dynamic region: every segment a SIMT VF dereferences.
+// Dynamic region: every segment this kernel allocates, SIMT-visible or not.
 inline constexpr std::uint32_t kDynamicUbBytes =
     2 * kKvCurRegionFloats * 4 + 2 * kPrevARegionFloats * 4 + kApeBytes +
-    kNormWF32Bytes + kRopeTableBytes + kOutF32Bytes + kReduceSlackBytes;
+    kNormWF32Bytes + kRopeTableBytes + kOutF32Bytes + kReduceSlackBytes +
+    kNormWBytes + kOutBf16Bytes;
 
-// Static region: the two SIMD-private BF16 staging buffers.
-inline constexpr std::uint32_t kStaticUbBytes = kNormWBytes + kOutBf16Bytes;
+// No TPipe: nothing is allocated from the static region.
+inline constexpr std::uint32_t kStaticUbBytes = 0;
 
 inline constexpr std::uint32_t kTotalUbBytes = kStaticUbBytes + kDynamicUbBytes;
 
 // The contract's padded emit-phase figure (83,968 B + 1 KiB); see above.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 84992;
 
-static_assert(kDynamicUbBytes == 70400,
-              "paged_compressor_rope dynamic UB must sum to 70,400 B");
-static_assert(kStaticUbBytes == 2048,
-              "paged_compressor_rope static UB must sum to 2,048 B");
+static_assert(kDynamicUbBytes == 72448,
+              "paged_compressor_rope dynamic UB must sum to 72,448 B");
+static_assert(kStaticUbBytes == 0,
+              "paged_compressor_rope must allocate nothing from TPipe: a TBuf "
+              "aliases the LocalMemAllocator segments, which is the defect "
+              "that corrupted kvCur_ row 0");
 static_assert(kTotalUbBytes == 72448,
               "paged_compressor_rope UB layout must sum to 72,448 B");
 

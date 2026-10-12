@@ -94,3 +94,26 @@ if(UNIX AND NOT APPLE)
     )
   endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# "One UB allocation mechanism per device kernel", checked against the sources
+# (see tests/common/verify_ub_allocator_exclusive.cmake for the defect this
+# exists to prevent). Registered here rather than under tests/npu because it
+# reads sources, needs no toolkit and no device, and so must run everywhere
+# the CI gate runs.
+# ---------------------------------------------------------------------------
+file(GLOB _ub_kernel_sources
+  "${CMAKE_SOURCE_DIR}/src/ops/*/op_kernel/*.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/*/op_kernel/*.h"
+)
+if(_ub_kernel_sources)
+  add_test(NAME ub_allocator_exclusive
+    COMMAND ${CMAKE_COMMAND}
+      -D "KERNEL_SOURCES=${_ub_kernel_sources}"
+      -P "${CMAKE_SOURCE_DIR}/tests/common/verify_ub_allocator_exclusive.cmake"
+  )
+  set_tests_properties(ub_allocator_exclusive PROPERTIES
+    LABELS "emu;hygiene"
+    TIMEOUT 120
+  )
+endif()

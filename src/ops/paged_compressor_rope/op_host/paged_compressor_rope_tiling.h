@@ -26,12 +26,23 @@ inline constexpr float kCompressorNormEps = 1e-6F;
 // ---------------------------------------------------------------------------
 // Dynamic UB size (dyn_ub_size, the second chevron argument)
 // ---------------------------------------------------------------------------
-// Every buffer this kernel's two SIMT VFs dereference is allocated from the
-// DYNAMIC UB region via LocalMemAllocator, because the dynamic region is the
-// one whose size the host declares at launch. A TPipe/TBuf buffer lands in
-// the STATIC region instead, and handing a SIMT VF a static-region pointer
-// while the launch declares 0 dynamic bytes puts every SIMT UB access outside
-// the reserved window -- the kernel then faults on its first SIMT UB touch.
+// EVERY buffer this kernel has is allocated from the DYNAMIC UB region via
+// LocalMemAllocator. There is no TPipe at all, so the static region is 0 B,
+// and that is a correctness requirement rather than a preference.
+//
+// Two reasons, and they are different failures:
+//
+//   1. A buffer a SIMT VF dereferences MUST be in the dynamic region, because
+//      that is the region whose size the host declares at launch. Hand a VF a
+//      static-region pointer while the launch declares 0 dynamic bytes and
+//      every SIMT UB access is outside the reserved window -- AIV error 341
+//      on the first touch.
+//   2. TPipe/TBuf and LocalMemAllocator bump a head pointer from the SAME UB
+//      base, so holding a TBuf alongside the allocator makes the TBuf alias
+//      the allocator's first segments. This kernel carried two 1 KiB BF16
+//      staging TBufs that landed on top of kvCur_ row 0, silently corrupting
+//      the persistent state; see the kernel's Init() for the full account.
+//      Mixing the two is undefined, and the 950PR docs say so.
 //
 // The host must therefore compute the same byte count the device allocates,
 // so the formula lives here: this header is included by both sides (CLAUDE.md
@@ -51,6 +62,8 @@ inline constexpr float kCompressorNormEps = 1e-6F;
 //   ropeSin    ropeHeadDim      floats      256 B
 //   outF32     headDim          floats    2,048 B
 //   reduce     64               floats      256 B
+//   normWBf16  headDim          bf16      1,024 B   (was a TBuf)
+//   outBf16    headDim          bf16      1,024 B   (was a TBuf)
 inline constexpr std::uint32_t kCompressorReduceSlackFloats = 64;
 
 inline constexpr std::uint32_t kCompressorDynUbBytes =
@@ -60,15 +73,17 @@ inline constexpr std::uint32_t kCompressorDynUbBytes =
     kCompressorHeadDim * 4u +                                  // normWF32
     2u * kRopeHeadDim * 4u +                                   // cos + sin
     kCompressorHeadDim * 4u +                                  // outF32
-    kCompressorReduceSlackFloats * 4u;                         // reduce slack
+    kCompressorReduceSlackFloats * 4u +                        // reduce slack
+    kCompressorHeadDim * 2u +                                  // normWBf16
+    kCompressorHeadDim * 2u;                                   // outBf16
 
-static_assert(kCompressorDynUbBytes == 70400,
-              "paged_compressor_rope dynamic UB must sum to 70,400 B");
+static_assert(kCompressorDynUbBytes == 72448,
+              "paged_compressor_rope dynamic UB must sum to 72,448 B");
 
-// The static region holds only the two SIMD-private BF16 staging buffers
-// (norm gain in, cache-slot token out); nothing else is allocated from TPipe.
-inline constexpr std::uint32_t kCompressorStaticUbBytes =
-    kCompressorHeadDim * 2u + kCompressorHeadDim * 2u;  // 2,048
+// No TPipe, so the static region is empty. Keep the constant: the kernel's
+// layout header asserts against it, which is what would catch a TBuf being
+// reintroduced without the dyn_ub figure being updated to match.
+inline constexpr std::uint32_t kCompressorStaticUbBytes = 0u;
 
 // static + dynamic must fit 256 KiB - 8 KiB reserved - 32 KiB min DataCache.
 static_assert(kCompressorStaticUbBytes + kCompressorDynUbBytes <= 221184u,

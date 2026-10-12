@@ -250,20 +250,36 @@ class PagedCompressorRope {
   }
 
   __aicore__ inline void Init() {
-    // STATIC region (TPipe/TBuf): the two BF16 staging buffers, and only
-    // those. Neither is ever passed to a SIMT VF -- normWBf16 is cast into
-    // the dynamic normWF32 and outBf16 is an MTE3 source -- so neither needs
-    // to be SIMT-addressable.
-    pipe_.InitBuffer(normWBf16Buf_, kNormWBytes);
-    pipe_.InitBuffer(outBf16Buf_, kOutBf16Bytes);
-
-    // DYNAMIC region: everything the two SIMT VFs dereference. A TBuf here
-    // would land in the static region, which the launch's dyn_ub_size does
-    // not cover, and every SIMT UB access would be out of bounds on the
-    // first touch. Alloc() takes ELEMENTS, not bytes, and bumps a head
-    // pointer -- so this call order fixes the offsets and must match the
-    // table in the tiling header, which is where the host gets the byte
-    // count it declares at launch.
+    // ONE ALLOCATION MECHANISM. There is no TPipe in this kernel, and that is
+    // load-bearing rather than tidiness.
+    //
+    // TPipe/TBuf and LocalMemAllocator both bump a head pointer from the SAME
+    // UB base, so a TBuf and the allocator's first segment occupy the same
+    // bytes. This kernel used to hold two BF16 staging TBufs -- a 1 KiB norm
+    // gain and a 1 KiB output token -- alongside the allocator, and they
+    // aliased kvCur_ row 0: normWBf16 over lanes [0,256), outBf16 over
+    // [256,512).
+    //
+    // It presented as a group-boundary bug and it is not one. Every step's
+    // LoadStateAndTables copies the norm gain into that TBuf, which clobbers
+    // kv_cur row 0's lower lanes; the whole-region writeback then persists the
+    // damage. On step 0 the projection's slot is 0, so it rewrites row 0
+    // afterwards and the corruption is invisible -- which is why step 0 passed
+    // and step 1 reported kv_cur row 0 lane 83 holding 1.486311, a float whose
+    // top 16 bits are the BF16 norm gain 1.484375. Row 0's a half is also what
+    // the EMIT rolls into prev_kv_a, so group 1 then reduced a partly
+    // overwritten previous row (cos 0.8848) while group 0, which reads only b
+    // halves at lanes >= 512, stayed clean.
+    //
+    // Note a row-scoped writeback would NOT have fixed this: the EMIT roll
+    // reads row 0's a half straight out of the aliased UB, so prev_kv_a would
+    // still be corrupt. The aliasing itself had to go.
+    //
+    // Alloc() takes ELEMENTS, not bytes, and bumps a head pointer -- so this
+    // call order fixes the offsets and must match the table in the tiling
+    // header, which is where the host gets the byte count it declares at
+    // launch. The two BF16 buffers are appended last so every pre-existing
+    // offset is unchanged.
     //
     // The allocator is a function local, not a member: as a member its
     // inline constructor must be emitted from the enclosing class's ctor,
@@ -281,6 +297,13 @@ class PagedCompressorRope {
     ropeSin_ = alloc.Alloc<float>(kRopeHeadDim);
     outF32_ = alloc.Alloc<float>(kHeadDim);
     reduce_ = alloc.Alloc<float>(kReduceSlackFloats);
+    // The two BF16 staging buffers, formerly TBufs. No SIMT VF dereferences
+    // either -- normWBf16_ is cast into normWF32_ and outBf16_ is an MTE3
+    // source -- but they come from the allocator anyway, because one
+    // mechanism per kernel is the rule that makes the offsets above mean
+    // anything.
+    normWBf16_ = alloc.Alloc<bfloat16_t>(kHeadDim);
+    outBf16_ = alloc.Alloc<bfloat16_t>(kHeadDim);
   }
 
   __aicore__ inline void Process() {
@@ -339,11 +362,10 @@ class PagedCompressorRope {
         reinterpret_cast<__ubuf__ float*>(reduce_.GetPhyAddr()));
     DataSyncBarrier<MemDsbT::ALL>();
 
-    auto outBf16 = outBf16Buf_.Get<bfloat16_t>();
-    Cast(outBf16, outF32_, RoundMode::CAST_RINT, kHeadDim);
+    Cast(outBf16_, outF32_, RoundMode::CAST_RINT, kHeadDim);
     SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
-    DataCopy(cacheSlotGm_, outBf16, kHeadDim);
+    DataCopy(cacheSlotGm_, outBf16_, kHeadDim);
 
     WritebackRegions(true);
     metaGm_.SetValue(0, 1u);              // have_previous
@@ -367,14 +389,13 @@ class PagedCompressorRope {
     DataCopy(prevGateA_, statePrevGateGm_, kPrevARegionFloats);
     DataCopy(apeF32_, apeGm_,
              kRatio * kStateWidth);  // the [4,1024] ape block, resident
-    DataCopy(normWBf16Buf_.Get<bfloat16_t>(), normWGm_, kHeadDim);
+    DataCopy(normWBf16_, normWGm_, kHeadDim);
     DataCopy(ropeCos_, ropeCosGm_, kRopeHeadDim);
     DataCopy(ropeSin_, ropeSinGm_, kRopeHeadDim);
     SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     // The widened norm gain is consumed by the emit launch.
-    Cast(normWF32_, normWBf16Buf_.Get<bfloat16_t>(), RoundMode::CAST_NONE,
-         kHeadDim);
+    Cast(normWF32_, normWBf16_, RoundMode::CAST_NONE, kHeadDim);
   }
 
   __aicore__ inline void WritebackRegions(bool with_previous) {
@@ -412,13 +433,9 @@ class PagedCompressorRope {
   std::uint32_t step_;
   float norm_eps_;
 
-  // Static region: SIMD-private BF16 staging only.
-  TPipe pipe_;
-  TBuf<> normWBf16Buf_;
-  TBuf<> outBf16Buf_;
-
-  // Dynamic region: every buffer a SIMT VF dereferences. Allocated in Init()
-  // in the order the tiling header documents.
+  // Dynamic region: every buffer this kernel has. No TPipe -- see Init() for
+  // why that is a correctness requirement and not a style choice. Allocated
+  // in Init() in the order the tiling header documents.
   LocalTensor<float> kvCur_;
   LocalTensor<float> gateCur_;
   LocalTensor<float> prevKvA_;
@@ -429,6 +446,8 @@ class PagedCompressorRope {
   LocalTensor<float> ropeSin_;
   LocalTensor<float> outF32_;
   LocalTensor<float> reduce_;
+  LocalTensor<bfloat16_t> normWBf16_;
+  LocalTensor<bfloat16_t> outBf16_;
 
   GlobalTensor<bfloat16_t> xGm_;
   GlobalTensor<bfloat16_t> wkvGm_;
