@@ -16,6 +16,32 @@ inline constexpr std::uint32_t kMxfp4GroupSize = 32;
 inline constexpr std::uint32_t kMxfp4BlockDim = 32;  // 32 AIVs, grid-stride
 
 // ---------------------------------------------------------------------------
+// Dynamic UB size (dyn_ub_size, the second chevron argument)
+// ---------------------------------------------------------------------------
+// The kernel's two SIMT-visible buffers are allocated from the DYNAMIC UB
+// region via LocalMemAllocator rather than from TPipe/TBuf, because the
+// dynamic region is the one whose size the host declares at launch. The host
+// therefore has to compute the same byte count the device will allocate, so
+// the formula lives here -- this header is included by both sides (CLAUDE.md
+// section 2.4) and is ACL-free.
+//
+// Allocation order in Init() fixes the offsets and MUST match this sum:
+//   xF32   cols   floats
+//   yTile  32     floats
+//
+// Returned as uint64 because cols is caller-supplied and section 2.7 requires
+// widening before the multiply; the caller checks the ceiling, then narrows.
+inline constexpr std::uint64_t Mxfp4DynUbBytes(std::uint32_t cols) noexcept {
+  return static_cast<std::uint64_t>(cols) * 4u +
+         static_cast<std::uint64_t>(kMxfp4RowsPerTile) * 4u;
+}
+
+// dyn_ub_size must not exceed 256 KiB - 8 KiB reserved - 32 KiB minimum
+// DataCache - static. This kernel allocates nothing statically (no TPipe), so
+// the whole 216 KiB is available to the dynamic region.
+inline constexpr std::uint32_t kMxfp4DynUbCeilingBytes = 221184u;  // 216 KiB
+
+// ---------------------------------------------------------------------------
 // sizeof == 40
 // ---------------------------------------------------------------------------
 struct Mxfp4GemvTilingData {

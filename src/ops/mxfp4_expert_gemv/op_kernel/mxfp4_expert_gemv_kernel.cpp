@@ -27,7 +27,18 @@
 // (one V->MTE3 guarded 128 B DataCopy each). A vector ReduceSum cannot
 // express 32 independent 16-lane row reductions on this API generation
 // (no sub-tensor views), which is why the dense reduction runs in
-// registers instead; the UB budget stays at 18,688 B <= 19,456 B.
+// registers instead; the UB budget is 16,512 B, all of it dynamic.
+//
+// PROBE (hardware error 341): the two SIMT-visible buffers are allocated
+// from the DYNAMIC UB region via LocalMemAllocator, and the host declares
+// that region's size as dyn_ub_size in the chevron. Previously they were
+// TPipe/TBuf allocations in the STATIC region while the launch passed
+// nullptr for dyn_ub_size, i.e. declared 0 dynamic bytes. Every operator
+// that hands a __ubuf__ pointer to asc_vf_call faults with 341 on its first
+// SIMT UB access, while fused_mhc_post_residual -- the only operator with no
+// SIMT at all -- passes; the three failing footprints span 16 KB to 174 KB,
+// which rules out a static tile-budget violation. This change tests that
+// correlation. NOT YET VALIDATED ON HARDWARE.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 #include "mxfp4_expert_gemv_arch35.h"
@@ -105,14 +116,23 @@ class Mxfp4ExpertGemv {
   }
 
   __aicore__ inline void Init() {
-    pipe_.InitBuffer(xBuf_, tiling_.cols * 4u);
-    pipe_.InitBuffer(yTileBuf_, kYTileBytes);
-    pipe_.InitBuffer(scalarBuf_, kScalarStateBytes);
+    // DYNAMIC UB, not TPipe/TBuf. Both of these buffers are addressed by the
+    // SIMT VF, and the dynamic region is the one whose size the host declares
+    // through dyn_ub_size in the chevron; a TBuf lives in the static region,
+    // which the launch never declares. See the probe rationale in the file
+    // header. Allocation order fixes the offsets and must match
+    // Mxfp4DynUbBytes(): xF32 first, then yTile.
+    //
+    // Alloc()'s tileSize is in ELEMENTS, not bytes (the implementation does
+    // head_ += sizeof(DataType) * tileSize), so cols and kRowsPerTile are
+    // passed as element counts.
+    xTensor_ = alloc_.Alloc<float>(tiling_.cols);
+    yTensor_ = alloc_.Alloc<float>(kRowsPerTile);
   }
 
   __aicore__ inline void Process() {
     // x is resident once for all of this core's tiles.
-    DataCopy(xBuf_.Get<float>(), xGm_, tiling_.cols);
+    DataCopy(xTensor_, xGm_, tiling_.cols);
     SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     DataSyncBarrier<MemDsbT::ALL>();
@@ -130,14 +150,14 @@ class Mxfp4ExpertGemv {
           const_cast<__gm__ std::uint8_t*>(
               reinterpret_cast<const __gm__ std::uint8_t*>(
                   scaleGm_.GetPhyAddr())),
-          reinterpret_cast<__ubuf__ float*>(xBuf_.Get<float>().GetPhyAddr()),
+          reinterpret_cast<__ubuf__ float*>(xTensor_.GetPhyAddr()),
           tiling_.rows, tiling_.cols, tiling_.packed_row_stride,
           tiling_.scale_row_stride, tile_base,
-          reinterpret_cast<__ubuf__ float*>(yTileBuf_.Get<float>().GetPhyAddr()));
+          reinterpret_cast<__ubuf__ float*>(yTensor_.GetPhyAddr()));
       DataSyncBarrier<MemDsbT::ALL>();
       SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
       WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
-      DataCopy(yGm_[tile_base], yTileBuf_.Get<float>(), kRowsPerTile);
+      DataCopy(yGm_[tile_base], yTensor_, kRowsPerTile);
     }
   }
 
@@ -145,10 +165,13 @@ class Mxfp4ExpertGemv {
   int32_t block_idx_;
   Mxfp4GemvTilingData tiling_;
 
-  TPipe pipe_;
-  TBuf<> xBuf_;
-  TBuf<> yTileBuf_;
-  TBuf<> scalarBuf_;
+  // No TPipe: this kernel allocates entirely from the dynamic UB region, so
+  // static UB is 0 B. Keeping a TBuf alongside LocalMemAllocator would risk
+  // the two mechanisms overlapping, which the 950PR docs call out as
+  // undefined -- and the old scalarState TBuf was never read anyway.
+  LocalMemAllocator<> alloc_;
+  LocalTensor<float> xTensor_;
+  LocalTensor<float> yTensor_;
 
   GlobalTensor<std::uint8_t> packedGm_;
   GlobalTensor<std::uint8_t> scaleGm_;

@@ -1,16 +1,31 @@
 // mxfp4_expert_gemv_ub_layout.hpp -- unified-buffer layout and event plan for mxfp4_expert_gemv
 // mxfp4 expert GEMV (32 AIVs, grid-stride over 32-row tiles, hybrid).
 //
-// Segment table (per core; cols = tiling.cols, worst case 4,096):
+// UB REGION: all DYNAMIC, static is 0 B.
+//
+// Both buffers are addressed by the SIMT VF, so they are allocated from the
+// dynamic UB region through LocalMemAllocator rather than from TPipe/TBuf.
+// The dynamic region is the one whose size the host declares as dyn_ub_size
+// in the chevron; the static region is never declared at launch. The byte
+// count is derived once, in Mxfp4DynUbBytes() in the tiling header, because
+// host and device must agree on it exactly.
+//
+// Segment table (per core; cols = tiling.cols, worst case 4,096), in
+// LocalMemAllocator allocation order -- the order IS the layout:
 //
 //   offset          size (cols=4096)  segment
-//   0               16,384            xF32       resident FP32 x[cols]
-//   16,384          2,048             partials   [32 rows][16 lanes] FP32
-//   18,432          128               yTile      32 FP32 row results
-//   18,560          128               scalarState loop bounds
+//   0               16,384            xF32   resident FP32 x[cols]
+//   16,384          128               yTile  32 FP32 row results
 //
-// Total: 18,688 B at cols=4096 (10,752 B at cols=2048) -- inside the
-// contract's padded v1 bound of 19,456 B and the directive's 35 KiB target.
+// Dynamic total: 16,512 B at cols=4096 (8,320 B at cols=2048). Static: 0.
+// DataCache = min(256 KiB - 0 - 16,512 - 8 KiB, 128 KiB) = 131,072 B.
+//
+// Two segments from the previous revision are gone, and both were fictional:
+// `partials` (2,048 B) was counted in the total but no buffer was ever
+// allocated for it -- the 16-lane row reduction is an in-register butterfly,
+// as the note below already said -- and `scalarState` (128 B) was allocated
+// but never read. The old total of 18,688 B therefore overstated a real
+// footprint of 16,640 B by 2,048 B of buffer that did not exist.
 // Packed nibbles and E8M0 scales are NOT staged in UB: SIMT lanes read them
 // from GM through the SIMT DataCache (asc_ldca), decode OCP E2M1
 // branch-free in registers and form the E8M0 scale with ldexpf, exactly as
@@ -48,24 +63,31 @@ inline constexpr std::uint32_t kRowsPerTile = 32;  // one tile per SIMT launch
 inline constexpr std::uint32_t kLanesPerRow = 16;  // 512 threads / 32 rows
 inline constexpr std::uint32_t kGroupSize = 32;
 
-inline constexpr std::uint32_t kXF32BytesMax = 4096 * 4;                  // 16,384
-inline constexpr std::uint32_t kPartialsBytes = kRowsPerTile * kLanesPerRow * 4;  // 2,048
-inline constexpr std::uint32_t kYTileBytes = kRowsPerTile * 4;            // 128
-inline constexpr std::uint32_t kScalarStateBytes = 128;
+inline constexpr std::uint32_t kXF32BytesMax = 4096 * 4;       // 16,384
+inline constexpr std::uint32_t kYTileBytes = kRowsPerTile * 4;  // 128
 
-inline constexpr std::uint32_t kTotalUbBytes =
-    kXF32BytesMax + kPartialsBytes + kYTileBytes + kScalarStateBytes;
+// Static UB is zero: this kernel has no TPipe and no TBuf.
+inline constexpr std::uint32_t kStaticUbBytes = 0;
+// Worst-case dynamic footprint, at cols = 4,096.
+inline constexpr std::uint32_t kDynUbBytesMax = kXF32BytesMax + kYTileBytes;
 
 // The contract's padded v1 bound at cols=4096.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 19456;
 // The directive's Stage-1 target footprint.
 inline constexpr std::uint32_t kDirectiveUbTargetBytes = 35 * 1024;
 
-static_assert(kTotalUbBytes == 18688, "mxfp4_expert_gemv UB layout must sum to 18,688 B");
-static_assert(kTotalUbBytes <= kContractUbBudgetBytes,
+static_assert(kDynUbBytesMax == 16512,
+              "mxfp4_expert_gemv dynamic UB must sum to 16,512 B");
+static_assert(kStaticUbBytes + kDynUbBytesMax <= kContractUbBudgetBytes,
               "mxfp4_expert_gemv UB layout exceeds the contract v1 budget");
-static_assert(kTotalUbBytes <= kDirectiveUbTargetBytes,
+static_assert(kStaticUbBytes + kDynUbBytesMax <= kDirectiveUbTargetBytes,
               "mxfp4_expert_gemv UB layout exceeds the 35 KiB directive target");
+static_assert(kStaticUbBytes + kDynUbBytesMax <= kUsableUbBytes,
+              "mxfp4_expert_gemv UB layout exceeds the arch35 usable ceiling");
+static_assert(kUbTotalBytes - kUbReservedBytes - kStaticUbBytes -
+                      kDynUbBytesMax >= kUbDataCacheMinBytes,
+              "mxfp4_expert_gemv UB layout starves the SIMT DataCache below "
+              "32 KiB");
 
 // SIMT launch geometry: 32 rows x 16 lanes.
 inline constexpr std::uint32_t kSimtThreads = kRowsPerTile * kLanesPerRow;  // 512

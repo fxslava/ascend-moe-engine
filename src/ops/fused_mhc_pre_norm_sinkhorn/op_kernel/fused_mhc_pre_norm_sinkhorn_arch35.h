@@ -19,7 +19,11 @@
 //
 // Total allocated: 174,336 B <= the contract's v1 budget of 182,464 B and
 // <= kUsableUbBytes (221,184 B). After the 8 KiB runtime reserve, the SIMT
-// DataCache gets min(256 KiB - 174,336 - 8 KiB, 128 KiB) = 75,264 B >= 32 KiB.
+// DataCache gets min(256 KiB - 174,336 - 8 KiB, 128 KiB)
+// = min(79,616, 131,072) = 79,616 B >= 32 KiB.
+// (An earlier revision of this comment said 75,264 B, which was an
+// arithmetic slip: 262,144 - 174,336 - 8,192 is 79,616. The static_assert
+// below was always computing the correct value; only the prose was wrong.)
 //
 // Event plan (EVENT_ID0..3 only; arch35 has no EVENT_ID4..7). The two phi
 // tiles alternate but are driven one-at-a-time (issue, wait, consume), so

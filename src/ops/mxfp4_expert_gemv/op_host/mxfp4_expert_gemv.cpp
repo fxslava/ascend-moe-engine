@@ -50,7 +50,26 @@ Status LaunchMxfp4ExpertGemv(
     return staged;
   }
 
-  mxfp4_expert_gemv<<<tiling.block_dim, nullptr, stream>>>(
+  // The second chevron slot is dyn_ub_size (uint32 BYTES), not an l2ctrl
+  // pointer: the 950PR SIMD/SIMT hybrid launch is
+  // kernel<<<block_num, dyn_ub_size, stream>>>. The kernel's two
+  // SIMT-visible buffers come from the dynamic UB region, so a declared size
+  // of 0 -- which is what passing nullptr here amounted to -- leaves the SIMT
+  // VF addressing a region the launch never reserved. CLAUDE.md section 3.1
+  // prescribes nullptr for this slot; the user granted an explicit exception
+  // for the dynamic-UB argument. This is a PROBE for hardware error 341 and
+  // has not been validated on a device.
+  const std::uint64_t dyn_ub_bytes = Mxfp4DynUbBytes(tiling.cols);
+  if (dyn_ub_bytes > kMxfp4DynUbCeilingBytes) {
+    // Geometry this UB envelope cannot host, not a caller mistake (section
+    // 2.6). Unreachable for the two shapes MakeMxfp4GemvTiling admits, but
+    // the ceiling is part of the launch contract, so it is checked rather
+    // than assumed.
+    return Status::unsupported_shape;
+  }
+
+  mxfp4_expert_gemv<<<tiling.block_dim,
+                      static_cast<std::uint32_t>(dyn_ub_bytes), stream>>>(
       detail::Gm(packed_gm), detail::Gm(scale_gm), detail::Gm(x_gm),
       detail::Gm(y_gm), detail::Gm(workspace), detail::Gm(staging.get()));
   return detail::FinishLaunch(kOp, stream);
