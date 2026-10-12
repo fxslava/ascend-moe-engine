@@ -1,174 +1,36 @@
-// fast_fp8_indexer_topk_kernel.cpp -- fast_fp8_indexer_topk device kernel (Ascend 950PR,
-// arch35 / dav-3510, single AIV, hybrid SIMD/SIMT).
+// fast_fp8_indexer_topk_kernel.cpp -- fast_fp8_indexer_topk device kernel
+// (Ascend 950PR, arch35 / dav-3510, single AIV, hybrid SIMD/SIMT).
+//
+// THE FUSED SINGLE-CORE PATH, AND IT IS CURRENTLY UNLAUNCHED.
+// LaunchFp8IndexerTopK now issues the `fast_fp8_indexer_score` (32 AIV) +
+// `fast_fp8_indexer_select` (1 AIV) pair, and no host wrapper reaches this
+// entry. It is compiled and linked by the device gates but nothing executes
+// it, so say that plainly rather than calling it a verified fallback: the
+// device suite drives LaunchFp8IndexerTopK, which means it now exercises the
+// SPLIT against the tests/emu oracle, not this.
+//
+// It is kept for one reason: it is the only shape in which the whole operator
+// is a single launch, and reinstating it needs a host wrapper, not a rewrite.
+// If no caller ever wants that, this file is dead weight and should be
+// deleted along with its registry and gate entries -- that is a decision for
+// whoever owns the operator's API, not something to settle by leaving it here
+// indefinitely.
+//
+// Its two SIMT phases are the same function templates the split kernels
+// instantiate (fast_fp8_indexer_score_simt.h, fast_fp8_indexer_select_simt.h),
+// so there is one transcription of the scoring loop and one of the selection
+// network, not three. The single-core key schedule is the degenerate case of
+// the grid-stride pair: warp_base 0, warp_stride kWarpsPerCore.
 
 #include "moe/kernels/arch35/arch35_common.hpp"
 #include "fast_fp8_indexer_topk_arch35.h"
 #include "fast_fp8_indexer_topk_tiling.h"
+#include "fast_fp8_indexer_score_simt.h"
+#include "fast_fp8_indexer_select_simt.h"
 
 namespace moe::kernels::arch35::fast_fp8_indexer_topk {
 
 using namespace AscendC;
-
-// ---------------------------------------------------------------------------
-// SIMT phase 0: decode the E4M3 query into FP32 (once per kernel)
-// ---------------------------------------------------------------------------
-__simt_vf__ __aicore__ __launch_bounds__(kSimtThreads) inline void
-DecodeQuerySimt(__ubuf__ const std::uint8_t* query_fp8,  // [64*128]
-                __ubuf__ float* query_f32) {             // [64*128]
-  const std::uint32_t t = threadIdx.x;
-  const std::uint32_t base = t * 16u;  // 8,192 bytes over 512 threads
-  for (std::uint32_t q = 0; q < 16u; ++q) {
-    query_f32[base + q] = DecodeFp8E4M3(query_fp8[base + q]);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// SIMT phase 1: warp-per-key scoring, raw FP32 scores to the GM workspace
-// ---------------------------------------------------------------------------
-__simt_vf__ __aicore__ __launch_bounds__(kSimtThreads) inline void
-ScoreKeysSimt(__ubuf__ const float* query_f32,     // [64*128]
-              __ubuf__ const float* head_scales,   // qw[64]
-              __gm__ float* dequant_scales_gm,     // [64 | seq_len]
-              __gm__ std::uint8_t* key_cache_gm,   // PA_BSND
-              __gm__ std::int32_t* block_table,    // may be null
-              std::uint32_t block_size, std::uint32_t seq_len,
-              std::uint32_t key_block_stride,
-              std::uint32_t num_physical_blocks,
-              __gm__ float* scores_ws) {
-  const std::uint32_t t = threadIdx.x;
-  const std::uint32_t warp = t / kWarpSize;
-  const std::uint32_t lane = t % kWarpSize;
-  const std::uint32_t num_warps = kSimtThreads / kWarpSize;  // 16
-
-  for (std::uint32_t j = warp; j < seq_len; j += num_warps) {
-    const std::uint32_t logical_block = j / block_size;
-    const std::uint32_t within_block = j % block_size;
-
-    std::uint32_t physical_block = logical_block;
-    if (block_table != nullptr) {
-      const std::int32_t entry = block_table[logical_block];
-      if (unlikely(entry < 0 ||
-                   static_cast<std::uint32_t>(entry) >= num_physical_blocks)) {
-        if (lane == 0u) {
-          asc_stcg(scores_ws + j, -__builtin_inff());
-        }
-        continue;
-      }
-      physical_block = static_cast<std::uint32_t>(entry);
-    } else if (unlikely(logical_block >= num_physical_blocks)) {
-      if (lane == 0u) {
-        asc_stcg(scores_ws + j, -__builtin_inff());
-      }
-      continue;
-    }
-
-    __gm__ std::uint8_t* key_row =
-        key_cache_gm + physical_block * key_block_stride +
-        within_block * kHeadDim;
-
-    float acc = 0.0f;
-    for (std::uint32_t h = lane; h < kHeads; h += kWarpSize) {
-      const __ubuf__ float* qh = query_f32 + h * kHeadDim;
-      float dot = 0.0f;
-      for (std::uint32_t d = 0; d < kHeadDim; ++d) {
-        dot += qh[d] * DecodeFp8E4M3(key_row[d]);
-      }
-      if (dot > 0.0f) {
-        acc += head_scales[h] * dot;
-      }
-    }
-    for (std::uint32_t offset = kWarpSize / 2u; offset > 0u; offset >>= 1u) {
-      acc += asc_shfl_xor(acc, static_cast<std::int32_t>(offset), kWarpSize);
-    }
-    if (lane == 0u) {
-      const float k_scale = asc_ldcg(dequant_scales_gm + kHeads + j);
-      asc_stcg(scores_ws + j, acc * k_scale);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// SIMT phase 2: re-read the GM scores, round through BF16, composite-key
-// bitonic sort descending, emit the ranked indices.
-// ---------------------------------------------------------------------------
-__simt_vf__ __aicore__ __launch_bounds__(kSimtThreads) inline void
-SelectTopKSimt(__gm__ const float* scores_ws,  // [seq_len] FP32, stable copy
-               __gm__ std::int32_t* indices, std::uint32_t seq_len,
-               std::uint32_t top_k,
-               __ubuf__ std::uint32_t* keys) {  // [2,048] cross-warp staging
-  const std::uint32_t t = threadIdx.x;
-  const std::uint32_t base = t * kKeysPerThread;
-
-  std::uint32_t key[kKeysPerThread];
-  for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-    const std::uint32_t j = base + r;
-    key[r] = (j < seq_len) ? MakeSelectionKey(scores_ws[j], j)
-                           : kSelectionPadKey;
-  }
-
-  for (std::uint32_t k = 2u; k <= kSortLength; k <<= 1u) {
-    for (std::uint32_t jj = k >> 1u; jj > 0u; jj >>= 1u) {
-      if (jj < kKeysPerThread) {
-        // --- tier 1: both elements are this thread's registers ------------
-        for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-          const std::uint32_t partner_r = r ^ jj;
-          if (partner_r > r) {
-            const std::uint32_t i = base + r;
-            const std::uint32_t a = key[r];
-            const std::uint32_t b = key[partner_r];
-            const std::uint32_t hi = a > b ? a : b;
-            const std::uint32_t lo = a > b ? b : a;
-            const bool want_desc = ((i & k) == 0u);
-            key[r] = want_desc ? hi : lo;
-            key[partner_r] = want_desc ? lo : hi;
-          }
-        }
-      } else if (jj < kKeysPerThread * kWarpSize) {
-        // --- tier 2: same warp, different lane ----------------------------
-        const std::int32_t lane_mask =
-            static_cast<std::int32_t>(jj / kKeysPerThread);
-        for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-          const std::uint32_t i = base + r;
-          const std::uint32_t a = key[r];
-          const std::uint32_t b = asc_shfl_xor(a, lane_mask, kWarpSize);
-          const std::uint32_t hi = a > b ? a : b;
-          const std::uint32_t lo = a > b ? b : a;
-          const bool want_desc = ((i & k) == 0u);
-          const bool i_is_low = ((i & jj) == 0u);
-          key[r] = (i_is_low == want_desc) ? hi : lo;
-        }
-      } else {
-        // --- tier 3: cross-warp, through UB -------------------------------
-        for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-          keys[base + r] = key[r];
-        }
-        asc_syncthreads();
-        for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-          const std::uint32_t i = base + r;
-          const std::uint32_t a = key[r];
-          const std::uint32_t b = keys[i ^ jj];
-          const std::uint32_t hi = a > b ? a : b;
-          const std::uint32_t lo = a > b ? b : a;
-          const bool want_desc = ((i & k) == 0u);
-          const bool i_is_low = ((i & jj) == 0u);
-          key[r] = (i_is_low == want_desc) ? hi : lo;
-        }
-        asc_syncthreads();
-      }
-    }
-  }
-
-  const std::uint32_t selected = top_k < seq_len ? top_k : seq_len;
-  for (std::uint32_t r = 0u; r < kKeysPerThread; ++r) {
-    const std::uint32_t slot = base + r;
-    if (slot < top_k) {
-      indices[slot] = (slot < selected)
-                          ? static_cast<std::int32_t>(
-                                SelectionKeyToIndex(key[r]))
-                          : -1;
-    }
-  }
-}
 
 class Fp8IndexerTopK {
  public:
@@ -227,6 +89,7 @@ class Fp8IndexerTopK {
         reinterpret_cast<__ubuf__ float*>(queryF32Buf.GetPhyAddr()));
     DataSyncBarrier<MemDsbT::ALL>();
 
+    // One core: global warp id == local warp id, stride == warps per core.
     asc_vf_call<ScoreKeysSimt>(
         dim3(kSimtThreads),
         reinterpret_cast<__ubuf__ float*>(queryF32Buf.GetPhyAddr()),
@@ -242,7 +105,7 @@ class Fp8IndexerTopK {
                   reinterpret_cast<const __gm__ std::int32_t*>(
                       blockTableGm_.GetPhyAddr())),
         tiling_.block_size, seq_len, tiling_.key_block_stride,
-        tiling_.num_physical_blocks, scoresWs_);
+        tiling_.num_physical_blocks, 0u, kWarpsPerCore, scoresWs_);
     DataSyncBarrier<MemDsbT::DDR>();
 
     asc_vf_call<SelectTopKSimt>(
@@ -281,6 +144,7 @@ extern "C" __global__ __aicore__ void fast_fp8_indexer_topk(
                td->seq_len > kMaxSeqLen ||
                td->block_size == 0 ||
                td->num_physical_blocks == 0 ||
+               (td->key_block_stride & 3u) != 0u ||
                static_cast<std::uint64_t>(td->key_block_stride) <
                    static_cast<std::uint64_t>(td->block_size) * kHeadDim ||
                td->block_table_len <

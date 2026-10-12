@@ -8,9 +8,12 @@
 //   8,192    32,768  queryF32     dequantized query [64,128] (decoded once)
 //   40,960   256     headScales  qw[64] FP32 head scales
 //   41,216   8,192   sortKeys    2,048 uint32 selection composites
-//   49,408   256     scalarState tie-break / count scalars
 //
-// Total: 49,664 B <= kUsableUbBytes (221,184 B). The contract's v1 cap of
+// Total: 49,408 B <= kUsableUbBytes (221,184 B). A `scalarState` segment of
+// 256 B used to close this table, but Process() never allocated it and the
+// host's dyn_ub_size formula never counted it, so the table was 256 B larger
+// than the region the kernel actually uses; it is dropped rather than carried.
+// The contract's v1 cap of
 // 44,064 B assumed a vector-scoring shape (FP8 query 8,192 + widened query
 // 32,768 + FP8 key tile 256 + widened key 512 + head partials 256 + score
 // scan 2,048 + scalar 32); this kernel scores warp-per-key straight out of
@@ -41,6 +44,9 @@
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
+// Carries the score/select grid sizes and the per-kernel dyn_ub_size formulas
+// the host launches with; the asserts below tie this table to them.
+#include "fast_fp8_indexer_topk_tiling.h"
 
 namespace moe::kernels::arch35::fast_fp8_indexer_topk {
 
@@ -54,16 +60,17 @@ inline constexpr std::uint32_t kQueryFp8Bytes = kHeads * kHeadDim;      // 8,192
 inline constexpr std::uint32_t kQueryF32Bytes = kHeads * kHeadDim * 4;  // 32,768
 inline constexpr std::uint32_t kHeadScalesBytes = kHeads * 4;           // 256
 inline constexpr std::uint32_t kSortKeysBytes = kSortLength * 4;        // 8,192
-inline constexpr std::uint32_t kScalarStateBytes = 256;
 
 inline constexpr std::uint32_t kTotalUbBytes =
-    kQueryFp8Bytes + kQueryF32Bytes + kHeadScalesBytes + kSortKeysBytes +
-    kScalarStateBytes;
+    kQueryFp8Bytes + kQueryF32Bytes + kHeadScalesBytes + kSortKeysBytes;
 
 // The contract's v1 UB cap (vector-scoring shape); see the header comment.
 inline constexpr std::uint32_t kContractUbCapBytes = 44064;
 
-static_assert(kTotalUbBytes == 49664, "fast_fp8_indexer_topk UB layout must sum to 49,664 B");
+static_assert(kTotalUbBytes == 49408, "fast_fp8_indexer_topk UB layout must sum to 49,408 B");
+static_assert(kTotalUbBytes == IndexerDynamicUbBytes(),
+              "the fused kernel's UB layout disagrees with the dyn_ub_size "
+              "the host launches it with");
 static_assert(kTotalUbBytes <= kUsableUbBytes,
               "fast_fp8_indexer_topk UB layout exceeds the arch35 usable UB ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
@@ -73,6 +80,50 @@ static_assert(kUbTotalBytes - kUbReservedBytes - kTotalUbBytes >=
 // SIMT launch geometry.
 inline constexpr std::uint32_t kSimtThreads = 512;  // 16 warps
 inline constexpr std::uint32_t kWarpSize = 32;
+
+// ---------------------------------------------------------------------------
+// The two-kernel split
+// ---------------------------------------------------------------------------
+// Scoring runs on all 32 AIVs, selection on one. The segment table above is
+// the FUSED kernel's layout; the split kernels each take a prefix of it:
+//
+//   fast_fp8_indexer_score   queryFp8 + queryF32 + headScales   41,216 B
+//   fast_fp8_indexer_select  sortKeys                            8,192 B
+//
+// The grid sizes and those two byte counts live in the tiling header, which
+// both this file and the host include, so neither side can compute a
+// different one. The stride below is the device's half of the key
+// distribution: a core's warp w takes global warp id
+// kScoreBlockDim-many-cores * 16 warps apart, i.e.
+//
+//   j = (block_idx * kWarpsPerCore + warp) + n * kScoreWarpStride
+//
+// and because kScoreWarpStride == kScoreBlockDim * kWarpsPerCore, the global
+// warp ids cover [0, kScoreWarpStride) exactly once -- which is what makes the
+// union of the per-warp key sequences a partition of [0, seq_len).
+inline constexpr std::uint32_t kWarpsPerCore = kSimtThreads / kWarpSize;  // 16
+inline constexpr std::uint32_t kScoreBlockDim = kIndexerScoreBlockDim;    // 32
+inline constexpr std::uint32_t kScoreWarpStride = kScoreBlockDim * kWarpsPerCore;
+
+static_assert(kWarpsPerCore == kIndexerWarpsPerCore,
+              "the device's warps-per-core must match the host's figure, or "
+              "the key-distribution stride is wrong on one side");
+static_assert(kScoreWarpStride == kIndexerScoreWarpStride,
+              "the device's grid-stride step must match the host's figure");
+
+// Per-kernel UB totals, each asserted against the host's dyn_ub_size formula.
+inline constexpr std::uint32_t kScoreUbBytes =
+    kQueryFp8Bytes + kQueryF32Bytes + kHeadScalesBytes;  // 41,216
+inline constexpr std::uint32_t kSelectUbBytes = kSortKeysBytes;  // 8,192
+
+static_assert(kScoreUbBytes == IndexerScoreDynamicUbBytes(),
+              "the score kernel's UB layout disagrees with the dyn_ub_size "
+              "the host launches it with");
+static_assert(kSelectUbBytes == IndexerSelectDynamicUbBytes(),
+              "the select kernel's UB layout disagrees with the dyn_ub_size "
+              "the host launches it with");
+static_assert(kScoreUbBytes <= kUsableUbBytes && kSelectUbBytes <= kUsableUbBytes,
+              "a split kernel exceeds the arch35 usable UB ceiling");
 
 // Register blocking for the selection network: thread t holds sequence
 // indices [t*kKeysPerThread, (t+1)*kKeysPerThread) in registers. This is what

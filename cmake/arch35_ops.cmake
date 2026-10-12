@@ -49,6 +49,35 @@ foreach(_op IN LISTS MOE_ARCH35_OPS)
   )
 endforeach()
 
+# -----------------------------------------------------------------------------
+# Additional device-kernel TUs
+# -----------------------------------------------------------------------------
+# The three-TUs-per-operator derivation above assumes one kernel entry symbol
+# per operator. fast_fp8_indexer_topk has three: the fused single-core
+# reference and the score/select pair that LaunchFp8IndexerTopK actually
+# dispatches, because scoring wants all 32 AIVs and the bitonic selection
+# network wants a total order on one. They are extra ENTRY POINTS of one
+# operator, not new operators -- one directory, one host ABI, one tiling POD --
+# so they are listed here rather than added to MOE_ARCH35_OPS, which would
+# demand their own op_host/ and op_kernel/ trees and a second launch wrapper.
+#
+# Adding one: put it in the owning operator's op_kernel/ and list it here, and
+# add it to scripts/device_compile_kernels.sh (CLAUDE.md §5.1).
+set(MOE_ARCH35_EXTRA_KERNEL_SOURCES
+  "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_score_kernel.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_select_kernel.cpp"
+)
+
+foreach(_src IN LISTS MOE_ARCH35_EXTRA_KERNEL_SOURCES)
+  if(NOT EXISTS "${_src}")
+    message(FATAL_ERROR
+      "arch35 extra kernel TU ${_src} is listed in "
+      "MOE_ARCH35_EXTRA_KERNEL_SOURCES but does not exist. Either add the "
+      "file or remove it from the list.")
+  endif()
+  list(APPEND MOE_ARCH35_OP_ASC_SOURCES "${_src}")
+endforeach()
+
 # The shared launch-layer TU (the failure record and Status::ToString) belongs
 # to no single operator but is an ASC TU for the same reason the op_host
 # wrappers are.

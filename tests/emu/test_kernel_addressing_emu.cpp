@@ -58,6 +58,13 @@ constexpr std::uint32_t kIdxHeads = 64;
 constexpr std::uint32_t kIdxHeadDim = 128;
 constexpr std::uint32_t kIdxMaxSeqLen = 2048;
 
+constexpr std::uint32_t kIdxSimtThreads = 512;
+constexpr std::uint32_t kIdxWarpSize = 32;
+constexpr std::uint32_t kIdxWarpsPerCore = kIdxSimtThreads / kIdxWarpSize;  // 16
+constexpr std::uint32_t kIdxScoreBlockDim = 32;                             // all AIVs
+constexpr std::uint32_t kIdxScoreWarpStride =
+    kIdxScoreBlockDim * kIdxWarpsPerCore;  // 512
+
 // --- mirrored from src/ops/mxfp4_expert_gemv/op_kernel/..._arch35.h ---------
 constexpr std::uint32_t kMxRowsPerTile = 32;
 constexpr std::uint32_t kMxLanesPerRow = 16;
@@ -125,6 +132,16 @@ void TestMirroredShapeInvariants(emu_test::Runner& runner) {
                "which is what makes lane_group_base exact");
   runner.Check(kIdxHeads * kIdxHeadDim == 8192u,
                "indexer query tile is 8,192 FP8 bytes");
+  runner.Check(kIdxScoreWarpStride == kIdxScoreBlockDim * kIdxWarpsPerCore,
+               "the score kernel's grid-stride step is exactly the number of "
+               "global warps, which is what makes the key schedule a "
+               "partition rather than an overlap");
+  runner.Check(kIdxHeads % kIdxWarpSize == 0u,
+               "the 64 heads split evenly over a warp's 32 lanes, so every "
+               "lane owns the same number of head dots");
+  runner.Check(kIdxHeadDim % 4u == 0u,
+               "the key row is a whole number of uint32 words, so the "
+               "word-wide E4M3 load has no tail");
   runner.Check(kShProjectionRows == 6u * kShStreams,
                "the 24 projection rows are three 4-wide gate segments plus "
                "the 16-wide logits segment");
@@ -481,6 +498,142 @@ void TestIndexerBlockStride(emu_test::Runner& runner) {
 }
 
 // ---------------------------------------------------------------------------
+// Section 3b: fast_fp8_indexer_score key distribution across 32 AIVs.
+//
+// Transcribed from ScoreKeysSimt's loop header, which is the entire contract
+// of the two-kernel split:
+//
+//   for (j = warp_base + warp; j < seq_len; j += warp_stride)
+//     warp_base   = block_idx * kWarpsPerCore
+//     warp_stride = kScoreBlockDim * kWarpsPerCore
+//
+// Correctness of the split rests on one property and nothing else: the union
+// of the per-(core, warp) key sequences must be EXACTLY [0, seq_len), each key
+// once. Scoring is key-independent, so if that holds the 32-core scores are
+// bit-identical to the single-core scores; if it does not, keys are either
+// never scored (the workspace keeps whatever was there, and selection ranks a
+// stale or uninitialized score) or scored twice by different cores (two cores
+// race on one 4-byte slot). Neither failure throws, and neither is visible in
+// a cosine against the oracle once the top-k happens to come out the same --
+// which is exactly why it is checked here rather than on hardware.
+//
+// This says nothing about warp scheduling or store visibility (CLAUDE.md
+// §5.2); it is an integer-coverage claim and stops there.
+//
+// VERIFIED TO HAVE TEETH. Mutation-tested at seq_len 2,048 on a 32-core grid;
+// every plausible way to get the pair wrong is caught, with the counts naming
+// which way:
+//
+//   warp_base = block_idx (missing the *16)   1,860 unscored,  180 duplicated
+//   warp_base = block_idx * 32 (warps/cores)  1,024 unscored,  768 duplicated
+//   warp_stride = warps per core (16)                        2,032 duplicated
+//   warp_stride = block_dim (32)                             2,016 duplicated
+//   warp_stride 511 / 513                         3 unscored,    4 duplicated
+//
+// The first two rows are the ones that matter: a grid-stride written as
+// `for (j = block_idx; j < seq_len; j += block_dim)` is the obvious way to
+// spread keys over cores and it scores 3% of them, because this kernel's unit
+// of work is a WARP, not a core. That formulation reads correct and is not;
+// it is caught here in a printed line rather than as a plausible-looking
+// hardware number.
+// ---------------------------------------------------------------------------
+void CheckScoreCoverage(emu_test::Runner& runner, std::uint32_t block_dim,
+                        std::uint32_t seq_len, const std::string& label) {
+  const std::uint32_t warp_stride = block_dim * kIdxWarpsPerCore;
+
+  // One counter per key: how many (core, warp) pairs claim it.
+  std::vector<std::uint32_t> visits(seq_len, 0u);
+  std::uint64_t total = 0;
+  for (std::uint32_t block_idx = 0; block_idx < block_dim; ++block_idx) {
+    const std::uint32_t warp_base = block_idx * kIdxWarpsPerCore;
+    for (std::uint32_t warp = 0; warp < kIdxWarpsPerCore; ++warp) {
+      for (std::uint32_t j = warp_base + warp; j < seq_len; j += warp_stride) {
+        ++visits[j];
+        ++total;
+      }
+    }
+  }
+
+  std::uint32_t unvisited = 0;
+  std::uint32_t duplicated = 0;
+  std::uint32_t first_bad = 0;
+  for (std::uint32_t j = 0; j < seq_len; ++j) {
+    if (visits[j] == 0u) {
+      if (unvisited == 0u && duplicated == 0u) first_bad = j;
+      ++unvisited;
+    } else if (visits[j] > 1u) {
+      if (unvisited == 0u && duplicated == 0u) first_bad = j;
+      ++duplicated;
+    }
+  }
+
+  runner.Check(unvisited == 0u,
+               label + ": every key is scored (unscored=" +
+                   std::to_string(unvisited) + ", first at j=" +
+                   std::to_string(first_bad) + ")");
+  runner.Check(duplicated == 0u,
+               label + ": no key is scored twice, so no two cores write the "
+                       "same workspace slot (duplicated=" +
+                   std::to_string(duplicated) + ")");
+  runner.Check(total == static_cast<std::uint64_t>(seq_len),
+               label + ": the schedule issues exactly seq_len key dots (" +
+                   std::to_string(total) + " vs " + std::to_string(seq_len) +
+                   ")");
+}
+
+void TestIndexerScoreDistribution(emu_test::Runner& runner) {
+  runner.Section("fast_fp8_indexer_score key distribution");
+
+  // The production grid, at the three sequence lengths the hardware
+  // benchmark covers plus the boundary cases.
+  for (std::uint32_t seq_len : {1u, 31u, 32u, 511u, 512u, 513u, 1024u,
+                                kIdxMaxSeqLen}) {
+    CheckScoreCoverage(runner, kIdxScoreBlockDim, seq_len,
+                       "32 AIV, seq_len " + std::to_string(seq_len));
+  }
+
+  // The fused single-core kernel is the degenerate case of the same schedule
+  // (warp_base 0, stride kWarpsPerCore). If that stopped being a partition the
+  // split-vs-fused comparison would be comparing two broken things.
+  for (std::uint32_t seq_len : {1u, 17u, 512u, kIdxMaxSeqLen}) {
+    CheckScoreCoverage(runner, 1u, seq_len,
+                       "1 AIV, seq_len " + std::to_string(seq_len));
+  }
+
+  // The property must hold for ANY grid, not just 1 and 32: the stride is
+  // derived from the grid rather than hardcoded, so a future change to
+  // kScoreBlockDim must not need this file edited to stay true.
+  for (std::uint32_t block_dim : {2u, 3u, 7u, 16u, 32u}) {
+    CheckScoreCoverage(runner, block_dim, 1000u,
+                       "block_dim " + std::to_string(block_dim) +
+                           ", seq_len 1000");
+  }
+
+  // Each warp's own sequence must be strictly increasing and stay in range --
+  // the loop variable is uint32 and `warp_base + warp` must not be able to
+  // start past seq_len and wrap.
+  bool monotone = true;
+  bool in_range = true;
+  for (std::uint32_t block_idx = 0; block_idx < kIdxScoreBlockDim; ++block_idx) {
+    for (std::uint32_t warp = 0; warp < kIdxWarpsPerCore; ++warp) {
+      std::uint32_t previous = 0;
+      bool first = true;
+      for (std::uint32_t j = block_idx * kIdxWarpsPerCore + warp;
+           j < kIdxMaxSeqLen; j += kIdxScoreWarpStride) {
+        if (!first && j <= previous) monotone = false;
+        if (j >= kIdxMaxSeqLen) in_range = false;
+        previous = j;
+        first = false;
+      }
+    }
+  }
+  runner.Check(monotone, "each warp's key sequence is strictly increasing");
+  runner.Check(in_range,
+               "no warp forms a key index at or past kMaxSeqLen, so the "
+               "workspace write stays inside Fp8IndexerWorkspaceBytes");
+}
+
+// ---------------------------------------------------------------------------
 // Section 4: fused_mhc_pre_norm_sinkhorn segment and butterfly indexing.
 //
 // The 4x4 solve never leaves registers, so there is no buffer walk to
@@ -558,6 +711,7 @@ int main() {
   TestIndexerWellFormedTable(runner);
   TestIndexerMalformedTable(runner);
   TestIndexerBlockStride(runner);
+  TestIndexerScoreDistribution(runner);
   TestSinkhornIndexing(runner);
 
   return runner.Summary();

@@ -46,6 +46,20 @@ Status MakeIndexerTiling(std::uint32_t query_head_stride,
     if (static_cast<std::uint64_t>(key_block_stride) < min_stride) {
       return Status::unsupported_shape;
     }
+    // The scoring VF loads four E4M3 codes per instruction by reading the key
+    // row as uint32 words, so the row base must be 4-byte aligned. The
+    // within-block term is always a multiple of kIndexerHeadDim (128), so the
+    // only way to break it is a stride that is not a multiple of 4.
+    //
+    // unsupported_shape and not invalid_argument (CLAUDE.md §2.6): a stride of
+    // 129 is a perfectly coherent layout that v1 does not implement, not a
+    // caller mistake like a null pointer. It must be rejected HERE, host-side
+    // and before the enqueue, because the kernel's only way to refuse is an
+    // early return -- which on device is a silent no-op leaving a zeroed
+    // workspace, i.e. a wrong answer rather than an error.
+    if ((key_block_stride & 3u) != 0u) {
+      return Status::unsupported_shape;
+    }
     // "block_table_len >= ceil(seq_len/block_size)". Key j is read through
     // block_table[j / block_size], so a shorter table is an out-of-bounds
     // read the kernel cannot detect.

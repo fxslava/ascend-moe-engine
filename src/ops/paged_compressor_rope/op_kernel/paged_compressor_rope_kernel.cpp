@@ -378,6 +378,26 @@ class PagedCompressorRope {
   }
 
   __aicore__ inline void WritebackRegions(bool with_previous) {
+    // RAW guard: the four state regions were last written by a SIMT VF, which
+    // issues on the Vector pipeline, and MTE3 is a different queue. The
+    // canonical choreography is "MTE3 waits V_MTE3 before draining a vector
+    // result to GM" -- DataSyncBarrier<ALL> is scope-limited data visibility
+    // and is explicitly not a compute fence, so it does not stand in for this
+    // pairing. Both hybrid kernels that run correctly on hardware
+    // (mxfp4_expert_gemv, fused_mhc_pre_norm_sinkhorn) pair the barrier with
+    // this flag before DMA-ing VF-written UB out; this one did not.
+    //
+    // The HOLD path is where that mattered. Steps 0..2 of a group project into
+    // kvCur_/gateCur_ inside CompressorProjectSimt and then drain both regions
+    // here with no V->MTE3 dependency, so the writeback could read UB the VF
+    // had not finished writing and persist a stale row. The EMIT at step 3
+    // reloads exactly those rows as window rows 4..6, so a cold-start group 0
+    // reduced partly-unwritten b halves -- a direction that is correlated with
+    // the golden but wrong (the observed cos 0.576) rather than garbage. The
+    // roll then carried the same damage into prev_kv_a / prev_gate_a, which is
+    // why group 1 was worse (0.379) despite taking the identical code path.
+    SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
+    WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
     // WAR guard: every state MTE2 read must drain before the MTE3 writeback.
     SetFlag<HardEvent::MTE2_MTE3>(kEvMte2ToMte3);
     WaitFlag<HardEvent::MTE2_MTE3>(kEvMte2ToMte3);

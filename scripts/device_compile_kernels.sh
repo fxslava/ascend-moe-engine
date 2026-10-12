@@ -139,6 +139,23 @@ for k in $KERNELS; do
   compile_one "$k/op_host/${k}_tiling.cpp"   "$d/op_host/${k}_tiling.cpp"   "$inc"
 done
 
+# Extra device-kernel TUs: additional ENTRY POINTS of an operator above, not
+# new operators, so the ${k}_kernel.cpp derivation does not reach them. They
+# must still pass this gate -- they are the kernels the host now launches.
+# Format: "<owning operator>:<file stem under op_kernel/>".
+EXTRA_KERNELS="
+fast_fp8_indexer_topk:fast_fp8_indexer_score_kernel
+fast_fp8_indexer_topk:fast_fp8_indexer_select_kernel
+"
+
+for e in $EXTRA_KERNELS; do
+  k="${e%%:*}"
+  stem="${e##*:}"
+  d="src/ops/$k"
+  inc="-I$d/op_kernel -I$d/op_host"
+  compile_one "$k/op_kernel/${stem}.cpp" "$d/op_kernel/${stem}.cpp" "$inc"
+done
+
 # The shared launch-layer TU: the failure record and Status::ToString.
 compile_one "kernels/arch35/launch_common.cpp" \
             "src/kernels/arch35/launch_common.cpp" ""

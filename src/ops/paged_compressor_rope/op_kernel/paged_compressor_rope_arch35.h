@@ -57,7 +57,14 @@
 //
 // Event plan (EVENT_ID0..3 only):
 //   EVENT_ID0  MTE2 -> V    state regions / ape / norm / rope arrivals
-//   EVENT_ID1  V    -> MTE3 outBf16 cache-slot store readiness
+//   EVENT_ID1  V    -> MTE3 vector results final, DMA-out may read: the
+//                           outBf16 cache-slot store, and -- on HOLD as well
+//                           as EMIT -- the four state regions the SIMT VFs
+//                           write. DataSyncBarrier<ALL> is data visibility
+//                           only and does not order the V and MTE3 queues, so
+//                           the writeback needs this pairing and not just the
+//                           barrier. Each use is an immediate Set/Wait pair,
+//                           so reusing the id across the two sites is balanced.
 //   EVENT_ID2  MTE2 -> MTE3 WAR guard: state MTE2 traffic drained before
 //                           the state writeback may issue
 //   EVENT_ID3  MTE3 -> MTE2 reload guard (directive): the state MTE2 reload
