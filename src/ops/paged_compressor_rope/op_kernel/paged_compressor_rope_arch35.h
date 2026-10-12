@@ -1,7 +1,19 @@
 // paged_compressor_rope_ub_layout.hpp -- unified-buffer layout and event plan for paged_compressor_rope
 // fused_paged_compressor_rope (single AIV, hybrid SIMD/SIMT, coff=2 C4A).
 //
-// Segment table:
+// UB REGION SPLIT -- this is load-bearing, not bookkeeping.
+//
+// Both SIMT VFs (CompressorProjectSimt, CompressorEmitSimt) dereference UB
+// pointers, and a buffer a SIMT VF touches must live in the DYNAMIC region
+// whose size the host declares as the second chevron argument. TPipe/TBuf
+// allocates from the STATIC region, so the two BF16 staging buffers below --
+// the only ones no SIMT VF ever sees -- are the only TBufs this kernel has.
+// Everything else comes from LocalMemAllocator, and the byte total is derived
+// once in op_host/paged_compressor_rope_tiling.h so host and device cannot
+// disagree about it.
+//
+// DYNAMIC segments (LocalMemAllocator; allocation order IS the layout, and it
+// must match the order documented in the tiling header):
 //
 //   offset   size    segment
 //   0        16,384  kvCur        current-group KV state [4,1024] FP32
@@ -9,16 +21,26 @@
 //   32,768   8,192   prevKvA      previous group a-KV halves [4,512] FP32
 //   40,960   8,192   prevGateA    previous group a-gate halves [4,512] FP32
 //   49,152   16,384  apeF32       all four ape rows [4,1024] FP32 (resident)
-//   65,536   2,048   outF32       compressed token [512] FP32
-//   67,584   1,024   normWBf16    BF16 norm gain [512]
-//   68,608   2,048   normWF32     widened norm gain [512]
-//   70,656   512     ropeTables   cos[64] || sin[64] FP32
-//   71,168   1,024   outBf16      BF16 [512] cache-slot token
-//   72,192   256     reduceSlack  16 warp partials + block inv-rms scalar
-//   72,448   768     scalarState  meta copy + loop scalars
+//   65,536   2,048   normWF32     widened norm gain [512]
+//   67,584   256     ropeCos      cos[64] FP32
+//   67,840   256     ropeSin      sin[64] FP32
+//   68,096   2,048   outF32       compressed token [512] FP32
+//   70,144   256     reduceSlack  16 warp partials + block inv-rms scalar
 //
-// Total: 73,216 B -- inside the contract's padded emit-phase figure of
-// 84,992 B and far below kUsableUbBytes (221,184 B). The four state regions
+//   dynamic total: 70,400 B
+//
+// STATIC segments (TPipe/TBuf, SIMD-private):
+//
+//   1,024  normWBf16  BF16 norm gain [512], cast into normWF32
+//   1,024  outBf16    BF16 [512] cache-slot token, MTE3 source
+//
+//   static total: 2,048 B
+//
+// Total: 72,448 B -- inside the contract's padded emit-phase figure of
+// 84,992 B and far below kUsableUbBytes (221,184 B). A `scalarState` segment
+// of 768 B used to sit at the end of this table; the TBuf existed but nothing
+// ever read or wrote it, so it is gone rather than carried as a static-region
+// allocation this kernel does not use. The four state regions
 // mirror the GM ring-state ABI one-to-one (kv [0,16K), gate [16K,32K),
 // prev-a kv [32K,40K), prev-a gate [40K,48K) in GM), so the state crosses
 // the boundary as four whole-region MTE2/MTE3 copies. Weight rows are NOT
@@ -52,6 +74,9 @@
 #include <cstdint>
 
 #include "moe/kernels/arch35/arch35_common.hpp"
+// Carries kCompressorDynUbBytes, the single formula the host also uses for
+// the chevron's dyn_ub_size; the asserts below tie this table to it.
+#include "paged_compressor_rope_tiling.h"
 
 namespace moe::kernels::arch35::paged_compressor_rope {
 
@@ -78,18 +103,40 @@ inline constexpr std::uint32_t kNormWBytes = kHeadDim * 2;                  // 1
 inline constexpr std::uint32_t kNormWF32Bytes = kHeadDim * 4;               // 2,048
 inline constexpr std::uint32_t kRopeTableBytes = 2 * kRopeHeadDim * 4;      // 512
 inline constexpr std::uint32_t kOutBf16Bytes = kHeadDim * 2;                // 1,024
-inline constexpr std::uint32_t kReduceSlackBytes = 256;
-inline constexpr std::uint32_t kScalarStateBytes = 768;
+inline constexpr std::uint32_t kReduceSlackFloats = kCompressorReduceSlackFloats;
+inline constexpr std::uint32_t kReduceSlackBytes = kReduceSlackFloats * 4;  // 256
 
-inline constexpr std::uint32_t kTotalUbBytes =
+// Dynamic region: every segment a SIMT VF dereferences.
+inline constexpr std::uint32_t kDynamicUbBytes =
     2 * kKvCurRegionFloats * 4 + 2 * kPrevARegionFloats * 4 + kApeBytes +
-    kOutF32Bytes + kNormWBytes + kNormWF32Bytes + kRopeTableBytes +
-    kOutBf16Bytes + kReduceSlackBytes + kScalarStateBytes;
+    kNormWF32Bytes + kRopeTableBytes + kOutF32Bytes + kReduceSlackBytes;
+
+// Static region: the two SIMD-private BF16 staging buffers.
+inline constexpr std::uint32_t kStaticUbBytes = kNormWBytes + kOutBf16Bytes;
+
+inline constexpr std::uint32_t kTotalUbBytes = kStaticUbBytes + kDynamicUbBytes;
 
 // The contract's padded emit-phase figure (83,968 B + 1 KiB); see above.
 inline constexpr std::uint32_t kContractUbBudgetBytes = 84992;
 
-static_assert(kTotalUbBytes == 73216, "paged_compressor_rope UB layout must sum to 73,216 B");
+static_assert(kDynamicUbBytes == 70400,
+              "paged_compressor_rope dynamic UB must sum to 70,400 B");
+static_assert(kStaticUbBytes == 2048,
+              "paged_compressor_rope static UB must sum to 2,048 B");
+static_assert(kTotalUbBytes == 72448,
+              "paged_compressor_rope UB layout must sum to 72,448 B");
+
+// The host declares dyn_ub_size from the tiling header's constant, so a
+// segment added here without updating that formula would under-declare the
+// dynamic region and reintroduce the out-of-bounds SIMT access this split
+// exists to prevent. Tie the two together at compile time.
+static_assert(kDynamicUbBytes == kCompressorDynUbBytes,
+              "paged_compressor_rope dynamic UB layout disagrees with the "
+              "dyn_ub_size formula the host launches with");
+static_assert(kStaticUbBytes == kCompressorStaticUbBytes,
+              "paged_compressor_rope static UB layout disagrees with the "
+              "tiling header's static-region figure");
+
 static_assert(kTotalUbBytes <= kContractUbBudgetBytes,
               "paged_compressor_rope UB layout exceeds the contract emit-phase budget");
 static_assert(kTotalUbBytes <= kUsableUbBytes,

@@ -216,12 +216,23 @@ class PagedCompressorRope {
                                kRopeHeadDim);
     ropeSinGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(rope_sin),
                                kRopeHeadDim);
-    // The UB regions mirror the GM ABI offsets one-to-one.
+    // The UB regions mirror the GM ABI offsets one-to-one. The ABI is four
+    // consecutive regions in this order -- kv_cur | gate_cur | prev_kv_a |
+    // prev_gate_a -- so gate_cur begins one kv-region in, at float 4,096.
+    //
+    // It was previously set to 2 * kKvCurRegionFloats (float 8,192), which is
+    // where prev_kv_a starts: gate_cur then covered exactly the union of the
+    // two prev-a regions and the real gate slot [4,096, 8,192) was never
+    // touched. Nothing read out of bounds, so it could not fault -- it
+    // silently aliased. On an EMIT the prev-a writeback landed after the gate
+    // writeback and clobbered it, and the following HOLD's gate writeback
+    // clobbered prev-a in turn, so the first group emitted correctly and
+    // every later group reduced against corrupted previous rows.
     stateKvGm_.SetGlobalBuffer(
         reinterpret_cast<__gm__ float*>(state) + 0,
         kKvCurRegionFloats);
     stateGateGm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ float*>(state) + 2 * kKvCurRegionFloats,
+        reinterpret_cast<__gm__ float*>(state) + kKvCurRegionFloats,
         kGateCurRegionFloats);
     statePrevKvGm_.SetGlobalBuffer(
         reinterpret_cast<__gm__ float*>(state) + 2 * kKvCurRegionFloats,
@@ -239,19 +250,37 @@ class PagedCompressorRope {
   }
 
   __aicore__ inline void Init() {
-    pipe_.InitBuffer(kvCurBuf_, kKvCurRegionFloats * 4);
-    pipe_.InitBuffer(gateCurBuf_, kGateCurRegionFloats * 4);
-    pipe_.InitBuffer(prevKvABuf_, kPrevARegionFloats * 4);
-    pipe_.InitBuffer(prevGateABuf_, kPrevARegionFloats * 4);
-    pipe_.InitBuffer(apeBuf_, kApeBytes);
-    pipe_.InitBuffer(outF32Buf_, kOutF32Bytes);
+    // STATIC region (TPipe/TBuf): the two BF16 staging buffers, and only
+    // those. Neither is ever passed to a SIMT VF -- normWBf16 is cast into
+    // the dynamic normWF32 and outBf16 is an MTE3 source -- so neither needs
+    // to be SIMT-addressable.
     pipe_.InitBuffer(normWBf16Buf_, kNormWBytes);
-    pipe_.InitBuffer(normWF32Buf_, kNormWF32Bytes);
-    pipe_.InitBuffer(ropeCosBuf_, kRopeTableBytes / 2);
-    pipe_.InitBuffer(ropeSinBuf_, kRopeTableBytes / 2);
     pipe_.InitBuffer(outBf16Buf_, kOutBf16Bytes);
-    pipe_.InitBuffer(reduceBuf_, kReduceSlackBytes);
-    pipe_.InitBuffer(scalarBuf_, kScalarStateBytes);
+
+    // DYNAMIC region: everything the two SIMT VFs dereference. A TBuf here
+    // would land in the static region, which the launch's dyn_ub_size does
+    // not cover, and every SIMT UB access would be out of bounds on the
+    // first touch. Alloc() takes ELEMENTS, not bytes, and bumps a head
+    // pointer -- so this call order fixes the offsets and must match the
+    // table in the tiling header, which is where the host gets the byte
+    // count it declares at launch.
+    //
+    // The allocator is a function local, not a member: as a member its
+    // inline constructor must be emitted from the enclosing class's ctor,
+    // and on CANN 9.2.0-beta.2 that constructor has no definition the normal
+    // include path reaches (-Wundefined-inline). head_ starts at 0 per
+    // instance, and every allocation happens here, so a local is equivalent.
+    LocalMemAllocator<> alloc;
+    kvCur_ = alloc.Alloc<float>(kKvCurRegionFloats);
+    gateCur_ = alloc.Alloc<float>(kGateCurRegionFloats);
+    prevKvA_ = alloc.Alloc<float>(kPrevARegionFloats);
+    prevGateA_ = alloc.Alloc<float>(kPrevARegionFloats);
+    apeF32_ = alloc.Alloc<float>(kRatio * kStateWidth);
+    normWF32_ = alloc.Alloc<float>(kHeadDim);
+    ropeCos_ = alloc.Alloc<float>(kRopeHeadDim);
+    ropeSin_ = alloc.Alloc<float>(kRopeHeadDim);
+    outF32_ = alloc.Alloc<float>(kHeadDim);
+    reduce_ = alloc.Alloc<float>(kReduceSlackFloats);
   }
 
   __aicore__ inline void Process() {
@@ -281,11 +310,9 @@ class PagedCompressorRope {
         const_cast<__gm__ std::uint16_t*>(
             reinterpret_cast<const __gm__ std::uint16_t*>(
                 wgateGm_.GetPhyAddr())),
-        reinterpret_cast<__ubuf__ float*>(apeBuf_.Get<float>().GetPhyAddr()),
-        slot,
-        reinterpret_cast<__ubuf__ float*>(kvCurBuf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            gateCurBuf_.Get<float>().GetPhyAddr()));
+        reinterpret_cast<__ubuf__ float*>(apeF32_.GetPhyAddr()), slot,
+        reinterpret_cast<__ubuf__ float*>(kvCur_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(gateCur_.GetPhyAddr()));
     DataSyncBarrier<MemDsbT::ALL>();
 
     if (slot != kRatio - 1u) {
@@ -299,28 +326,21 @@ class PagedCompressorRope {
     // EMIT: the eight-row window, softmax, reduction, norm, RoPE, roll.
     asc_vf_call<CompressorEmitSimt>(
         dim3(kSimtThreads),
-        reinterpret_cast<__ubuf__ float*>(kvCurBuf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            gateCurBuf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            prevKvABuf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            prevGateABuf_.Get<float>().GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(kvCur_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(gateCur_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(prevKvA_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(prevGateA_.GetPhyAddr()),
         have_previous,
-        reinterpret_cast<__ubuf__ float*>(
-            normWF32Buf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            ropeCosBuf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            ropeSinBuf_.Get<float>().GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(normWF32_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(ropeCos_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(ropeSin_.GetPhyAddr()),
         norm_eps_,
-        reinterpret_cast<__ubuf__ float*>(outF32Buf_.Get<float>().GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(reduceBuf_.Get<float>().GetPhyAddr()));
+        reinterpret_cast<__ubuf__ float*>(outF32_.GetPhyAddr()),
+        reinterpret_cast<__ubuf__ float*>(reduce_.GetPhyAddr()));
     DataSyncBarrier<MemDsbT::ALL>();
 
-    auto outF32 = outF32Buf_.Get<float>();
     auto outBf16 = outBf16Buf_.Get<bfloat16_t>();
-    Cast(outBf16, outF32, RoundMode::CAST_RINT, kHeadDim);
+    Cast(outBf16, outF32_, RoundMode::CAST_RINT, kHeadDim);
     SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
     DataCopy(cacheSlotGm_, outBf16, kHeadDim);
@@ -338,52 +358,57 @@ class PagedCompressorRope {
     SetFlag<HardEvent::MTE3_MTE2>(kEvMte3ToMte2);
     WaitFlag<HardEvent::MTE3_MTE2>(kEvMte3ToMte2);
 
-    DataCopy(kvCurBuf_.Get<float>(), stateKvGm_, kKvCurRegionFloats);
-    DataCopy(gateCurBuf_.Get<float>(), stateGateGm_, kGateCurRegionFloats);
-    DataCopy(prevKvABuf_.Get<float>(), statePrevKvGm_, kPrevARegionFloats);
-    DataCopy(prevGateABuf_.Get<float>(), statePrevGateGm_, kPrevARegionFloats);
-    DataCopy(apeBuf_.Get<float>(), apeGm_,
+    // A LocalMemAllocator LocalTensor is an ordinary UB tensor as far as the
+    // SIMD side is concerned, so one allocation serves both the DataCopy here
+    // and the SIMT VF that dereferences it -- no separate staging copy.
+    DataCopy(kvCur_, stateKvGm_, kKvCurRegionFloats);
+    DataCopy(gateCur_, stateGateGm_, kGateCurRegionFloats);
+    DataCopy(prevKvA_, statePrevKvGm_, kPrevARegionFloats);
+    DataCopy(prevGateA_, statePrevGateGm_, kPrevARegionFloats);
+    DataCopy(apeF32_, apeGm_,
              kRatio * kStateWidth);  // the [4,1024] ape block, resident
     DataCopy(normWBf16Buf_.Get<bfloat16_t>(), normWGm_, kHeadDim);
-    DataCopy(ropeCosBuf_.Get<float>(), ropeCosGm_, kRopeHeadDim);
-    DataCopy(ropeSinBuf_.Get<float>(), ropeSinGm_, kRopeHeadDim);
+    DataCopy(ropeCos_, ropeCosGm_, kRopeHeadDim);
+    DataCopy(ropeSin_, ropeSinGm_, kRopeHeadDim);
     SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
     // The widened norm gain is consumed by the emit launch.
-    Cast(normWF32Buf_.Get<float>(), normWBf16Buf_.Get<bfloat16_t>(),
-         RoundMode::CAST_NONE, kHeadDim);
+    Cast(normWF32_, normWBf16Buf_.Get<bfloat16_t>(), RoundMode::CAST_NONE,
+         kHeadDim);
   }
 
   __aicore__ inline void WritebackRegions(bool with_previous) {
     // WAR guard: every state MTE2 read must drain before the MTE3 writeback.
     SetFlag<HardEvent::MTE2_MTE3>(kEvMte2ToMte3);
     WaitFlag<HardEvent::MTE2_MTE3>(kEvMte2ToMte3);
-    DataCopy(stateKvGm_, kvCurBuf_.Get<float>(), kKvCurRegionFloats);
-    DataCopy(stateGateGm_, gateCurBuf_.Get<float>(), kGateCurRegionFloats);
+    DataCopy(stateKvGm_, kvCur_, kKvCurRegionFloats);
+    DataCopy(stateGateGm_, gateCur_, kGateCurRegionFloats);
     if (with_previous) {
-      DataCopy(statePrevKvGm_, prevKvABuf_.Get<float>(), kPrevARegionFloats);
-      DataCopy(statePrevGateGm_, prevGateABuf_.Get<float>(),
-               kPrevARegionFloats);
+      DataCopy(statePrevKvGm_, prevKvA_, kPrevARegionFloats);
+      DataCopy(statePrevGateGm_, prevGateA_, kPrevARegionFloats);
     }
   }
 
   std::uint32_t step_;
   float norm_eps_;
 
+  // Static region: SIMD-private BF16 staging only.
   TPipe pipe_;
-  TBuf<> kvCurBuf_;
-  TBuf<> gateCurBuf_;
-  TBuf<> prevKvABuf_;
-  TBuf<> prevGateABuf_;
-  TBuf<> apeBuf_;
-  TBuf<> outF32Buf_;
   TBuf<> normWBf16Buf_;
-  TBuf<> normWF32Buf_;
-  TBuf<> ropeCosBuf_;
-  TBuf<> ropeSinBuf_;
   TBuf<> outBf16Buf_;
-  TBuf<> reduceBuf_;
-  TBuf<> scalarBuf_;
+
+  // Dynamic region: every buffer a SIMT VF dereferences. Allocated in Init()
+  // in the order the tiling header documents.
+  LocalTensor<float> kvCur_;
+  LocalTensor<float> gateCur_;
+  LocalTensor<float> prevKvA_;
+  LocalTensor<float> prevGateA_;
+  LocalTensor<float> apeF32_;
+  LocalTensor<float> normWF32_;
+  LocalTensor<float> ropeCos_;
+  LocalTensor<float> ropeSin_;
+  LocalTensor<float> outF32_;
+  LocalTensor<float> reduce_;
 
   GlobalTensor<bfloat16_t> xGm_;
   GlobalTensor<bfloat16_t> wkvGm_;

@@ -61,7 +61,23 @@ Status LaunchPagedCompressorRope(
     return staged;
   }
 
-  paged_compressor_rope<<<tiling.block_dim, nullptr, stream>>>(
+  // The second chevron slot is dyn_ub_size (uint32 BYTES), not an l2ctrl
+  // pointer: the 950PR hybrid launch is
+  // kernel<<<block_num, dyn_ub_size, stream>>>. This kernel hands ten UB
+  // pointers to two SIMT VFs, and all ten now come from the dynamic region,
+  // so the size has to be declared here. Passing nullptr -- which is what
+  // this call did -- declares ZERO dynamic bytes, which put every SIMT UB
+  // access outside the reserved window and faulted on device with
+  // aclError=507035 (ACL_ERROR_RT_VECTOR_CORE_EXCEPTION) at step 0.
+  //
+  // CLAUDE.md section 3.1 prescribes nullptr for this slot; the dynamic-UB
+  // argument is the granted exception, and it is the same exception
+  // mxfp4_expert_gemv, fused_mhc_pre_norm_sinkhorn and fast_fp8_indexer_topk
+  // already rely on -- those three declare a real size and run on hardware,
+  // this one did not and did not. The byte count is a compile-time constant
+  // shared with the kernel's UB layout, so the ceiling is enforced by
+  // static_assert in the tiling header rather than branched on here.
+  paged_compressor_rope<<<tiling.block_dim, kCompressorDynUbBytes, stream>>>(
       detail::Gm(x_gm), detail::Gm(wkv_gm), detail::Gm(wgate_gm),
       detail::Gm(ape_gm), detail::Gm(norm_weight_gm), detail::Gm(rope_cos_gm),
       detail::Gm(rope_sin_gm), detail::Gm(state_gm),
