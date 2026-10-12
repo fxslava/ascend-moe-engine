@@ -19,8 +19,26 @@ set(_custom_kernel_binaries
   bench_custom_kernels_performance
 )
 
+# Exactly one RunDeviceCases() implementation is compiled in. The real one
+# needs the BiSheng-built launch layer; the stub reports every device case as
+# skipped so the two builds print the same section.
+if(TARGET arch35_device_launch)
+  set(_device_cases_src device_cases.cpp)
+else()
+  set(_device_cases_src device_cases_stub.cpp)
+endif()
+
 foreach(_bin IN LISTS _custom_kernel_binaries)
-  add_executable(${_bin} "${_bin}.cpp")
+  if(_bin STREQUAL "test_custom_kernels_verification")
+    add_executable(${_bin} "${_bin}.cpp" "${_device_cases_src}")
+    if(TARGET arch35_device_launch)
+      # Carries MOE_KERNEL_LAUNCH_LAYER_AVAILABLE, the CANN include dirs and
+      # the AscendCL link interface.
+      target_link_libraries(${_bin} PRIVATE arch35_device_launch)
+    endif()
+  else()
+    add_executable(${_bin} "${_bin}.cpp")
+  endif()
   target_link_libraries(${_bin} PRIVATE moe_emu)
   target_include_directories(${_bin} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(${_bin} PRIVATE ${MOE_EMU_WARNINGS})

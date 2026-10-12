@@ -21,6 +21,7 @@
 // This binary never loads a host CPU debug runtime (cpudebug / tikicpulib).
 // -----------------------------------------------------------------------------
 
+#include "device_cases.hpp"
 #include "kernel_test_harness.hpp"
 
 #include "moe/emu/cpu_kernels.h"
@@ -613,37 +614,6 @@ void VerifyMetrics(Report& rep) {
   rep.check(Bf16ToFp32(Fp32ToBf16(v)) == v, "BF16 rounding is idempotent");
 }
 
-// ===========================================================================
-// 6. On-device comparisons
-//
-// The actual kernel-vs-golden diffs. Reported as SKIP, with the reason, until
-// the Launch* layer exists -- never as a pass.
-// ===========================================================================
-void VerifyAgainstDevice(Report& rep) {
-  section("device: kernel output vs in-memory golden");
-
-  if (!kDeviceLaunchLayerAvailable) {
-    for (const char* k : {"fused_mhc_pre_norm_sinkhorn",
-                          "fused_mhc_post_residual",
-                          "paged_compressor_rope",
-                          "fast_fp8_indexer_topk",
-                          "mxfp4_expert_gemv"}) {
-      rep.skip(std::string(k) + ": device output vs golden",
-               DeviceUnavailableReason());
-    }
-    return;
-  }
-
-  // When the Launch* wrappers land, each case belongs here: allocate device
-  // buffers, launch with the tiling struct from
-  // include/moe/kernels/arch35/tiling_data.hpp, read back, and assert
-  // CosineSimilarity >= kCosineFloor && RelativeL2 <= kRelL2Ceiling against the
-  // golden computed above -- plus BirkhoffCheck on the Birkhoff output of
-  // fused_mhc_pre_norm_sinkhorn.
-  rep.skip("device comparisons",
-           "launch layer reported available but no cases are wired yet");
-}
-
 }  // namespace
 
 int main() {
@@ -657,7 +627,7 @@ int main() {
   VerifyMhcPostStructure(rep);
   VerifyIndexerEdgeCases(rep);
   VerifyMxfp4Gemv(rep);
-  VerifyAgainstDevice(rep);
+  RunDeviceCases(rep);
 
   std::printf("\n---------------------------------------------------------\n");
   std::printf("checks: %d   failures: %d   skipped: %d\n", rep.checks,

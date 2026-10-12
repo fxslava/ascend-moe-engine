@@ -88,6 +88,15 @@ option(ENABLE_MOCK_RUNTIME "Build against the zero-allocation symbolic mock runt
 # below (see the block after project()), so the tree builds with nothing but a
 # host compiler and links no toolkit library at all.
 option(ENABLE_HOST_EMU "Build only the standalone host CPU emulation layer (no CANN)" OFF)
+# ENABLE_ARCH35_DEVICE_LAUNCH: build the five arch35 kernels and the host
+# launch layer with BiSheng and link AscendCL, which turns on the device
+# comparison cases in test_custom_kernels_verification. Needs a CANN 9.2
+# toolkit (ASCEND_HOME_PATH) and BiSheng, but NOT a physical NPU: without a
+# device the cases skip at runtime. See cmake/arch35_device.cmake.
+option(ENABLE_ARCH35_DEVICE_LAUNCH
+       "Build the arch35 device kernels + host launch layer with BiSheng" OFF)
+set(ARCH35_NPU_ARCH "dav-3510" CACHE STRING
+    "Target NPU architecture for the arch35 kernels (BiSheng --npu-arch)")
 
 if(DSV4_USE_BISHENG AND NOT CMAKE_CXX_COMPILER)
   set(_moe_toolkit "$ENV{ASCEND_HOME_PATH}")
@@ -198,6 +207,12 @@ if(ENABLE_HOST_EMU)
   # The two custom-kernel binaries need nothing but moe_emu, so they are
   # available in this host-only mode as well as in a full CANN build. This is
   # the mode in which they can actually be run without a device.
+  #
+  # The device launch layer is optional even here: it needs BiSheng, not an
+  # NPU, so it can be built alongside the host emulation for a build check.
+  if(ENABLE_ARCH35_DEVICE_LAUNCH)
+    include("${CMAKE_SOURCE_DIR}/cmake/arch35_device.cmake")
+  endif()
   add_subdirectory(tests/custom_kernels)
 
   # The standalone claim, verified against the artifacts. `ldd` on the bench
@@ -466,6 +481,9 @@ set_target_properties(moe_runner PROPERTIES
 )
 
 enable_testing()
+if(ENABLE_ARCH35_DEVICE_LAUNCH)
+  include("${CMAKE_SOURCE_DIR}/cmake/arch35_device.cmake")
+endif()
 add_subdirectory(tests)
 if(NOT ENABLE_MOCK_RUNTIME)
   # -----------------------------------------------------------------------------
