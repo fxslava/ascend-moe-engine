@@ -11,25 +11,40 @@
 //   * every geometry reports mean, stddev, min and p50 so a single outlier is
 //     visible rather than averaged away.
 //
-// Device benchmarking needs the Launch* host wrappers, which are specified in
-// docs/kernel_contracts_spec.md but not implemented in the tree. Until they
-// land this binary measures the CPU reference instead, which is useful on its
-// own: it is the roofline the kernel is beating, and it exercises the timing
-// harness so the numbers are trustworthy the day the device path appears.
-// Each device row is reported as unavailable rather than silently omitted.
+// Device benchmarking goes through the Launch* host wrappers. Those now
+// exist, so this binary measures real hardware when an NPU is visible:
+// mxfp4_expert_gemv and fast_fp8_indexer_topk are wired, and the stream is
+// synchronized inside the timed region (see TimedLaunch -- a chevron dispatch
+// is asynchronous, so timing the launch call alone measures enqueue cost).
+// The other three kernels still print an explicit not-wired row.
+//
+// The host-reference figures are kept alongside, and are NOT comparable to the
+// device rows: they are the roofline the kernel is beating.
+//
+// This file previously stated that the Launch* wrappers were "specified in
+// docs/kernel_contracts_spec.md but not implemented in the tree", which stopped
+// being true once the launch layer landed -- and that stale comment is why the
+// benchmark went on quietly reporting every device row as unavailable.
 //
 // This binary never loads a host CPU debug runtime (cpudebug / tikicpulib).
 // -----------------------------------------------------------------------------
 
 #include "kernel_test_harness.hpp"
 
+#include "device_session.hpp"
+
 #include "moe/emu/cpu_kernels.h"
 #include "moe/emu/dsv4_layers.h"
+
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+#include "moe/kernels/arch35/launch.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <functional>
 #include <numeric>
+#include <string>
 
 namespace {
 
@@ -99,9 +114,284 @@ void Row(const std::string& geometry, const Timing& t, double bytes,
               t.mean_us, t.stddev_us, t.min_us, gbs, gflops);
 }
 
-void DeviceRowUnavailable(const char* kernel) {
+// ---------------------------------------------------------------------------
+// Device context
+// ---------------------------------------------------------------------------
+// Opened once in main(). Three states, kept apart on purpose:
+//   * not linked against the launch layer  -> DeviceUnavailableReason()
+//   * linked, but no NPU on this host      -> session's own reason
+//   * linked and a device is open          -> measure
+// A benchmark is never a correctness gate (CLAUDE.md section 4.6), so none of
+// these is a failure: the unmeasured rows say so and the binary still exits 0.
+struct DeviceCtx {
+  bool usable = false;
+  std::string reason = DeviceUnavailableReason();
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  moe::kerntest::device::AclSession session;
+  aclrtStream stream = nullptr;
+#endif
+};
+
+void DeviceRowUnavailable(const char* kernel, const DeviceCtx& ctx) {
   std::printf("  [device] %s: NOT MEASURED -- %s\n", kernel,
-              DeviceUnavailableReason());
+              ctx.reason.c_str());
+}
+
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+
+using moe::kerntest::device::AclFail;
+using moe::kerntest::device::DeviceBuffer;
+using moe::kerntest::device::OpenResult;
+
+// A launch plus the synchronize that makes it mean something.
+//
+// This is the one thing a device benchmark must not get wrong: a chevron
+// dispatch is asynchronous and returns void (CLAUDE.md section 3.5), so timing
+// the Launch* call alone measures enqueue cost and would report a kernel as
+// orders of magnitude faster than it is. The stream is synchronized INSIDE the
+// timed region; buffer allocation and H2D stay outside it.
+//
+// Returns false on the first failure, with `why` set, so a broken device path
+// is reported rather than silently producing a plausible number.
+bool TimedLaunch(const std::function<moe::kernels::arch35::Status()>& launch,
+                 aclrtStream stream, int warmup, int iters, Timing* out,
+                 std::string* why) {
+  using moe::kernels::arch35::Status;
+  bool ok = true;
+  const auto one = [&] {
+    if (!ok) return;
+    const Status st = launch();
+    if (st != Status::success) {
+      // Every ACL failure inside a wrapper is recorded (CLAUDE.md section
+      // 3.5), so report the record rather than just the Status -- otherwise a
+      // tiling malloc, a bad grid and a device fault all read the same.
+      const auto& f = moe::kernels::arch35::LastLaunchFailure();
+      *why = "launch returned Status=" +
+             std::to_string(static_cast<unsigned>(st)) + " [op=" +
+             std::string(f.op != nullptr ? f.op : "-") + ", call=" +
+             std::string(f.call != nullptr ? f.call : "-") +
+             ", aclError=" + std::to_string(f.acl_error) + "]";
+      ok = false;
+      return;
+    }
+    const aclError rc = aclrtSynchronizeStream(stream);
+    if (rc != ACL_SUCCESS) {
+      *why = AclFail("aclrtSynchronizeStream", rc);
+      ok = false;
+    }
+  };
+  *out = Measure(warmup, iters, one);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// device: mxfp4_expert_gemv
+//
+// 32 AIVs, grid-stride over 32-row tiles. Operand traffic is the packed
+// weights plus x plus y; the weights dominate and are read exactly once, so
+// GB/s here is the figure that matters -- this kernel is bandwidth-bound and
+// the host roofline above is not comparable to it.
+// ---------------------------------------------------------------------------
+void BenchMxfp4GemvDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  // The tiling contract admits exactly these two shapes.
+  struct Shape {
+    std::uint32_t rows;
+    std::uint32_t cols;
+  };
+  for (const Shape s : {Shape{2048u, 4096u}, Shape{4096u, 2048u}}) {
+    constexpr std::uint32_t kGroup = 32;
+    const std::size_t packed_bytes =
+        static_cast<std::size_t>(s.rows) * (s.cols / 2);
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>(s.rows) * (s.cols / kGroup);
+
+    Rng rng(0xB4F4ULL + s.rows);
+    const std::vector<std::uint8_t> packed = rng.bytes(packed_bytes);
+    const std::vector<std::uint8_t> scale = rng.bytes(scale_bytes, 120, 134);
+    const std::vector<float> x = rng.normal(s.cols);
+
+    DeviceBuffer d_packed, d_scale, d_x, d_y;
+    aclError rc = d_packed.Alloc(packed_bytes);
+    if (rc == ACL_SUCCESS) rc = d_scale.Alloc(scale_bytes);
+    if (rc == ACL_SUCCESS) rc = d_x.Alloc(s.cols * sizeof(float));
+    if (rc == ACL_SUCCESS) rc = d_y.Alloc(s.rows * sizeof(float));
+    if (rc == ACL_SUCCESS) rc = d_packed.Upload(packed.data(), packed_bytes);
+    if (rc == ACL_SUCCESS) rc = d_scale.Upload(scale.data(), scale_bytes);
+    if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), s.cols * sizeof(float));
+    if (rc == ACL_SUCCESS) rc = d_y.Zero();
+    if (rc != ACL_SUCCESS) {
+      std::printf("  [device] setup failed: %s\n",
+                  AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+      return;
+    }
+
+    Timing t;
+    std::string why;
+    const bool ok = TimedLaunch(
+        [&] {
+          return LaunchMxfp4ExpertGemv(
+              d_packed.as<Mxfp4Pair>(), s.cols / 2, d_scale.as<E8M0>(),
+              s.cols / kGroup, d_x.as<float>(), s.rows, s.cols,
+              d_y.as<float>(), nullptr, kMxfp4GemvWorkspaceBytes, ctx.stream);
+        },
+        ctx.stream, warmup, iters, &t, &why);
+    if (!ok) {
+      std::printf("  [device] %ux%u: FAILED -- %s\n", s.rows, s.cols,
+                  why.c_str());
+      continue;
+    }
+
+    // One pass over the weights and scales, plus x in and y out.
+    const double bytes = static_cast<double>(packed_bytes + scale_bytes) +
+                         static_cast<double>(s.cols) * 4.0 +
+                         static_cast<double>(s.rows) * 4.0;
+    // rows*cols multiply-adds.
+    const double flops =
+        2.0 * static_cast<double>(s.rows) * static_cast<double>(s.cols);
+    char geo[64];
+    std::snprintf(geo, sizeof(geo), "[device] %ux%u", s.rows, s.cols);
+    Row(geo, t, bytes, flops);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// device: fast_fp8_indexer_topk
+//
+// Single AIV. Traffic is the key cache (seq_len x 128 FP8 bytes) read once
+// per call, which is what the warp-per-key scoring streams through the SIMT
+// DataCache; the 66-stage selection network is compute, not traffic.
+// ---------------------------------------------------------------------------
+void BenchIndexerDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  constexpr std::uint32_t kHeads = 64;
+  constexpr std::uint32_t kHeadDim = 128;
+  constexpr std::uint32_t kTopK = 512;
+  constexpr std::uint32_t kBlockSize = 128;
+
+  for (const std::uint32_t seq_len : {512u, 1024u, 2048u}) {
+    const std::uint32_t blocks = (seq_len + kBlockSize - 1) / kBlockSize;
+    const std::size_t query_bytes =
+        static_cast<std::size_t>(kHeads) * kHeadDim;
+    const std::size_t cache_bytes =
+        static_cast<std::size_t>(blocks) * kBlockSize * kHeadDim;
+    const std::size_t scales_count = kHeads + seq_len;
+
+    Rng rng(0xF8DEULL + seq_len);
+    const std::vector<std::uint8_t> query = rng.bytes(query_bytes, 56, 72);
+    const std::vector<std::uint8_t> cache = rng.bytes(cache_bytes, 56, 72);
+    const std::vector<float> scales = rng.normal(scales_count, 1.0F, 0.1F);
+    std::vector<std::int32_t> table(blocks);
+    for (std::uint32_t i = 0; i < blocks; ++i) {
+      table[i] = static_cast<std::int32_t>(i);
+    }
+
+    const std::size_t ws_bytes = Fp8IndexerWorkspaceBytes(seq_len);
+
+    DeviceBuffer d_q, d_cache, d_scales, d_table, d_idx, d_ws;
+    aclError rc = d_q.Alloc(query_bytes);
+    if (rc == ACL_SUCCESS) rc = d_cache.Alloc(cache_bytes);
+    if (rc == ACL_SUCCESS) rc = d_scales.Alloc(scales_count * sizeof(float));
+    if (rc == ACL_SUCCESS) {
+      rc = d_table.Alloc(blocks * sizeof(std::int32_t));
+    }
+    if (rc == ACL_SUCCESS) rc = d_idx.Alloc(kTopK * sizeof(std::int32_t));
+    if (rc == ACL_SUCCESS) rc = d_ws.Alloc(ws_bytes);
+    if (rc == ACL_SUCCESS) rc = d_q.Upload(query.data(), query_bytes);
+    if (rc == ACL_SUCCESS) rc = d_cache.Upload(cache.data(), cache_bytes);
+    if (rc == ACL_SUCCESS) {
+      rc = d_scales.Upload(scales.data(), scales_count * sizeof(float));
+    }
+    if (rc == ACL_SUCCESS) {
+      rc = d_table.Upload(table.data(), blocks * sizeof(std::int32_t));
+    }
+    if (rc == ACL_SUCCESS) rc = d_idx.Zero();
+    if (rc != ACL_SUCCESS) {
+      std::printf("  [device] setup failed: %s\n",
+                  AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+      return;
+    }
+
+    Timing t;
+    std::string why;
+    const bool ok = TimedLaunch(
+        [&] {
+          return LaunchFp8IndexerTopK(
+              d_q.as<Fp8E4M3>(), kHeadDim, d_cache.as<Fp8E4M3>(),
+              kBlockSize * kHeadDim, d_scales.as<float>(),
+              d_table.as<std::int32_t>(), blocks, blocks, kBlockSize, seq_len,
+              d_idx.as<std::int32_t>(), d_ws.get(), ws_bytes, ctx.stream);
+        },
+        ctx.stream, warmup, iters, &t, &why);
+    if (!ok) {
+      std::printf("  [device] seq_len=%u: FAILED -- %s\n", seq_len,
+                  why.c_str());
+      continue;
+    }
+
+    // Key cache read once, plus the query, the scales and the index output.
+    const double bytes = static_cast<double>(cache_bytes + query_bytes) +
+                         static_cast<double>(scales_count) * 4.0 +
+                         static_cast<double>(kTopK) * 4.0;
+    // heads * head_dim multiply-adds per key, plus the weighted reduction.
+    const double flops = 2.0 * static_cast<double>(seq_len) *
+                         static_cast<double>(kHeads) *
+                         static_cast<double>(kHeadDim);
+    char geo[64];
+    std::snprintf(geo, sizeof(geo), "[device] seq_len %u, top-%u", seq_len,
+                  kTopK);
+    Row(geo, t, bytes, flops);
+  }
+}
+
+#endif  // MOE_KERNEL_LAUNCH_LAYER_AVAILABLE
+
+// ---------------------------------------------------------------------------
+// Device dispatchers
+// ---------------------------------------------------------------------------
+// Always defined so the host sections can call them unconditionally; each one
+// either measures or prints why it did not. The two wired kernels are the ones
+// whose operand set is self-contained: mxfp4_expert_gemv (32 AIVs,
+// bandwidth-bound) and fast_fp8_indexer_topk (single AIV, paged key cache).
+void DeviceSectionMxfp4(const DeviceCtx& ctx, int warmup, int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchMxfp4GemvDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("mxfp4_expert_gemv", ctx);
+}
+
+void DeviceSectionIndexer(const DeviceCtx& ctx, int warmup, int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchIndexerDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("fast_fp8_indexer_topk", ctx);
+}
+
+// The remaining three are not wired to the device yet. Said plainly rather
+// than reported as a missing device, so the row does not blame the host for a
+// gap in this harness.
+void DeviceSectionNotWired(const char* kernel, const DeviceCtx& ctx) {
+  if (ctx.usable) {
+    std::printf("  [device] %s: NOT MEASURED -- a device is open, but this "
+                "kernel's operand setup is not wired into the benchmark yet\n",
+                kernel);
+    return;
+  }
+  DeviceRowUnavailable(kernel, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +400,7 @@ void DeviceRowUnavailable(const char* kernel) {
 // The Sinkhorn solve alone, across iteration counts, since that is the part
 // the kernel keeps entirely in registers across 16 SIMT threads.
 // ---------------------------------------------------------------------------
-void BenchSinkhorn(int warmup, int iters) {
+void BenchSinkhorn(const DeviceCtx& ctx, int warmup, int iters) {
   Header("fused_mhc_pre_norm_sinkhorn (host reference: Sinkhorn solve)");
 
   for (const int n_iters : {5, 10, 20, 40}) {
@@ -130,7 +420,7 @@ void BenchSinkhorn(int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "4x4, %d iters", n_iters);
     Row(geo, t, bytes, flops);
   }
-  DeviceRowUnavailable("fused_mhc_pre_norm_sinkhorn");
+  DeviceSectionNotWired("fused_mhc_pre_norm_sinkhorn", ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +434,7 @@ void BenchSinkhorn(int warmup, int iters) {
 // TOKENS per step -- one 4x4096 post-mix per token, which is the axis that
 // actually varies at decode time.
 // ---------------------------------------------------------------------------
-void BenchMhcPost(int warmup, int iters) {
+void BenchMhcPost(const DeviceCtx& ctx, int warmup, int iters) {
   Header("fused_mhc_post_residual (host reference: 4-stream post-mix)");
 
   constexpr int kStreams = moe::emu::kHcStreams;   // 4, fixed by the reference
@@ -194,7 +484,7 @@ void BenchMhcPost(int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "%d tok x %dx%d", tokens, kStreams, kHidden);
     Row(geo, t, bytes, flops);
   }
-  DeviceRowUnavailable("fused_mhc_post_residual");
+  DeviceSectionNotWired("fused_mhc_post_residual", ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +492,7 @@ void BenchMhcPost(int warmup, int iters) {
 //
 // Scales with sequence length; the scoring half dominates.
 // ---------------------------------------------------------------------------
-void BenchIndexer(int warmup, int iters) {
+void BenchIndexer(const DeviceCtx& ctx, int warmup, int iters) {
   Header("fast_fp8_indexer_topk (host reference: score + select)");
 
   constexpr int kHeads = moe::emu::kIndexerHeads;
@@ -239,7 +529,7 @@ void BenchIndexer(int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "seq %d, top_k %d", seq_len, top_k);
     Row(geo, t, bytes, flops);
   }
-  DeviceRowUnavailable("fast_fp8_indexer_topk");
+  DeviceSectionIndexer(ctx, warmup, iters);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +537,7 @@ void BenchIndexer(int warmup, int iters) {
 //
 // The contract geometries: 2048x4096 and 4096x2048.
 // ---------------------------------------------------------------------------
-void BenchMxfp4Gemv(int warmup, int iters) {
+void BenchMxfp4Gemv(const DeviceCtx& ctx, int warmup, int iters) {
   Header("mxfp4_expert_gemv (host reference: MXFP4 GEMV)");
 
   constexpr int kGroup = moe::emu::kMxfp4GroupSize;
@@ -283,7 +573,7 @@ void BenchMxfp4Gemv(int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "%d x %d", rows, cols);
     Row(geo, t, bytes, flops);
   }
-  DeviceRowUnavailable("mxfp4_expert_gemv");
+  DeviceSectionMxfp4(ctx, warmup, iters);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,12 +583,12 @@ void BenchMxfp4Gemv(int warmup, int iters) {
 // steps), so a meaningful figure needs the full group of 4 steps driven in
 // order. Left to the device path rather than approximated here.
 // ---------------------------------------------------------------------------
-void BenchPagedCompressor() {
+void BenchPagedCompressor(const DeviceCtx& ctx) {
   Header("paged_compressor_rope");
   std::printf("  [host]   not benchmarked: the decode cadence is stateful "
               "across a 4-step group;\n           a per-call figure would "
               "misrepresent the hold/emit asymmetry.\n");
-  DeviceRowUnavailable("paged_compressor_rope");
+  DeviceSectionNotWired("paged_compressor_rope", ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,15 +598,30 @@ void BenchPagedCompressor() {
 // efficiency. There is no device here, so state the intent rather than print
 // a host number dressed up as a hardware figure.
 // ---------------------------------------------------------------------------
-void ReportScaling() {
+void ReportScaling(const DeviceCtx& ctx) {
   std::printf("\n=== AIV scaling efficiency ===\n");
-  if (!kDeviceLaunchLayerAvailable) {
-    std::printf("  NOT MEASURED -- %s\n", DeviceUnavailableReason());
-    std::printf("  When wired: sweep block_dim over the kernel's supported core\n"
-                "  counts (1 for the single-AIV kernels, 4 for\n"
-                "  fused_mhc_post_residual, 32 for mxfp4_expert_gemv) and report\n"
-                "  t(1)/(N*t(N)) per geometry.\n");
+  if (!ctx.usable) {
+    std::printf("  NOT MEASURED -- %s\n", ctx.reason.c_str());
+    return;
   }
+  // Not measurable as the comment above once described, and the reason is a
+  // contract fact rather than a missing feature: each kernel's block_dim is
+  // PINNED by its tiling, and the device-side entry gate rejects any other
+  // value outright -- mxfp4_expert_gemv requires block_dim == 32, the
+  // single-AIV kernels require 1. A launch with a swept block_dim therefore
+  // does not run a smaller grid, it returns early and computes nothing, which
+  // would time as a near-instant "perfectly scaling" kernel.
+  //
+  // Measuring t(N) honestly needs MakeMxfp4GemvTiling to accept a caller
+  // block_dim and the kernel gate to accept it with it, i.e. an ABI change.
+  // Printing nothing is better than printing a number that measures an early
+  // return.
+  std::printf("  NOT MEASURED -- block_dim is fixed by each kernel's tiling\n"
+              "  contract (32 for mxfp4_expert_gemv, 1 for the single-AIV\n"
+              "  kernels) and the device entry gate rejects any other value,\n"
+              "  so a block_dim sweep would time early returns rather than\n"
+              "  smaller grids. A real sweep needs the tiling builder and the\n"
+              "  kernel gate to take block_dim as a parameter.\n");
 }
 
 }  // namespace
@@ -336,12 +641,37 @@ int main(int argc, char** argv) {
   std::printf("  NOTE: host-reference figures are a roofline baseline, NOT "
               "device numbers.\n");
 
-  BenchSinkhorn(warmup, iters);
-  BenchMhcPost(warmup, iters);
-  BenchIndexer(warmup, iters);
-  BenchMxfp4Gemv(warmup, iters);
-  BenchPagedCompressor();
-  ReportScaling();
+  // Open the device once. A benchmark is never a gate (CLAUDE.md section
+  // 4.6), so neither "no NPU" nor a bring-up failure is fatal here -- both
+  // just mean the device rows say why they are empty. The two are still kept
+  // apart in the printed reason.
+  DeviceCtx ctx;
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  {
+    std::string why;
+    const OpenResult res = ctx.session.Open(&why);
+    if (res == OpenResult::kOk) {
+      ctx.usable = true;
+      ctx.stream = ctx.session.stream();
+      std::printf("  device: %u NPU(s) visible, measuring on device 0\n",
+                  ctx.session.device_count());
+    } else {
+      ctx.reason = (res == OpenResult::kNoDevice ? "no NPU on this host: "
+                                                 : "device bring-up FAILED: ") +
+                   why;
+      std::printf("  device: %s\n", ctx.reason.c_str());
+    }
+  }
+#else
+  std::printf("  device: %s\n", ctx.reason.c_str());
+#endif
+
+  BenchSinkhorn(ctx, warmup, iters);
+  BenchMhcPost(ctx, warmup, iters);
+  BenchIndexer(ctx, warmup, iters);
+  BenchMxfp4Gemv(ctx, warmup, iters);
+  BenchPagedCompressor(ctx);
+  ReportScaling(ctx);
 
   std::printf("\nDone.\n");
   return 0;
