@@ -57,8 +57,14 @@ Status LaunchMxfp4ExpertGemv(
   // of 0 -- which is what passing nullptr here amounted to -- leaves the SIMT
   // VF addressing a region the launch never reserved. CLAUDE.md section 3.1
   // prescribes nullptr for this slot; the user granted an explicit exception
-  // for the dynamic-UB argument. This is a PROBE for hardware error 341 and
-  // has not been validated on a device.
+  // for the dynamic-UB argument.
+  //
+  // This started as a probe for hardware error 341. It is no longer a probe:
+  // this kernel has since run on a 950PR at ~208 us for the contract
+  // geometries, and paged_compressor_rope -- the one kernel that kept
+  // nullptr here while handing UB pointers to a SIMT VF -- faulted on device
+  // with aclError=507035 until it was given a real dyn_ub_size. Declaring the
+  // dynamic region is load-bearing, not precautionary.
   const std::uint64_t dyn_ub_bytes = Mxfp4DynUbBytes(tiling.cols);
   if (dyn_ub_bytes > kMxfp4DynUbCeilingBytes) {
     // Geometry this UB envelope cannot host, not a caller mistake (section
