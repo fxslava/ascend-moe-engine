@@ -18,7 +18,6 @@ import heapq
 import math
 from pathlib import Path
 import random
-import resource
 import time
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -97,6 +96,11 @@ class PackedBatch:
     scales_f32: "np.ndarray"
     lloyd_indices_packed: "np.ndarray"
     lattice_codewords_i16: "np.ndarray"
+    # Logical width of one encoded row. Defaults to the 128-lane probe geometry
+    # so the original callers are unchanged; the MLA benchmark encodes 512-lane
+    # latents through the same codec and must carry its own width here, because
+    # decode cannot recover it from the packed payload alone.
+    dimension: int = HEAD_DIM
 
     @property
     def nbytes(self) -> int:
@@ -122,10 +126,22 @@ def _parse_depths(text: str) -> Tuple[float, ...]:
 
 
 def _memory_mib() -> Tuple[float, float]:
-    """Return current RSS and high-water RSS on Linux, in MiB."""
+    """Return current RSS and high-water RSS, in MiB.
+
+    The peak-RSS budget is a hard gate on these benchmarks, so the probe has
+    to work on the workstation they are authored on as well as in the CANN
+    container. `resource` is Unix-only and `/proc` does not exist on Windows,
+    so this reads whichever of the three sources the host actually has:
+    `/proc/self/status` (exact, Linux), `getrusage` (Unix fallback), or
+    `GetProcessMemoryInfo` (Windows). It never raises -- a benchmark must not
+    die because it could not measure itself -- and returns (0.0, 0.0) if no
+    source is available, which the callers' thresholds then read as "unknown"
+    rather than "fine".
+    """
     current_kib = 0.0
-    peak_kib = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    try:
+    peak_kib = 0.0
+
+    try:  # Linux: exact current and high-water marks.
         with Path("/proc/self/status").open("r", encoding="utf-8") as status:
             for line in status:
                 if line.startswith("VmRSS:"):
@@ -133,8 +149,62 @@ def _memory_mib() -> Tuple[float, float]:
                 elif line.startswith("VmHWM:"):
                     peak_kib = float(line.split()[1])
     except OSError:
-        current_kib = peak_kib
-    return current_kib / 1024.0, peak_kib / 1024.0
+        pass
+    if current_kib or peak_kib:
+        return current_kib / 1024.0, peak_kib / 1024.0
+
+    try:  # Other Unix: ru_maxrss is the high-water mark only.
+        import resource  # noqa: PLC0415 - optional, platform-specific.
+
+        peak_kib = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return peak_kib / 1024.0, peak_kib / 1024.0
+    except (ImportError, OSError, ValueError):
+        pass
+
+    try:  # Windows: PROCESS_MEMORY_COUNTERS via psapi.
+        import ctypes  # noqa: PLC0415 - optional, platform-specific.
+        from ctypes import wintypes  # noqa: PLC0415
+
+        class _ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        # The signatures must be declared: GetCurrentProcess returns the
+        # pseudo-handle (HANDLE)-1, and without an explicit HANDLE restype
+        # ctypes hands it on as a 32-bit int, which the call then rejects.
+        kernel32 = ctypes.WinDLL("kernel32")
+        psapi = ctypes.WinDLL("psapi")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcess.argtypes = []
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ProcessMemoryCounters),
+            wintypes.DWORD,
+        ]
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            return (
+                counters.WorkingSetSize / (1024.0 * 1024.0),
+                counters.PeakWorkingSetSize / (1024.0 * 1024.0),
+            )
+    except (ImportError, AttributeError, OSError):
+        pass
+
+    return 0.0, 0.0
 
 
 def _cosine(left: "np.ndarray", right: "np.ndarray") -> float:
@@ -341,12 +411,14 @@ def _fp8_quantize(values: "np.ndarray") -> "np.ndarray":
 
 
 def _encode_batch(
-    vectors: "np.ndarray", quantizer: TurboLatticeQuantizer
+    vectors: "np.ndarray", quantizer: TurboLatticeQuantizer, dimension: int = HEAD_DIM
 ) -> PackedBatch:
-    if vectors.ndim != 2 or vectors.shape[1] != HEAD_DIM:
-        raise ValueError("batch vectors must have shape [N, 128]")
+    if vectors.ndim != 2 or vectors.shape[1] != dimension:
+        raise ValueError(f"batch vectors must have shape [N, {dimension}]")
+    if dimension % quantizer.group_size:
+        raise ValueError("dimension must be divisible by the quantizer group_size")
     group_size = quantizer.group_size
-    grouped = vectors.reshape(vectors.shape[0], HEAD_DIM // group_size, group_size)
+    grouped = vectors.reshape(vectors.shape[0], dimension // group_size, group_size)
     if quantizer.scale_mode == "rms":
         scales = np.sqrt(np.mean(grouped * grouped, axis=-1, dtype=np.float32))
     else:
@@ -361,18 +433,20 @@ def _encode_batch(
     residual = fp8_values.astype(np.float64) - np.asarray(
         quantizer.lloyd.centres, dtype=np.float64
     )[indices]
-    padded_dimension = HEAD_DIM
+    padded_dimension = dimension
     if quantizer.lattice_mode == "none":
         codewords = np.empty((vectors.shape[0], 0), dtype=np.int16)
     elif quantizer.lattice_mode == "e8":
+        if dimension % 8:
+            raise ValueError("E8 requires a dimension divisible by eight")
         codewords = _nearest_e8_batch(
             residual / quantizer.lattice_step
         )
     else:
         padded_dimension = (
-            (HEAD_DIM + LEECH_DIMENSION - 1) // LEECH_DIMENSION
+            (dimension + LEECH_DIMENSION - 1) // LEECH_DIMENSION
         ) * LEECH_DIMENSION
-        padded = np.pad(residual, ((0, 0), (0, padded_dimension - HEAD_DIM)))
+        padded = np.pad(residual, ((0, 0), (0, padded_dimension - dimension)))
         blocks = padded.reshape(-1, LEECH_DIMENSION)
         codewords = _nearest_leech24_batch(
             blocks / quantizer.lattice_step,
@@ -385,6 +459,7 @@ def _encode_batch(
         scales_f32=scales,
         lloyd_indices_packed=_pack_indices_batch(indices, quantizer.index_bits),
         lattice_codewords_i16=codewords,
+        dimension=dimension,
     )
 
 
@@ -397,7 +472,7 @@ def _decode_batch(
     if packed.lattice_mode != quantizer.lattice_mode:
         raise ValueError("packed lattice mode does not match quantizer")
     indices = _unpack_indices_batch(
-        packed.lloyd_indices_packed, HEAD_DIM, packed.index_bits
+        packed.lloyd_indices_packed, packed.dimension, packed.index_bits
     )
     centres = np.asarray(quantizer.lloyd.centres, dtype=np.float32)
     normalized = centres[indices]
@@ -406,7 +481,7 @@ def _decode_batch(
             np.float32
         ) * np.float32(quantizer.lattice_step * 0.5)
     elif packed.lattice_mode == "e24":
-        residual = packed.lattice_codewords_i16[:, :HEAD_DIM].astype(np.float32)
+        residual = packed.lattice_codewords_i16[:, : packed.dimension].astype(np.float32)
         normalized = normalized + residual * np.float32(
             quantizer.lattice_step / LEECH_NORMALIZATION
         )

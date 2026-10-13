@@ -17,6 +17,25 @@ to the Lloyd-Max reconstruction, and finally multiplied by the block scale.
 
 It is a deterministic research model, not a wire-compatible CANN format.
 Only the Python standard library is required and no NPU runtime is imported.
+
+FLAT (128-lane) VERSUS DECOUPLED (512 + 64) GEOMETRY
+----------------------------------------------------
+`PagedQuantizedCache` above is the original flat probe: one vector per slot,
+positional and semantic lanes mixed, all of it quantized. It is kept because
+the existing suites are built on it.
+
+The lower half of this module adds the faithful DSV4 MLA geometry:
+
+* :class:`DecoupledMlaCache` stores a 512-lane semantic latent *packed* and a
+  64-lane rotary vector as *raw float32*. It has no code path that would hand
+  the rotary lanes to a quantizer, which is the point.
+* :class:`MultiHeadMlaIndexer` scores with 64 heads and the decomposed MLA
+  logit, with the up-projection absorbed into the query.
+* :func:`rms_norm` mirrors ``moe::emu::rms_norm_cpu``.
+
+See the geometry note further down for the two real cache layouts (the 576-lane
+FIA V5 split and the compressor's 512-lane in-row form) and why they must not
+be conflated.
 """
 
 from __future__ import annotations
@@ -902,6 +921,329 @@ class CSACompressor:
             cache.write(slot, compressed_key, compressed_value)
             exact_compressed.append(compressed_key)
         return tuple(exact_compressed)
+
+
+# ---------------------------------------------------------------------------
+# DSV4 MLA geometry
+# ---------------------------------------------------------------------------
+#
+# These mirror the engine's own constants. Audited against the headers rather
+# than restated from a brief:
+#
+#   include/moe/core/config.hpp
+#     kDefaultKvLoraRank     = 512   -> MLA_LATENT_DIM
+#     kDefaultQkRopeHeadDim  = 64    -> MLA_ROPE_DIM
+#     kDefaultQkNopeHeadDim  = 128   -> MLA_NOPE_HEAD_DIM
+#     kCompressRatioCsa      = 4     -> CSA_COMPRESS_RATIO
+#     kRmsNormEpsilon        = 1e-6  -> RMS_NORM_EPSILON
+#     MlaGeometry::kv_row_elements() = 512 + 64 = 576
+#
+#   include/moe/emu/cpu_kernels.h
+#     kIndexerHeads          = 64    -> MLA_INDEXER_HEADS
+#     kIndexerHeadDim        = 128   -> MLA_INDEXER_HEAD_DIM
+#     kIndexerTopK           = 512
+#     kCompressorHeadDim     = 512   -> CSA_COMPRESSOR_HEAD_DIM
+#     kRopeBaseOffset        = 448   -> CSA_ROPE_BASE_OFFSET
+#
+# TWO LAYOUTS, BOTH REAL -- do not conflate them:
+#
+# * ATTENTION / FIA V5 ("split"): the cached row is 576 wide and arrives as two
+#   separate tensors, `key` [*, 512] and `keyRope` [*, 64]. kv_lora_rank is the
+#   full 512-lane latent and the 64 rope lanes are appended alongside it.
+#   This is the layout `MlaGeometry::kv_row_elements()` sizes.
+#
+# * CSA COMPRESSOR ("in_row"): the compressor's row is 512 wide in TOTAL and
+#   the vendored kernel applies RoPE to its LAST 64 lanes --
+#   kRopeBaseOffset = kCompressorHeadDim - kRopeHeadDim = 448. So lanes
+#   [0, 448) are semantic and lanes [448, 512) are rotary. There is no 576.
+#   `shared_kv_swa_attention_decode_cpu` documents the same shape:
+#   `kv = rope_half(rms_norm(wkv @ h_in, kv_norm), last 64)  [512]`.
+#
+# Both layouts keep the rotary lanes out of the quantizer; they differ only in
+# how wide the semantic part is (512 vs 448). `DecoupledMlaCache` implements
+# both and names which one it is holding, because a benchmark that silently
+# picked one and reported the other as "faithful" would be the same class of
+# error the previous probe made.
+
+MLA_LATENT_DIM = 512
+MLA_ROPE_DIM = 64
+MLA_NOPE_HEAD_DIM = 128
+MLA_INDEXER_HEADS = 64
+MLA_INDEXER_HEAD_DIM = 128
+MLA_INDEXER_TOP_K = 512
+CSA_COMPRESS_RATIO = 4
+CSA_COMPRESSOR_HEAD_DIM = 512
+CSA_ROPE_BASE_OFFSET = CSA_COMPRESSOR_HEAD_DIM - MLA_ROPE_DIM  # 448
+MLA_KV_ROW_ELEMENTS = MLA_LATENT_DIM + MLA_ROPE_DIM  # 576
+RMS_NORM_EPSILON = 1e-6
+
+# The two layouts above, as the names `DecoupledMlaCache` accepts.
+MLA_LAYOUT_SPLIT = "split"
+MLA_LAYOUT_IN_ROW = "in_row"
+
+
+def mla_semantic_dim(layout: str = MLA_LAYOUT_SPLIT) -> int:
+    """Width of the quantized semantic path for `layout`."""
+    if layout == MLA_LAYOUT_SPLIT:
+        return MLA_LATENT_DIM
+    if layout == MLA_LAYOUT_IN_ROW:
+        return CSA_ROPE_BASE_OFFSET
+    raise ValueError("layout must be split or in_row")
+
+
+def rms_norm(
+    vector: Sequence[float],
+    weight: Optional[Sequence[float]] = None,
+    eps: float = RMS_NORM_EPSILON,
+) -> Tuple[float, ...]:
+    """``weight * x / sqrt(mean(x^2) + eps)``.
+
+    Mirrors ``moe::emu::rms_norm_cpu`` (include/moe/emu/dsv4_layers.h:161),
+    including its null-weight variant -- the engine spells it `rms_norm_cpu`,
+    not `rmsnorm_cpu`. Reducing over the channel axis is the point: it is what
+    stops a handful of high-gain outlier channels from setting the scale of
+    every logit, which is flaw 4 of the previous probe.
+    """
+    count = len(vector)
+    if count == 0:
+        raise ValueError("rms_norm needs a non-empty vector")
+    if weight is not None and len(weight) != count:
+        raise ValueError("rms_norm weight must match the vector width")
+    mean_square = sum(float(value) ** 2 for value in vector) / count
+    inverse_rms = 1.0 / math.sqrt(mean_square + eps)
+    if weight is None:
+        return tuple(float(value) * inverse_rms for value in vector)
+    return tuple(
+        float(gain) * float(value) * inverse_rms
+        for value, gain in zip(vector, weight)
+    )
+
+
+@dataclass(frozen=True)
+class DecoupledMlaSlot:
+    """One compressed cache slot: packed semantic latent, raw rotary lanes.
+
+    `rope` is a plain float tuple and there is deliberately no packed variant
+    of it. The invariant this whole module exists to test is that nothing ever
+    hands these lanes to a quantizer.
+    """
+
+    latent: PackedVector
+    rope: Tuple[float, ...]
+
+    @property
+    def nbytes(self) -> int:
+        return self.latent.nbytes + 4 * len(self.rope)
+
+
+class DecoupledMlaCache:
+    """Paged CSA cache with a quantized latent and an unquantized RoPE path.
+
+    Shapes, for `num_blocks * block_size` slots:
+
+        latent   [slots, semantic_dim]   packed (FP8 -> Lloyd-Max -> lattice)
+        rope     [slots, 64]             float32, never quantized
+
+    `semantic_dim` is 512 for the split (FIA V5) layout and 448 for the CSA
+    compressor's in-row layout; see the layout note above.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        quantizer: TurboLatticeQuantizer,
+        layout: str = MLA_LAYOUT_SPLIT,
+        rope_dim: int = MLA_ROPE_DIM,
+        block_table: Optional[Sequence[int]] = None,
+    ):
+        semantic_dim = mla_semantic_dim(layout)
+        if num_blocks <= 0 or block_size <= 0:
+            raise ValueError("cache extents must be positive")
+        if rope_dim <= 0:
+            raise ValueError("rope_dim must be positive")
+        if semantic_dim % quantizer.group_size:
+            raise ValueError(
+                "semantic_dim must be divisible by the quantizer group_size"
+            )
+        table = tuple(range(num_blocks)) if block_table is None else tuple(block_table)
+        if len(table) > num_blocks or any(not 0 <= block < num_blocks for block in table):
+            raise ValueError("block_table contains an invalid physical block")
+        if len(set(table)) != len(table):
+            raise ValueError("block_table physical blocks must be unique")
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.layout = layout
+        self.semantic_dim = semantic_dim
+        self.rope_dim = rope_dim
+        self.quantizer = quantizer
+        self.block_table = table
+        self._slots: List[Optional[DecoupledMlaSlot]] = [None] * (num_blocks * block_size)
+
+    @property
+    def row_elements(self) -> int:
+        """Width of one logical cached row, semantic plus rotary."""
+        return self.semantic_dim + self.rope_dim
+
+    @property
+    def latent_shape(self) -> Tuple[int, int, int, int]:
+        """PA_BSND ``[blocks, block_size, 1, semantic_dim]``."""
+        return (self.num_blocks, self.block_size, 1, self.semantic_dim)
+
+    @property
+    def rope_shape(self) -> Tuple[int, int, int, int]:
+        """PA_BSND ``[blocks, block_size, 1, rope_dim]``."""
+        return (self.num_blocks, self.block_size, 1, self.rope_dim)
+
+    def _physical_slot(self, logical_index: int) -> int:
+        if logical_index < 0:
+            raise IndexError("logical cache index must be non-negative")
+        logical_block, within = divmod(logical_index, self.block_size)
+        if logical_block >= len(self.block_table):
+            raise IndexError("logical cache index exceeds the block table")
+        return self.block_table[logical_block] * self.block_size + within
+
+    def write(
+        self,
+        logical_index: int,
+        latent: Sequence[float],
+        rope: Sequence[float],
+    ) -> None:
+        """Quantize `latent`; store `rope` verbatim."""
+        if len(latent) != self.semantic_dim:
+            raise ValueError("latent width does not match the cache semantic_dim")
+        if len(rope) != self.rope_dim:
+            raise ValueError("rope width does not match the cache rope_dim")
+        if any(not math.isfinite(float(value)) for value in rope):
+            raise ValueError("rope lanes must be finite")
+        physical = self._physical_slot(logical_index)
+        self._slots[physical] = DecoupledMlaSlot(
+            latent=self.quantizer.encode_vector(latent),
+            rope=tuple(float(value) for value in rope),
+        )
+
+    def write_row(self, logical_index: int, row: Sequence[float]) -> None:
+        """Split one full row into its semantic and rotary halves, then write.
+
+        For the in-row layout the rotary lanes are `row[448:512]`, which is
+        exactly `kRopeBaseOffset`. For the split layout the row is the 576-lane
+        concatenation and the rotary lanes are the trailing 64.
+        """
+        if len(row) != self.row_elements:
+            raise ValueError("row width does not match semantic_dim + rope_dim")
+        self.write(logical_index, row[: self.semantic_dim], row[self.semantic_dim :])
+
+    def packed_slot(self, logical_index: int) -> DecoupledMlaSlot:
+        slot = self._slots[self._physical_slot(logical_index)]
+        if slot is None:
+            raise KeyError("the requested cache slot has not been written")
+        return slot
+
+    def read_latent(self, logical_index: int) -> Tuple[float, ...]:
+        return self.quantizer.decode_vector(self.packed_slot(logical_index).latent)
+
+    def read_rope(self, logical_index: int) -> Tuple[float, ...]:
+        return self.packed_slot(logical_index).rope
+
+    def read_row(self, logical_index: int) -> Tuple[float, ...]:
+        slot = self.packed_slot(logical_index)
+        return self.quantizer.decode_vector(slot.latent) + slot.rope
+
+
+class MultiHeadMlaIndexer:
+    """Decomposed multi-head MLA scoring over a `DecoupledMlaCache`.
+
+    Per head `h` and slot `i`, with the up-projection absorbed into the query
+    (`q_absorbed[h] = W_UK[h]^T q_nope[h]`, the standard MLA absorption that
+    lets the latent be scored without ever reconstructing a per-slot key):
+
+        S[h, i] = (<q_absorbed[h], C_kv[i]> + <q_rope[h], K_rope[i]>) / sqrt(d)
+
+    with `d = qk_nope_head_dim + qk_rope_head_dim = 192`. The rotary term is
+    computed against the cache's raw rope lanes, so no phase error from the
+    quantizer can enter it.
+
+    Candidate ranking aggregates across heads with `head_max` (default) or
+    `mean`. head_max is the one that lets a single specialized retrieval head
+    surface a needle that the other 63 heads are indifferent to; a mean, or a
+    single-head dot product, averages that signal away.
+    """
+
+    def __init__(
+        self,
+        absorbed_queries: Sequence[Sequence[float]],
+        rope_queries: Sequence[Sequence[float]],
+        semantic_dim: int = MLA_LATENT_DIM,
+        rope_dim: int = MLA_ROPE_DIM,
+        nope_head_dim: int = MLA_NOPE_HEAD_DIM,
+        aggregation: str = "head_max",
+    ):
+        if aggregation not in ("head_max", "mean"):
+            raise ValueError("aggregation must be head_max or mean")
+        heads = len(absorbed_queries)
+        if heads == 0:
+            raise ValueError("the indexer needs at least one head")
+        if len(rope_queries) != heads:
+            raise ValueError("absorbed and rope queries must have the same head count")
+        if any(len(row) != semantic_dim for row in absorbed_queries):
+            raise ValueError("absorbed queries must be semantic_dim wide")
+        if any(len(row) != rope_dim for row in rope_queries):
+            raise ValueError("rope queries must be rope_dim wide")
+        self.heads = heads
+        self.semantic_dim = semantic_dim
+        self.rope_dim = rope_dim
+        self.aggregation = aggregation
+        self.absorbed_queries = tuple(
+            tuple(float(value) for value in row) for row in absorbed_queries
+        )
+        self.rope_queries = tuple(
+            tuple(float(value) for value in row) for row in rope_queries
+        )
+        self.inverse_temperature = 1.0 / math.sqrt(nope_head_dim + rope_dim)
+
+    def head_logits(
+        self, latent: Sequence[float], rope: Sequence[float]
+    ) -> Tuple[float, ...]:
+        """`S[:, i]` for one slot: the per-head decomposed logits."""
+        if len(latent) != self.semantic_dim or len(rope) != self.rope_dim:
+            raise ValueError("slot widths do not match the indexer geometry")
+        logits = []
+        for head in range(self.heads):
+            semantic = sum(
+                q * float(c) for q, c in zip(self.absorbed_queries[head], latent)
+            )
+            rotary = sum(q * float(k) for q, k in zip(self.rope_queries[head], rope))
+            logits.append((semantic + rotary) * self.inverse_temperature)
+        return tuple(logits)
+
+    def aggregate(self, head_logits: Sequence[float]) -> float:
+        if not head_logits:
+            raise ValueError("cannot aggregate an empty head logit vector")
+        if self.aggregation == "head_max":
+            return max(float(value) for value in head_logits)
+        return sum(float(value) for value in head_logits) / len(head_logits)
+
+    def score_slot(self, latent: Sequence[float], rope: Sequence[float]) -> float:
+        return self.aggregate(self.head_logits(latent, rope))
+
+    def rank(
+        self, cache: DecoupledMlaCache, seq_len: int, top_k: Optional[int] = None
+    ) -> Tuple[Tuple[float, ...], Tuple[int, ...]]:
+        """Score `seq_len` slots and return (scores, ranked slot indices)."""
+        if seq_len < 0:
+            raise ValueError("seq_len must be non-negative")
+        if top_k is not None and top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if cache.semantic_dim != self.semantic_dim or cache.rope_dim != self.rope_dim:
+            raise ValueError("cache geometry does not match the indexer")
+        scores = [
+            self.score_slot(cache.read_latent(index), cache.read_rope(index))
+            for index in range(seq_len)
+        ]
+        ranked = sorted(range(seq_len), key=lambda index: (-scores[index], index))
+        if top_k is not None:
+            ranked = ranked[: min(top_k, seq_len)]
+        return tuple(scores), tuple(ranked)
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
