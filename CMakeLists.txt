@@ -203,6 +203,7 @@ if(ENABLE_HOST_EMU)
 
   enable_testing()
   add_subdirectory(tests/emu)
+  add_subdirectory(tests/sim)
 
   # The device launch layer is optional even here: it needs BiSheng, not an
   # NPU, so it can be built alongside the host emulation for a build check.

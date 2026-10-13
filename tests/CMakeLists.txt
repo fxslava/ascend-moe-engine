@@ -1,4 +1,18 @@
 add_subdirectory(common)
+
+if(NOT TARGET moe_emu)
+  if(NOT DEFINED MOE_EMU_WARNINGS)
+    set(MOE_EMU_WARNINGS -Wall -Wextra)
+  endif()
+  if(NOT DEFINED MOE_EMU_ARCH_FLAGS)
+    set(MOE_EMU_ARCH_FLAGS "")
+  endif()
+  if(NOT DEFINED MOE_EMU_OPENMP)
+    set(MOE_EMU_OPENMP OFF)
+  endif()
+  add_subdirectory("${CMAKE_SOURCE_DIR}/src/emu" "${CMAKE_BINARY_DIR}/src/emu")
+endif()
+
 add_subdirectory(sim)
 
 # The two decoupled custom-kernel binaries (verification + benchmark).
