@@ -489,6 +489,32 @@ set_target_properties(moe_runner PROPERTIES
 enable_testing()
 if(ENABLE_ARCH35_DEVICE_LAUNCH)
   include("${CMAKE_SOURCE_DIR}/cmake/arch35_device.cmake")
+
+  # ---------------------------------------------------------------------------
+  # dsv4_semi_e2e_bench_npu -- the device twin of apps/dsv4_semi_e2e_bench.
+  #
+  # It lives in apps/ rather than tests/bench/ for two reasons: its host
+  # counterpart is an app, and tests/bench is defined as timing-only and never
+  # a gate (CLAUDE.md section 4), while this binary asserts golden parity and
+  # returns non-zero on a mismatch.
+  #
+  # It is the only target that links BOTH sides: ascend_moe_engine for the
+  # OpTable / aclnn surface and the safetensors reader, and
+  # arch35_device_launch for the five BiSheng-built operators. That pairing
+  # only exists in the engine configuration with -DENABLE_ARCH35_DEVICE_LAUNCH=ON,
+  # which is why it is declared here and not next to the emu apps.
+  # ---------------------------------------------------------------------------
+  add_executable(dsv4_semi_e2e_bench_npu apps/dsv4_semi_e2e_bench_npu.cpp)
+  target_link_libraries(dsv4_semi_e2e_bench_npu PRIVATE ascend_moe_engine arch35_device_launch)
+  target_compile_options(dsv4_semi_e2e_bench_npu PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(dsv4_semi_e2e_bench_npu PRIVATE -Werror)
+  endif()
+  set_target_properties(dsv4_semi_e2e_bench_npu PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/apps"
+    BUILD_RPATH "$ORIGIN/.."
+    INSTALL_RPATH "$ORIGIN/.."
+  )
 endif()
 add_subdirectory(tests)
 if(NOT ENABLE_MOCK_RUNTIME)

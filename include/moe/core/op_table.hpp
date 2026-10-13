@@ -80,6 +80,7 @@ enum class OpId {
   kMul,
   kInplaceAdd,
   kSwiGlu,
+  kClamp,
   kArgMax,
   // Decomposed sqrtsoftplus router scoring (DSV4 `scoring_func`)
   kSoftplus,
@@ -549,6 +550,29 @@ using InplaceAddPlanFn = int (*)(const aclTensor* self_ref, const aclTensor* oth
  */
 using SwiGluPlanFn = int (*)(const aclTensor* x, int64_t dim, const aclTensor* out, uint64_t* workspace_size,
                              aclOpExecutor** executor);
+
+/**
+ * @brief aclnnClamp: plan phase (Math).
+ * @details Elementwise clamp to [clipValueMin, clipValueMax]; either bound may be null for a
+ * one-sided clamp.
+ * @note DSV4's SwiGLU clamp is ASYMMETRIC -- the gate half takes a max bound only and the up half
+ * takes both -- which is why the bounds are separately nullable here and why this is not folded into
+ * aclnnSwiGlu. Engine uses FP32 input/output of identical shape and host FP32 scalar bounds.
+ * @warning The two-phase ownership and SoC constraints in @ref aclnn_contract apply.
+ * No descriptor or buffer may be released while queued work can still reference it.
+ * @param[in] self Input device tensor.
+ * @param[in] clip_value_min Host scalar lower bound; null leaves the lower side unclamped.
+ * @param[in] clip_value_max Host scalar upper bound; null leaves the upper side unclamped.
+ * @param[out] out Output device tensor.
+ * @param[out] workspace_size Returned required device workspace bytes; allocate before launch.
+ * @param[out] executor Returned opaque execution plan; transfer to StaticOpSlot before launch.
+ * @return 0 (ACLNN_SUCCESS); 161001 (ACLNN_ERR_PARAM_NULLPTR);
+ * 161002 (ACLNN_ERR_PARAM_INVALID); 361001 (ACLNN_ERR_RUNTIME_ERROR).
+ * See @ref aclnn_contract for meanings and asynchronous error handling.
+ * @see AclnnLaunchFn
+ */
+using ClampPlanFn = int (*)(const aclTensor* self, const aclScalar* clip_value_min, const aclScalar* clip_value_max,
+                            aclTensor* out, uint64_t* workspace_size, aclOpExecutor** executor);
 
 /**
  * @brief aclnnArgMax: plan phase (Math).

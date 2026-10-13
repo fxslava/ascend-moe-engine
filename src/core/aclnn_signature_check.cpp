@@ -38,6 +38,7 @@
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_apply_rotary_pos_emb_v2.h>
 #include <aclnnop/aclnn_argmax.h>
+#include <aclnnop/level2/aclnn_clamp.h>
 #include <aclnnop/aclnn_dynamic_mx_quant.h>
 #include <aclnnop/aclnn_fused_infer_attention_score_v5.h>
 #include <aclnnop/aclnn_grouped_matmul_finalize_routing_v3.h>
@@ -120,6 +121,7 @@ DSV4_ASSERT_SIGNATURE(aclnnSigmoidGetWorkspaceSize, UnaryPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMulGetWorkspaceSize, BinaryPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnInplaceAddGetWorkspaceSize, InplaceAddPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnSwiGluGetWorkspaceSize, SwiGluPlanFn);
+DSV4_ASSERT_SIGNATURE(aclnnClampGetWorkspaceSize, ClampPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnArgMaxGetWorkspaceSize, ArgMaxPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnGroupedMatmulV5GetWorkspaceSize, GroupedMatmulV5PlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnSwigluMxQuantGetWorkspaceSize, SwigluMxQuantPlanFn);

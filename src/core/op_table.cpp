@@ -62,6 +62,7 @@ const OpDeclaration kDeclarations[] = {
     {OpId::kMul, "aclnnMul", "attention output gate (Qwen3.5 stage map; unused by DSV4)", false, false},
     {OpId::kInplaceAdd, "aclnnInplaceAdd", "attention and MoE residual adds", true, false},
     {OpId::kSwiGlu, "aclnnSwiGlu", "shared-expert activation", true, false},
+    {OpId::kClamp, "aclnnClamp", "DSV4's asymmetric SwiGLU clamp (gate max-only, up two-sided)", false, false},
     {OpId::kArgMax, "aclnnArgMax", "greedy token selection on the LM head", true, false},
     {OpId::kSoftplus, "aclnnSoftplus", "sqrtsoftplus router scoring, stage 1 (host-scalar beta/threshold)", true,
      false},
