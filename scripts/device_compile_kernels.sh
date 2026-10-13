@@ -100,6 +100,7 @@ paged_compressor_rope
 fast_fp8_indexer_topk
 mxfp4_expert_gemv
 dsv4_moe_expert
+bf16_block_quant_fp8
 "
 
 pass=0; fail=0

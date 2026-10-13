@@ -20,6 +20,7 @@ set(MOE_ARCH35_OPS
   fast_fp8_indexer_topk
   mxfp4_expert_gemv
   dsv4_moe_expert
+  bf16_block_quant_fp8
 )
 
 set(MOE_ARCH35_OP_ASC_SOURCES "")

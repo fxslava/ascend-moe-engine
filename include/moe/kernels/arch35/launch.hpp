@@ -189,6 +189,32 @@ Status LaunchDsv4MoeExpert(
     const float* x_gm, std::uint32_t hidden, std::uint32_t inter, float* y_gm,
     void* workspace, std::size_t workspace_bytes, aclrtStream stream);
 
+// ---------------------------------------------------------------------------
+// bf16_block_quant_fp8
+//
+// BF16 -> FP8 E4M3 with one FP32 scale per 32 elements, for the activation
+// quantizer sites that feed the FP8 projections.
+//
+// This REPLACES the aclnnDynamicMxQuant + aclnnCast pair those sites used:
+// DynamicMxQuant emits E8M0 scales while the ascend950
+// QuantBatchMatmulV3 binary takes pertoken_scale in FP32, so the old path
+// cost two launches, and on hardware it failed with EZ1009. One dispatch
+// here, with the scales already in the dtype the matmul wants.
+//
+// `width` must be a multiple of 32 (whole scale blocks) and at most 65,536;
+// the live sites are 1,024 / 2,048 / 4,096 / 8,192 / 32,768. x, y and scale
+// must not alias.
+//
+// `scale` holds width/32 floats and is NOT power-of-two quantized -- see the
+// divergence note in op_host/bf16_block_quant_fp8_tiling.h.
+// ---------------------------------------------------------------------------
+inline constexpr std::size_t kBlockQuantFp8WorkspaceBytes = 0;
+
+Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
+                               Fp8E4M3* y_gm, float* scale_gm, void* workspace,
+                               std::size_t workspace_bytes,
+                               aclrtStream stream);
+
 }  // namespace moe::kernels::arch35
 
 #endif  // MOE_KERNELS_ARCH35_LAUNCH_HPP
