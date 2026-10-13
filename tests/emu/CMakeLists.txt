@@ -11,6 +11,7 @@ set(MOE_EMU_TESTS
   test_semi_e2e_pipeline
   test_custom_kernels_emu
   test_kernel_addressing_emu
+  test_bf16_block_quant_emu
 )
 
 # -----------------------------------------------------------------------------

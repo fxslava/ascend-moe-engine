@@ -93,8 +93,51 @@ if(TARGET arch35_device_launch)
     TIMEOUT 600
     SKIP_REGULAR_EXPRESSION "Physical Ascend NPU not detected"
   )
+  # -------------------------------------------------------------------------
+  # bf16_block_quant_fp8, on its own binary.
+  #
+  # Separate from test_custom_kernels_npu_device on purpose: this one exists
+  # to settle the __asc_fp8x2_storage_t byte order, and a dedicated binary
+  # keeps that answer readable instead of buried in a seven-operator run. It
+  # has the same dependencies and the same entry-guard contract.
+  # -------------------------------------------------------------------------
+  add_executable(test_bf16_block_quant_fp8_npu
+    test_bf16_block_quant_fp8_npu.cpp)
+  target_link_libraries(test_bf16_block_quant_fp8_npu PRIVATE
+    arch35_device_launch
+    moe_emu          # the in-memory CPU golden it compares against
+    pthread
+    dl
+  )
+  target_include_directories(test_bf16_block_quant_fp8_npu PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/tests/common"
+  )
+  target_compile_options(test_bf16_block_quant_fp8_npu PRIVATE
+    -Wall -Wextra
+    # Compares device output against a host golden computed from the same
+    # arithmetic, so the host side must not contract into an FMA at will.
+    -ffp-contract=off
+  )
+  if(DSV4_WERROR)
+    target_compile_options(test_bf16_block_quant_fp8_npu PRIVATE -Werror)
+  endif()
+  set_target_properties(test_bf16_block_quant_fp8_npu PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/npu"
+    BUILD_RPATH "$ORIGIN/../.."
+  )
+  add_test(NAME test_bf16_block_quant_fp8_npu
+           COMMAND test_bf16_block_quant_fp8_npu)
+  set_tests_properties(test_bf16_block_quant_fp8_npu PROPERTIES
+    LABELS "npu;arch35;verification"
+    TIMEOUT 600
+    SKIP_REGULAR_EXPRESSION "Physical Ascend NPU not detected"
+  )
 else()
   message(STATUS
     "test_custom_kernels_npu_device: not built (needs "
+    "-DENABLE_ARCH35_DEVICE_LAUNCH=ON)")
+  message(STATUS
+    "test_bf16_block_quant_fp8_npu: not built (needs "
     "-DENABLE_ARCH35_DEVICE_LAUNCH=ON)")
 endif()

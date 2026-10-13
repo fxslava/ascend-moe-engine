@@ -309,6 +309,33 @@ void moe_expert_swiglu_fp8_cpu(const Fp8BlockMatrix& w1, const Fp8BlockMatrix& w
                                float limit, std::vector<float>* scratch);
 
 // ---------------------------------------------------------------------------
+// Activation block quantizer (oracle for the bf16_block_quant_fp8 operator)
+// ---------------------------------------------------------------------------
+// BF16 -> FP8 E4M3 with one FP32 scale per 32 elements:
+//
+//   m        = max over the block of |x|
+//   scale[b] = (m > 0) ? m / 448 : 1        FP32, NOT a power of two
+//   q[i]     = e4m3_rne_sat( x[i] * (448 / m) )
+//
+// This replaces the aclnnDynamicMxQuant + aclnnCast pair the five activation
+// quantizer sites used. DynamicMxQuant emitted OCP E8M0 power-of-two scales;
+// these are arbitrary FP32, which is the dtype QuantBatchMatmulV3 takes
+// directly and which uses the E4M3 range strictly better. Outputs therefore
+// differ from the old path by design.
+//
+// `width` must be a multiple of 32. `q_out` holds `width` codes, `scale_out`
+// holds `width / 32` floats. Input is BF16 STORAGE BITS so the same buffer
+// can be handed to the device wrapper unchanged.
+inline constexpr int kBlockQuantRefBlockSize = 32;
+
+void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
+                              std::uint8_t* q_out, float* scale_out);
+
+// Decode one code against its block scale. The dequantization the consuming
+// matmul performs, factored out so tests state the round trip once.
+float bf16_block_quant_fp8_dequant(std::uint8_t code, float scale) noexcept;
+
+// ---------------------------------------------------------------------------
 // Resident-set reporting
 // ---------------------------------------------------------------------------
 

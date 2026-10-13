@@ -17,6 +17,7 @@ add_library(moe_emu STATIC
   # the surrounding layer machinery the semi-end-to-end harness threads them
   # through: quantized GEMVs, shared-KV SWA attention, the MoE block
   dsv4_quant_gemv.cpp
+  bf16_block_quant.cpp
   shared_kv_swa_attention.cpp
   moe_block.cpp
   semi_e2e_pipeline.cpp
