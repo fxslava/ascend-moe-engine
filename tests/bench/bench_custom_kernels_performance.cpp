@@ -13,9 +13,13 @@
 //
 // Device benchmarking goes through the Launch* host wrappers. Those now
 // exist, so this binary measures real hardware when an NPU is visible: all
-// five arch35 operators are wired, and the stream is synchronized inside the
+// six arch35 operators are wired, and the stream is synchronized inside the
 // timed region (see TimedLaunch -- a chevron dispatch is asynchronous, so
 // timing the launch call alone measures enqueue cost).
+//
+// dsv4_moe_expert is the one operator here that issues TWO chevron dispatches
+// per call, so its row is doubly sync-inclusive and carries two tiling
+// allocations; BenchDsv4ExpertDevice says why that is structural.
 //
 // paged_compressor_rope does not go through Measure() and reports HOLD and
 // EMIT separately; see BenchPagedCompressorDevice for why a stateful operator
@@ -279,6 +283,139 @@ void BenchMxfp4GemvDevice(const DeviceCtx& ctx, int warmup, int iters) {
     std::snprintf(geo, sizeof(geo), "[device] %ux%u", s.rows, s.cols);
     Row(geo, t, bytes, flops);
   }
+}
+
+// ---------------------------------------------------------------------------
+// device: dsv4_moe_expert
+//
+// One routed expert for one token, fused: gate GEMV, up GEMV, the asymmetric
+// clamped SwiGLU, down GEMV. 32 AIVs, grid-stride over 32-row tiles.
+//
+// Three things make this row different from the four around it, and all three
+// are properties of the operator rather than of the harness:
+//
+//  * TWO chevron dispatches per call. The down leg reduces over the whole
+//    `activated` vector while the gate/up legs are split across 32 cores by
+//    row tile, so the phases need a barrier and stream ordering is it
+//    (launch.hpp, dsv4_moe_expert). Both dispatches are inside the timed
+//    region because together they are one expert evaluation; the figure is
+//    not divisible into per-leg times from here.
+//  * TWO tiling staging allocations per call, not one, for the same reason.
+//    Per CLAUDE.md section 3.7 the v1 wrappers also synchronize before the
+//    free, so this row is sync-inclusive twice over -- a host-observed round
+//    trip, not a kernel time, and the cost is structural until a
+//    caller-owned-tiling variant exists.
+//  * `workspace` is a real inter-stage operand here, not scratch: the gate_up
+//    pass writes `activated` into it and the down pass reads it back. It is
+//    allocated separately from x and y precisely because it must not alias
+//    them.
+//
+// v1 geometry is pinned by MakeDsv4MoeExpertTiling to hidden = 4096,
+// inter = 2048 -- any other shape returns unsupported_shape -- so this is one
+// row, not a sweep. The three weight matrices are the same size
+// (2048x4096 twice, 4096x2048 once), which is why the traffic below is
+// 3 x (packed + scales): ~13.4 MB read once per token against ~32 KB of
+// activation, so this is bandwidth-bound by a wide margin.
+// ---------------------------------------------------------------------------
+void BenchDsv4ExpertDevice(const DeviceCtx& ctx, int warmup, int iters) {
+  using namespace moe::kernels::arch35;
+
+  constexpr std::uint32_t kHidden = 4096;
+  constexpr std::uint32_t kInter = 2048;
+  // Spelled locally rather than pulled from op_host/dsv4_moe_expert_tiling.h:
+  // that header is operator-private (CLAUDE.md section 1.2) and nothing
+  // outside the operator may depend on it. 32 is the MXFP4 block size, the
+  // same constant the host section above reads as moe::emu::kMxfp4GroupSize;
+  // if the two ever disagree the tiling builder rejects the row strides, so
+  // the mismatch surfaces as unsupported_shape rather than a wrong answer.
+  constexpr std::uint32_t kGroup = 32;
+
+  // w1/w3 are [inter, hidden]; w2 is [hidden, inter]. Equal element counts,
+  // so equal payloads -- but the row strides differ between the two, and the
+  // tiling builder rejects a mismatch, so they are kept named apart.
+  constexpr std::size_t kW13Packed =
+      static_cast<std::size_t>(kInter) * (kHidden / 2);
+  constexpr std::size_t kW13Scale =
+      static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  constexpr std::size_t kW2Packed =
+      static_cast<std::size_t>(kHidden) * (kInter / 2);
+  constexpr std::size_t kW2Scale =
+      static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  Rng rng(0xD54EULL);
+  const std::vector<std::uint8_t> w1_packed = rng.bytes(kW13Packed);
+  // E8M0 near the bias (127) so the decode cannot overflow to inf and turn
+  // the measurement into a run over NaNs.
+  const std::vector<std::uint8_t> w1_scale = rng.bytes(kW13Scale, 120, 134);
+  const std::vector<std::uint8_t> w3_packed = rng.bytes(kW13Packed);
+  const std::vector<std::uint8_t> w3_scale = rng.bytes(kW13Scale, 120, 134);
+  const std::vector<std::uint8_t> w2_packed = rng.bytes(kW2Packed);
+  const std::vector<std::uint8_t> w2_scale = rng.bytes(kW2Scale, 120, 134);
+  const std::vector<float> x = rng.normal(kHidden);
+
+  const std::size_t workspace_bytes = Dsv4MoeExpertWorkspaceBytes(kInter);
+
+  DeviceBuffer d_w1p, d_w1s, d_w3p, d_w3s, d_w2p, d_w2s, d_x, d_y, d_ws;
+  aclError rc = d_w1p.Alloc(kW13Packed);
+  if (rc == ACL_SUCCESS) rc = d_w1s.Alloc(kW13Scale);
+  if (rc == ACL_SUCCESS) rc = d_w3p.Alloc(kW13Packed);
+  if (rc == ACL_SUCCESS) rc = d_w3s.Alloc(kW13Scale);
+  if (rc == ACL_SUCCESS) rc = d_w2p.Alloc(kW2Packed);
+  if (rc == ACL_SUCCESS) rc = d_w2s.Alloc(kW2Scale);
+  if (rc == ACL_SUCCESS) rc = d_x.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_ws.Alloc(workspace_bytes);
+  if (rc == ACL_SUCCESS) rc = d_w1p.Upload(w1_packed.data(), kW13Packed);
+  if (rc == ACL_SUCCESS) rc = d_w1s.Upload(w1_scale.data(), kW13Scale);
+  if (rc == ACL_SUCCESS) rc = d_w3p.Upload(w3_packed.data(), kW13Packed);
+  if (rc == ACL_SUCCESS) rc = d_w3s.Upload(w3_scale.data(), kW13Scale);
+  if (rc == ACL_SUCCESS) rc = d_w2p.Upload(w2_packed.data(), kW2Packed);
+  if (rc == ACL_SUCCESS) rc = d_w2s.Upload(w2_scale.data(), kW2Scale);
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Zero();
+  if (rc == ACL_SUCCESS) rc = d_ws.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] setup failed: %s\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  Timing t;
+  std::string why;
+  const bool ok = TimedLaunch(
+      [&] {
+        return LaunchDsv4MoeExpert(
+            d_w1p.as<Mxfp4Pair>(), d_w1s.as<E8M0>(), d_w3p.as<Mxfp4Pair>(),
+            d_w3s.as<E8M0>(), d_w2p.as<Mxfp4Pair>(), d_w2s.as<E8M0>(),
+            kHidden / 2, kHidden / kGroup, kInter / 2, kInter / kGroup,
+            d_x.as<float>(), kHidden, kInter, d_y.as<float>(), d_ws.get(),
+            workspace_bytes, ctx.stream);
+      },
+      ctx.stream, warmup, iters, &t, &why);
+  if (!ok) {
+    std::printf("  [device] h=%u i=%u: FAILED -- %s\n", kHidden, kInter,
+                why.c_str());
+    return;
+  }
+
+  // All three weight matrices and their scale grids, read once, plus x in and
+  // y out. `activated` is counted both ways: the gate_up pass writes it to GM
+  // and the down pass reads it back, and that round trip is real traffic the
+  // two-dispatch structure forces.
+  const double bytes =
+      static_cast<double>(kW13Packed + kW13Scale) * 2.0 +
+      static_cast<double>(kW2Packed + kW2Scale) +
+      static_cast<double>(kHidden) * 4.0 * 2.0 +
+      static_cast<double>(workspace_bytes) * 2.0;
+  // Three GEMVs of inter*hidden multiply-adds each. The SwiGLU itself is
+  // O(inter) transcendental work and is deliberately NOT counted here: it
+  // would be noise against 50 MFLOP and counting a sigmoid as one flop would
+  // be arbitrary.
+  const double flops = 3.0 * 2.0 * static_cast<double>(kInter) *
+                       static_cast<double>(kHidden);
+  char geo[64];
+  std::snprintf(geo, sizeof(geo), "[device] h=%u i=%u", kHidden, kInter);
+  Row(geo, t, bytes, flops);
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +928,19 @@ void DeviceSectionMxfp4(const DeviceCtx& ctx, int warmup, int iters) {
   DeviceRowUnavailable("mxfp4_expert_gemv", ctx);
 }
 
+void DeviceSectionDsv4Expert(const DeviceCtx& ctx, int warmup, int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchDsv4ExpertDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("dsv4_moe_expert", ctx);
+}
+
 void DeviceSectionPagedCompressor(const DeviceCtx& ctx, int warmup,
                                   int iters) {
 #if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
@@ -1055,6 +1205,95 @@ void BenchMxfp4Gemv(const DeviceCtx& ctx, int warmup, int iters,
 }
 
 // ---------------------------------------------------------------------------
+// dsv4_moe_expert
+//
+// The host roofline is the same fused expert the kernel implements -- three
+// MXFP4 GEMVs with the asymmetric clamped SwiGLU between them -- so the two
+// rows below describe the same arithmetic. They are still NOT comparable as
+// speeds: the host figure is scalar single-threaded C++ over a dequantizing
+// inner loop, and the device figure is 32 AIVs plus two sync-inclusive round
+// trips. The host row is the baseline the kernel is beating, nothing more.
+//
+// One geometry only: MakeDsv4MoeExpertTiling pins v1 to hidden = 4096,
+// inter = 2048 and returns unsupported_shape for anything else, so a sweep
+// here would be measuring rejected launches.
+// ---------------------------------------------------------------------------
+void BenchDsv4Expert(const DeviceCtx& ctx, int warmup, int iters,
+                     bool device_only) {
+  Header("dsv4_moe_expert (host reference: fused MXFP4 expert + SwiGLU)");
+
+  if (device_only) {
+    HostSkipped();
+    DeviceSectionDsv4Expert(ctx, warmup, iters);
+    return;
+  }
+
+  constexpr int kGroup = moe::emu::kMxfp4GroupSize;
+  constexpr int kHidden = 4096;
+  constexpr int kInter = 2048;
+
+  // w1/w3 project hidden -> inter; w2 projects inter -> hidden.
+  constexpr std::size_t kW13Packed =
+      static_cast<std::size_t>(kInter) * (kHidden / 2);
+  constexpr std::size_t kW13Scale =
+      static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  constexpr std::size_t kW2Packed =
+      static_cast<std::size_t>(kHidden) * (kInter / 2);
+  constexpr std::size_t kW2Scale =
+      static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  Rng rng(0xD54EULL);
+  const std::vector<std::uint8_t> w1_packed = rng.bytes(kW13Packed);
+  // E8M0 near the bias so the decode cannot overflow to inf.
+  const std::vector<std::uint8_t> w1_scale = rng.bytes(kW13Scale, 120, 134);
+  const std::vector<std::uint8_t> w3_packed = rng.bytes(kW13Packed);
+  const std::vector<std::uint8_t> w3_scale = rng.bytes(kW13Scale, 120, 134);
+  const std::vector<std::uint8_t> w2_packed = rng.bytes(kW2Packed);
+  const std::vector<std::uint8_t> w2_scale = rng.bytes(kW2Scale, 120, 134);
+  const std::vector<float> x = rng.normal(static_cast<std::size_t>(kHidden));
+
+  moe::emu::Mxfp4Matrix w1;
+  w1.packed = w1_packed.data();
+  w1.scale = w1_scale.data();
+  w1.rows = kInter;
+  w1.cols = kHidden;
+
+  moe::emu::Mxfp4Matrix w3 = w1;
+  w3.packed = w3_packed.data();
+  w3.scale = w3_scale.data();
+
+  moe::emu::Mxfp4Matrix w2;
+  w2.packed = w2_packed.data();
+  w2.scale = w2_scale.data();
+  w2.rows = kHidden;
+  w2.cols = kInter;
+
+  std::vector<float> out(static_cast<std::size_t>(kHidden), 0.0F);
+  // Hoisted so the reference reuses it across iterations: the allocation is
+  // setup, not work, and must not land inside the timed region.
+  std::vector<float> scratch;
+
+  const Timing t = Measure(warmup, iters, [&] {
+    moe::emu::moe_expert_swiglu_mxfp4_cpu(w1, w3, w2, x.data(), out.data(),
+                                          moe::emu::kSwigluLimit, &scratch);
+  });
+
+  // Three GEMVs of inter*hidden multiply-adds; the SwiGLU is excluded for the
+  // same reason as in the device row.
+  const double flops =
+      3.0 * 2.0 * static_cast<double>(kInter) * static_cast<double>(kHidden);
+  const double bytes = static_cast<double>(kW13Packed + kW13Scale) * 2.0 +
+                       static_cast<double>(kW2Packed + kW2Scale) +
+                       static_cast<double>(kHidden) * 4.0 * 2.0 +
+                       static_cast<double>(kInter) * 4.0 * 2.0;
+  char geo[64];
+  std::snprintf(geo, sizeof(geo), "h=%d i=%d", kHidden, kInter);
+  Row(geo, t, bytes, flops);
+
+  DeviceSectionDsv4Expert(ctx, warmup, iters);
+}
+
+// ---------------------------------------------------------------------------
 // 5. paged_compressor_rope
 //
 // The reference's decode cadence is stateful (a persistent ring buffer across
@@ -1188,6 +1427,7 @@ int main(int argc, char** argv) {
   BenchMhcPost(ctx, warmup, iters, device_only);
   BenchIndexer(ctx, warmup, iters, device_only);
   BenchMxfp4Gemv(ctx, warmup, iters, device_only);
+  BenchDsv4Expert(ctx, warmup, iters, device_only);
   BenchPagedCompressor(ctx, warmup, iters);
   ReportScaling(ctx);
 
