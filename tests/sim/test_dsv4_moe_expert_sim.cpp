@@ -1,11 +1,10 @@
-// Host SIMT functional model for the arch35 expert kernel.
-// It follows the device lane reduction and tile-stride mapping; it does not
-// interpret device code through a host CPU debug runtime.
 #include "dsv4_moe_expert_tiling.h"
 #include "moe/emu/dsv4_layers.h"
+#include "moe/kernels/arch35/launch.hpp"
+
+#include <acl/acl.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,20 +18,20 @@
 namespace {
 constexpr std::uint32_t kHidden = 512;
 constexpr std::uint32_t kInter = 512;
-constexpr std::uint32_t kRowsPerTile = 32;
-constexpr std::uint32_t kLanesPerRow = 16;
 constexpr std::uint32_t kGroup = 32;
-constexpr std::uint32_t kBlockDim = 2;
 constexpr float kLimit = 10.0F;
 constexpr std::uint64_t kSeed = 0xD5A40001ULL;
 constexpr float kAbsTolerance = 1.0e-2F;
 constexpr float kRelTolerance = 1.0e-2F;
 
+using moe::kernels::arch35::E8M0;
+using moe::kernels::arch35::Mxfp4Pair;
+
 struct Matrix {
   std::uint32_t rows;
   std::uint32_t cols;
-  std::vector<std::uint8_t> packed;
-  std::vector<std::uint8_t> scales;
+  std::vector<Mxfp4Pair> packed;
+  std::vector<E8M0> scales;
 
   moe::emu::Mxfp4Matrix View() const {
     return {packed.data(), scales.data(), static_cast<int>(rows),
@@ -40,10 +39,115 @@ struct Matrix {
   }
 };
 
+[[noreturn]] void Fail(const std::string& message) {
+  throw std::runtime_error(message);
+}
+
 void Require(bool condition, const std::string& message) {
-  if (!condition) {
-    throw std::runtime_error(message);
+  if (!condition) Fail(message);
+}
+
+std::string AclError(const char* call, aclError status) {
+  const char* recent = aclGetRecentErrMsg();
+  return std::string(call) + " failed with ACL status " +
+         std::to_string(status) + ": " +
+         (recent != nullptr ? recent : "<no recent ACL error>");
+}
+
+void RequireAcl(aclError status, const char* call) {
+  if (status != ACL_SUCCESS) Fail(AclError(call, status));
+}
+
+class Runtime {
+ public:
+  Runtime() {
+    RequireAcl(aclInit(nullptr), "aclInit");
+    initialized_ = true;
+    std::uint32_t device_count = 0;
+    RequireAcl(aclrtGetDeviceCount(&device_count), "aclrtGetDeviceCount");
+    Require(device_count > 0,
+            "CAModel reports no simulated Ascend device (device count is 0)");
+    RequireAcl(aclrtSetDevice(0), "aclrtSetDevice(0)");
+    device_set_ = true;
+    RequireAcl(aclrtCreateStream(&stream_), "aclrtCreateStream");
   }
+
+  Runtime(const Runtime&) = delete;
+  Runtime& operator=(const Runtime&) = delete;
+
+  ~Runtime() {
+    if (stream_ != nullptr) aclrtDestroyStream(stream_);
+    if (device_set_) aclrtResetDevice(0);
+    if (initialized_) aclFinalize();
+  }
+
+  aclrtStream stream() const noexcept { return stream_; }
+
+  void Close() {
+    if (stream_ != nullptr) {
+      RequireAcl(aclrtDestroyStream(stream_), "aclrtDestroyStream");
+      stream_ = nullptr;
+    }
+    if (device_set_) {
+      RequireAcl(aclrtResetDevice(0), "aclrtResetDevice(0)");
+      device_set_ = false;
+    }
+    if (initialized_) {
+      RequireAcl(aclFinalize(), "aclFinalize");
+      initialized_ = false;
+    }
+  }
+
+ private:
+  aclrtStream stream_ = nullptr;
+  bool initialized_ = false;
+  bool device_set_ = false;
+};
+
+class DeviceBuffer {
+ public:
+  explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
+    Require(bytes_ > 0, "device buffer size must be nonzero");
+    RequireAcl(aclrtMalloc(&pointer_, bytes_, ACL_MEM_MALLOC_HUGE_FIRST),
+               "aclrtMalloc");
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  ~DeviceBuffer() {
+    if (pointer_ != nullptr) {
+      const aclError status = aclrtFree(pointer_);
+      if (status != ACL_SUCCESS) {
+        std::fprintf(stderr, "[CLEANUP] %s\n", AclError("aclrtFree", status).c_str());
+      }
+    }
+  }
+
+  void* get() const noexcept { return pointer_; }
+  std::size_t bytes() const noexcept { return bytes_; }
+
+ private:
+  void* pointer_ = nullptr;
+  std::size_t bytes_;
+};
+
+template <typename T>
+void CopyToDevice(DeviceBuffer& destination, const std::vector<T>& source) {
+  const std::size_t bytes = source.size() * sizeof(T);
+  Require(destination.bytes() >= bytes, "host-to-device copy exceeds buffer");
+  RequireAcl(aclrtMemcpy(destination.get(), destination.bytes(), source.data(),
+                         bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+             "aclrtMemcpy(HOST_TO_DEVICE)");
+}
+
+template <typename T>
+void CopyFromDevice(std::vector<T>& destination, const DeviceBuffer& source) {
+  const std::size_t bytes = destination.size() * sizeof(T);
+  Require(source.bytes() >= bytes, "device-to-host copy exceeds buffer");
+  RequireAcl(aclrtMemcpy(destination.data(), bytes, source.get(), bytes,
+                         ACL_MEMCPY_DEVICE_TO_HOST),
+             "aclrtMemcpy(DEVICE_TO_HOST)");
 }
 
 std::uint8_t EncodeFp4(float value) {
@@ -63,17 +167,17 @@ std::uint8_t EncodeFp4(float value) {
 Matrix MakeMatrix(std::uint32_t rows, std::uint32_t cols,
                   std::mt19937_64& rng) {
   Require(cols % kGroup == 0, "MXFP4 width must be group aligned");
-  Matrix m{rows, cols,
-           std::vector<std::uint8_t>(static_cast<std::size_t>(rows) *
-                                     (cols / 2u)),
-           std::vector<std::uint8_t>(static_cast<std::size_t>(rows) *
-                                     (cols / kGroup))};
+  Matrix matrix{rows, cols,
+                std::vector<Mxfp4Pair>(static_cast<std::size_t>(rows) *
+                                       (cols / 2u)),
+                std::vector<E8M0>(static_cast<std::size_t>(rows) *
+                                  (cols / kGroup))};
   std::normal_distribution<float> source_weight(0.0F, 1.7F);
   for (std::uint32_t row = 0; row < rows; ++row) {
     for (std::uint32_t group = 0; group < cols / kGroup; ++group) {
-      const std::uint8_t scale_code =
-          static_cast<std::uint8_t>(126u + ((row + group) % 3u));
-      m.scales[static_cast<std::size_t>(row) * (cols / kGroup) + group] =
+      const E8M0 scale_code =
+          static_cast<E8M0>(126u + ((row + group) % 3u));
+      matrix.scales[static_cast<std::size_t>(row) * (cols / kGroup) + group] =
           scale_code;
       const float scale =
           std::ldexp(1.0F, static_cast<int>(scale_code) - 127);
@@ -81,95 +185,12 @@ Matrix MakeMatrix(std::uint32_t rows, std::uint32_t cols,
            col < (group + 1u) * kGroup; col += 2u) {
         const std::uint8_t low = EncodeFp4(source_weight(rng) / scale);
         const std::uint8_t high = EncodeFp4(source_weight(rng) / scale);
-        m.packed[static_cast<std::size_t>(row) * (cols / 2u) + col / 2u] =
-            static_cast<std::uint8_t>(low | (high << 4u));
+        matrix.packed[static_cast<std::size_t>(row) * (cols / 2u) + col / 2u] =
+            static_cast<Mxfp4Pair>(low | (high << 4u));
       }
     }
   }
-  return m;
-}
-
-float LanePartial(const std::uint8_t* packed, const std::uint8_t* scales,
-                  const float* x, std::uint32_t lane, std::uint32_t cols) {
-  const std::uint32_t pairs_per_lane = (cols / 2u) / kLanesPerRow;
-  const std::uint32_t scale_base = lane * pairs_per_lane / 16u;
-  float total = 0.0F;
-  for (std::uint32_t group = 0; group < pairs_per_lane / 16u; ++group) {
-    float subtotal = 0.0F;
-    const std::uint32_t pair_base = lane * pairs_per_lane + group * 16u;
-    for (std::uint32_t pair_offset = 0; pair_offset < 16u; ++pair_offset) {
-      const std::uint32_t pair = pair_base + pair_offset;
-      const std::uint8_t byte = packed[pair];
-      subtotal +=
-          moe::emu::DecodeFp4E2M1(byte & 0x0Fu) * x[2u * pair] +
-          moe::emu::DecodeFp4E2M1(byte >> 4u) * x[2u * pair + 1u];
-    }
-    const float scale =
-        std::ldexp(1.0F, static_cast<int>(scales[scale_base + group]) - 127);
-    total += subtotal * scale;
-  }
-  return total;
-}
-
-float SimtGemvRow(const Matrix& weight, std::uint32_t row, const float* x) {
-  const std::size_t packed_stride = weight.cols / 2u;
-  const std::size_t scale_stride = weight.cols / kGroup;
-  const std::uint8_t* packed =
-      weight.packed.data() + static_cast<std::size_t>(row) * packed_stride;
-  const std::uint8_t* scales =
-      weight.scales.data() + static_cast<std::size_t>(row) * scale_stride;
-  std::array<float, kLanesPerRow> lane_values{};
-  for (std::uint32_t lane = 0; lane < kLanesPerRow; ++lane) {
-    lane_values[lane] =
-        LanePartial(packed, scales, x, lane, weight.cols);
-  }
-  for (std::uint32_t mask = 1; mask < kLanesPerRow; mask <<= 1u) {
-    const auto previous = lane_values;
-    for (std::uint32_t lane = 0; lane < kLanesPerRow; ++lane) {
-      lane_values[lane] = previous[lane] + previous[lane ^ mask];
-    }
-  }
-  return lane_values[0];
-}
-
-template <typename RowFunction>
-std::vector<std::uint32_t> RunTiles(std::uint32_t rows,
-                                    RowFunction&& process_row) {
-  const std::uint32_t tile_count = rows / kRowsPerTile;
-  std::vector<std::uint32_t> visits(tile_count, 0u);
-  for (std::uint32_t core = 0; core < kBlockDim; ++core) {
-    for (std::uint32_t tile = core; tile < tile_count; tile += kBlockDim) {
-      ++visits[tile];
-      for (std::uint32_t offset = 0; offset < kRowsPerTile; ++offset) {
-        process_row(tile * kRowsPerTile + offset);
-      }
-    }
-  }
-  return visits;
-}
-
-std::vector<float> SimulateGateUp(const Matrix& w1, const Matrix& w3,
-                                  const std::vector<float>& x,
-                                  std::vector<std::uint32_t>* visits) {
-  std::vector<float> activated(kInter);
-  *visits = RunTiles(kInter, [&](std::uint32_t row) {
-    const float gate = SimtGemvRow(w1, row, x.data());
-    const float up = SimtGemvRow(w3, row, x.data());
-    const float g = gate < kLimit ? gate : kLimit;
-    const float u = up < -kLimit ? -kLimit : (up > kLimit ? kLimit : up);
-    activated[row] = (g / (1.0F + std::exp(-g))) * u;
-  });
-  return activated;
-}
-
-std::vector<float> SimulateDown(const Matrix& w2,
-                                const std::vector<float>& activated,
-                                std::vector<std::uint32_t>* visits) {
-  std::vector<float> output(kHidden);
-  *visits = RunTiles(kHidden, [&](std::uint32_t row) {
-    output[row] = SimtGemvRow(w2, row, activated.data());
-  });
-  return output;
+  return matrix;
 }
 
 struct Diff {
@@ -207,42 +228,11 @@ bool NonDegenerate(const std::vector<float>& values) {
   }
   const double mean = sum / static_cast<double>(values.size());
   const double mean_sq = sum_sq / static_cast<double>(values.size());
-  const double rms = std::sqrt(mean_sq);
   const double variance = std::max(0.0, mean_sq - mean * mean);
-  return rms > 1.0e-6 && std::sqrt(variance) > 1.0e-6;
+  return std::sqrt(mean_sq) > 1.0e-6 && std::sqrt(variance) > 1.0e-6;
 }
 
 void RunTest() {
-  moe::kernels::arch35::Dsv4MoeExpertTilingData tiling{};
-  const auto status = moe::kernels::arch35::MakeDsv4MoeExpertTiling(
-      kHidden, kInter, kHidden / 2u, kHidden / kGroup, kInter / 2u,
-      kInter / kGroup, &tiling);
-  Require(status == moe::kernels::arch35::Status::success,
-          "test override rejected the scaled tiling");
-  Require(tiling.block_dim == kBlockDim && tiling.hidden == kHidden &&
-              tiling.inter == kInter &&
-              tiling.rows_per_block == kRowsPerTile &&
-              tiling.group_size == kGroup &&
-              tiling.w13_packed_row_stride == kHidden / 2u &&
-              tiling.w13_scale_row_stride == kHidden / kGroup &&
-              tiling.w2_packed_row_stride == kInter / 2u &&
-              tiling.w2_scale_row_stride == kInter / kGroup &&
-              tiling.low_nibble_first == 1u && tiling.reserved0 == 0u &&
-              tiling.reserved1 == 0u && tiling.swiglu_limit == kLimit &&
-              moe::kernels::arch35::Dsv4ExpertTilingGeometryValid(
-                  tiling.hidden, tiling.inter, tiling.block_dim),
-          "test tiling fields do not satisfy the kernel geometry guard");
-
-  // Each lane must own at least one whole 16-pair scale group. Thus 256/128
-  // would make the kernel's group loop empty; 512 is the smallest valid width.
-  const auto group_aligned = [](std::uint32_t cols) {
-    const std::uint32_t pairs_per_lane =
-        (cols / 2u) / kLanesPerRow;
-    return pairs_per_lane >= 16u && pairs_per_lane % 16u == 0u;
-  };
-  Require(group_aligned(kHidden) && group_aligned(kInter),
-          "SIMT lanes do not own whole MXFP4 scale groups");
-
   std::mt19937_64 rng(kSeed);
   std::normal_distribution<float> x_distribution(0.0F, 0.25F);
   std::vector<float> x(kHidden);
@@ -251,65 +241,96 @@ void RunTest() {
   const Matrix w3 = MakeMatrix(kInter, kHidden, rng);
   const Matrix w2 = MakeMatrix(kHidden, kInter, rng);
 
-  std::vector<float> reference_gate(kInter);
-  std::vector<float> reference_up(kInter);
-  moe::emu::mxfp4_gemv_cpu(w1.View(), x.data(), reference_gate.data());
-  moe::emu::mxfp4_gemv_cpu(w3.View(), x.data(), reference_up.data());
-  std::uint32_t gate_upper_clamps = 0;
-  std::uint32_t up_upper_clamps = 0;
-  std::uint32_t up_lower_clamps = 0;
-  for (std::uint32_t row = 0; row < kInter; ++row) {
-    gate_upper_clamps += reference_gate[row] > kLimit ? 1u : 0u;
-    up_upper_clamps += reference_up[row] > kLimit ? 1u : 0u;
-    up_lower_clamps += reference_up[row] < -kLimit ? 1u : 0u;
-  }
-  Require(gate_upper_clamps > 0u && gate_upper_clamps < kInter &&
-              up_upper_clamps > 0u && up_lower_clamps > 0u,
-          "fixture did not exercise each asymmetric clamp branch");
-
-  std::vector<float> reference_y(kHidden);
+  std::vector<float> expected_y(kHidden);
   std::vector<float> scratch;
   moe::emu::moe_expert_swiglu_mxfp4_cpu(
-      w1.View(), w3.View(), w2.View(), x.data(), reference_y.data(), kLimit,
+      w1.View(), w3.View(), w2.View(), x.data(), expected_y.data(), kLimit,
       &scratch);
-  Require(scratch.size() >= kInter, "CPU reference omitted activation data");
-  const std::vector<float> reference_activated(scratch.begin(),
-                                                scratch.begin() + kInter);
-
-  std::vector<std::uint32_t> gate_visits;
-  const std::vector<float> actual_activated =
-      SimulateGateUp(w1, w3, x, &gate_visits);
-  std::vector<std::uint32_t> down_visits;
-  const std::vector<float> actual_y =
-      SimulateDown(w2, actual_activated, &down_visits);
-  const auto every_once = [](const std::vector<std::uint32_t>& visits) {
-    return std::all_of(visits.begin(), visits.end(),
-                       [](std::uint32_t n) { return n == 1u; });
-  };
-  Require(gate_visits.size() == 16u && down_visits.size() == 16u &&
-              every_once(gate_visits) && every_once(down_visits),
-          "grid-stride simulation skipped or duplicated a tile");
-
-  const Diff activation_diff =
-      Compare(actual_activated, reference_activated);
-  const Diff output_diff = Compare(actual_y, reference_y);
-  Require(NonDegenerate(reference_activated),
+  Require(scratch.size() >= kInter, "CPU golden omitted activation data");
+  std::vector<float> expected_activated(scratch.begin(),
+                                        scratch.begin() + kInter);
+  Require(NonDegenerate(expected_activated),
           "activation golden is zero, constant, or non-finite");
-  Require(NonDegenerate(reference_y),
+  Require(NonDegenerate(expected_y),
           "output golden is zero, constant, or non-finite");
+
+  moe::kernels::arch35::Dsv4MoeExpertTilingData tiling{};
+  const auto tiling_status = moe::kernels::arch35::MakeDsv4MoeExpertTiling(
+      kHidden, kInter, kHidden / 2u, kHidden / kGroup, kInter / 2u,
+      kInter / kGroup, &tiling);
+  Require(tiling_status == moe::kernels::arch35::Status::success,
+          std::string("scaled tiling rejected: ") +
+              moe::kernels::arch35::ToString(tiling_status));
+
+  std::vector<float> actual_activated(kInter);
+  std::vector<float> actual_y(kHidden);
+  {
+    Runtime runtime;
+    {
+      DeviceBuffer d_w1_packed(w1.packed.size() * sizeof(Mxfp4Pair));
+      DeviceBuffer d_w1_scale(w1.scales.size() * sizeof(E8M0));
+      DeviceBuffer d_w3_packed(w3.packed.size() * sizeof(Mxfp4Pair));
+      DeviceBuffer d_w3_scale(w3.scales.size() * sizeof(E8M0));
+      DeviceBuffer d_x(x.size() * sizeof(float));
+      DeviceBuffer d_activated(actual_activated.size() * sizeof(float));
+      DeviceBuffer d_w2_packed(w2.packed.size() * sizeof(Mxfp4Pair));
+      DeviceBuffer d_w2_scale(w2.scales.size() * sizeof(E8M0));
+      DeviceBuffer d_y(actual_y.size() * sizeof(float));
+
+      CopyToDevice(d_w1_packed, w1.packed);
+      CopyToDevice(d_w1_scale, w1.scales);
+      CopyToDevice(d_w3_packed, w3.packed);
+      CopyToDevice(d_w3_scale, w3.scales);
+      CopyToDevice(d_x, x);
+      CopyToDevice(d_w2_packed, w2.packed);
+      CopyToDevice(d_w2_scale, w2.scales);
+
+      const auto launch_status = moe::kernels::arch35::LaunchDsv4MoeExpert(
+          static_cast<const Mxfp4Pair*>(d_w1_packed.get()),
+          static_cast<const E8M0*>(d_w1_scale.get()),
+          static_cast<const Mxfp4Pair*>(d_w3_packed.get()),
+          static_cast<const E8M0*>(d_w3_scale.get()),
+          static_cast<const Mxfp4Pair*>(d_w2_packed.get()),
+          static_cast<const E8M0*>(d_w2_scale.get()), kHidden / 2u,
+          kHidden / kGroup, kInter / 2u, kInter / kGroup,
+          static_cast<const float*>(d_x.get()), kHidden, kInter,
+          static_cast<float*>(d_y.get()), d_activated.get(),
+          moe::kernels::arch35::Dsv4MoeExpertWorkspaceBytes(kInter),
+          runtime.stream());
+      if (launch_status != moe::kernels::arch35::Status::success) {
+        const auto& failure = moe::kernels::arch35::LastLaunchFailure();
+        const char* failed_call =
+            failure.call != nullptr ? failure.call : "<no recorded ACL call>";
+        Fail(std::string("LaunchDsv4MoeExpert returned ") +
+             moe::kernels::arch35::ToString(launch_status) + "; last ACL " +
+             failed_call + " status " + std::to_string(failure.acl_error) +
+             "; " + (aclGetRecentErrMsg() != nullptr ? aclGetRecentErrMsg()
+                                                      : "<no recent ACL error>"));
+      }
+      RequireAcl(aclrtSynchronizeStream(runtime.stream()),
+                 "aclrtSynchronizeStream");
+      CopyFromDevice(actual_activated, d_activated);
+      CopyFromDevice(actual_y, d_y);
+    }
+    runtime.Close();
+  }
+
+  const Diff activation_diff = Compare(actual_activated, expected_activated);
+  const Diff output_diff = Compare(actual_y, expected_y);
   std::printf("Seed: 0x%llX\n", static_cast<unsigned long long>(kSeed));
-  std::printf("Tiling accepted: hidden=%u inter=%u block_dim=%u rows/tile=%u; "
-              "gate/up tiles=16, down tiles=16 (8 tiles/core)\n",
-              tiling.hidden, tiling.inter, tiling.block_dim,
-              tiling.rows_per_block);
+  std::printf("Executed dsv4_moe_expert_gate_up and "
+              "dsv4_moe_expert_down via AscendCL: hidden=%u inter=%u "
+              "block_dim=%u, gate/up tiles=%u, down tiles=%u\n",
+              kHidden, kInter, tiling.block_dim,
+              kInter / tiling.rows_per_block, kHidden / tiling.rows_per_block);
   std::printf("Activated max abs diff: %.8g; output max abs diff: %.8g "
               "(abs/rel tolerance %.2g/%.2g)\n",
               activation_diff.max_abs, output_diff.max_abs, kAbsTolerance,
               kRelTolerance);
   Require(activation_diff.within_tolerance,
-          "gate/up activation differs from CPU reference beyond tolerance");
+          "device activation differs from CPU golden beyond tolerance");
   Require(output_diff.within_tolerance,
-          "down output differs from CPU reference beyond tolerance");
+          "device output differs from CPU golden beyond tolerance");
 }
 }  // namespace
 
@@ -317,9 +338,9 @@ int main() {
   try {
     RunTest();
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "[FAIL] Dsv4MoeExpertSim: %s\n", error.what());
+    std::fprintf(stderr, "[FAIL] Dsv4MoeExpertCamodel: %s\n", error.what());
     return 1;
   }
-  std::puts("[PASS] Dsv4MoeExpertSim");
+  std::puts("[PASS] Dsv4MoeExpertCamodel");
   return 0;
 }
