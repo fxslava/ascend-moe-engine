@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 // test_custom_kernels_npu_device -- Target B, on-device verification.
 //
-// Runs the five arch35 kernels on real hardware through the Launch* wrappers
+// Runs the six arch35 kernels on real hardware through the Launch* wrappers
 // and compares each result, on the fly, against the same in-memory CPU golden
 // that Target A asserts the invariants of. Nothing is read from disk.
 //
@@ -1064,6 +1064,262 @@ void DevicePagedCompressorRope(Report& rep, aclrtStream stream) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// dsv4_moe_expert: the fused routed expert, gate/up GEMV + asymmetric clamped
+// SwiGLU + down GEMV, for one token.
+//
+// Operands: w1/w3 [2048,4096] and w2 [4096,2048] MXFP4 with their E8M0 scale
+// planes, x [4096] FP32. Output y [4096] FP32. The only geometry
+// MakeDsv4MoeExpertTiling admits is hidden=4096 / inter=2048.
+//
+// WHAT IS AND IS NOT OBSERVABLE.
+// This operator materializes exactly two tensors in GM: `activated` (in the
+// caller's workspace, written by the gate_up dispatch and read by the down
+// dispatch) and `y`. The raw gate and up projections are never stored --
+// gate_up fuses silu(clamp(gate)) * clamp(up) inside a 32-row UB tile and
+// writes only the product. So there are two checkable stages here, not four,
+// and this case asserts both:
+//
+//   activated <- scratch[0, inter)  after moe_expert_swiglu_mxfp4_cpu, which
+//                leaves the activation in the first half of its scratch
+//   y         <- the reference's `out`
+//
+// Checking `activated` is what separates a gate_up bug from a down bug: with
+// only `y` asserted, an error in either dispatch arrives as the same failure.
+// It costs nothing, because the test already owns the workspace.
+//
+// THE FIXTURE, AND WHY THE SCALE BAND IS NARROW.
+// The DSV4 clamp SATURATES. Once |w1 @ x| is well past the limit, min(gate,
+// limit) returns the limit regardless of the GEMV result, and the comparison
+// stops being sensitive to the arithmetic it exists to verify. E8M0 codes in
+// [121,123] put the gate's standard deviation at 7.54 against a limit of 10,
+// measured on this reference at this geometry with this seed: 9.0% of gate
+// rows and 20.4% of up rows saturate, so both halves of the clamp are hit
+// while the large majority of rows stay in the linear region where a wrong
+// product still shows. Codes near the 127 bias do NOT work here -- at
+// hidden=4096 they pin ~98% of `up` at +/-limit and would let a broken up
+// GEMV pass. (tests/emu uses a band near the bias at hidden=1024, a quarter
+// of the reduction width; the band does not transfer.)
+//
+// TOLERANCE.
+// Both sides decode the same MXFP4 lattice, and an E2M1 nibble times a
+// power-of-two E8M0 scale is exact in FP32, so there is no quantization term:
+// the only difference is reduction ORDER. The device splits each row over 16
+// lanes and factors the scale per 32-element group, then reduces the lanes in
+// a butterfly; the reference accumulates sequentially. FP32 carries a 24-bit
+// mantissa, so a 4096-term reorder is bounded in the random-walk model by
+// ~sqrt(4096) * 2^-24 ~= 4e-6 relative, and the down GEMV's 2048 terms add
+// the same order again. 1e-4 on relative L2 is that bound with room to spare,
+// and the floor on cosine stays tight: reordering moves magnitude, while a
+// wrong lane range or a mismatched scale byte moves direction.
+// ---------------------------------------------------------------------------
+void DeviceDsv4MoeExpert(Report& rep, aclrtStream stream) {
+  constexpr std::uint32_t kHidden = 4096;
+  constexpr std::uint32_t kInter = 2048;
+  constexpr std::uint32_t kGroup = 32;
+  // The clamp bound is NOT a launch argument: MakeDsv4MoeExpertTiling writes
+  // kDsv4ExpertSwigluLimit into the POD host-side. That constant lives in
+  // op_host/dsv4_moe_expert_tiling.h, which is op-private (§1.2) and must not
+  // be reached across from here (§1.3), so the golden is driven by the
+  // oracle's own public copy. The two are the same model constant; the guard
+  // below fails loudly if either drifts, because the fixture's scale band was
+  // chosen against this value.
+  constexpr float kLimit = moe::emu::kSwigluLimit;
+
+  const std::size_t w13_packed = static_cast<std::size_t>(kInter) * (kHidden / 2);
+  const std::size_t w13_scale = static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  const std::size_t w2_packed = static_cast<std::size_t>(kHidden) * (kInter / 2);
+  const std::size_t w2_scale = static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  Rng rng(0xD50E4ULL);
+  const std::vector<std::uint8_t> w1p = rng.bytes(w13_packed);
+  const std::vector<std::uint8_t> w3p = rng.bytes(w13_packed);
+  const std::vector<std::uint8_t> w2p = rng.bytes(w2_packed);
+  const std::vector<std::uint8_t> w1s = rng.bytes(w13_scale, 121, 123);
+  const std::vector<std::uint8_t> w3s = rng.bytes(w13_scale, 121, 123);
+  const std::vector<std::uint8_t> w2s = rng.bytes(w2_scale, 121, 123);
+  const std::vector<float> x = rng.normal(kHidden);
+
+  if (kLimit != 10.0F) {
+    rep.fail("device dsv4_moe_expert",
+             "moe::emu::kSwigluLimit is not the model's 10.0, so it no longer "
+             "agrees with the kernel's kDsv4ExpertSwigluLimit and the "
+             "fixture's scale band is no longer calibrated to the clamp");
+    return;
+  }
+
+  // --- golden, in memory, this run -------------------------------------
+  const auto matrix = [](const std::vector<std::uint8_t>& packed,
+                         const std::vector<std::uint8_t>& scale, int rows,
+                         int cols) {
+    moe::emu::Mxfp4Matrix m;
+    m.packed = packed.data();
+    m.scale = scale.data();
+    m.rows = rows;
+    m.cols = cols;
+    return m;
+  };
+  const moe::emu::Mxfp4Matrix w1 =
+      matrix(w1p, w1s, static_cast<int>(kInter), static_cast<int>(kHidden));
+  const moe::emu::Mxfp4Matrix w3 =
+      matrix(w3p, w3s, static_cast<int>(kInter), static_cast<int>(kHidden));
+  const moe::emu::Mxfp4Matrix w2 =
+      matrix(w2p, w2s, static_cast<int>(kHidden), static_cast<int>(kInter));
+
+  std::vector<float> want_y(kHidden, 0.0F);
+  std::vector<float> scratch;
+  moe::emu::moe_expert_swiglu_mxfp4_cpu(w1, w3, w2, x.data(), want_y.data(),
+                                        kLimit, &scratch);
+  // ExpertSwiglu leaves the activation in scratch[0, inter) and the raw up
+  // projection in scratch[inter, 2*inter); the kernel's workspace holds the
+  // former.
+  if (scratch.size() < static_cast<std::size_t>(kInter)) {
+    rep.fail("device dsv4_moe_expert",
+             "reference scratch is shorter than inter; the activated-stage "
+             "comparison would read past it");
+    return;
+  }
+  const float* want_activated = scratch.data();
+
+  // --- device ------------------------------------------------------------
+  const std::size_t workspace_bytes = Dsv4MoeExpertWorkspaceBytes(kInter);
+  if (workspace_bytes < static_cast<std::size_t>(kInter) * sizeof(float)) {
+    rep.fail("device dsv4_moe_expert",
+             "Dsv4MoeExpertWorkspaceBytes is smaller than the activated "
+             "vector it must hold");
+    return;
+  }
+
+  DeviceBuffer d_w1p, d_w1s, d_w3p, d_w3s, d_w2p, d_w2s, d_x, d_y, d_ws;
+  aclError rc = d_w1p.Alloc(w13_packed);
+  if (rc == ACL_SUCCESS) rc = d_w1s.Alloc(w13_scale);
+  if (rc == ACL_SUCCESS) rc = d_w3p.Alloc(w13_packed);
+  if (rc == ACL_SUCCESS) rc = d_w3s.Alloc(w13_scale);
+  if (rc == ACL_SUCCESS) rc = d_w2p.Alloc(w2_packed);
+  if (rc == ACL_SUCCESS) rc = d_w2s.Alloc(w2_scale);
+  if (rc == ACL_SUCCESS) rc = d_x.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_ws.Alloc(workspace_bytes);
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_expert", AclFail("aclrtMalloc", rc));
+    return;
+  }
+
+  rc = d_w1p.Upload(w1p.data(), w13_packed);
+  if (rc == ACL_SUCCESS) rc = d_w1s.Upload(w1s.data(), w13_scale);
+  if (rc == ACL_SUCCESS) rc = d_w3p.Upload(w3p.data(), w13_packed);
+  if (rc == ACL_SUCCESS) rc = d_w3s.Upload(w3s.data(), w13_scale);
+  if (rc == ACL_SUCCESS) rc = d_w2p.Upload(w2p.data(), w2_packed);
+  if (rc == ACL_SUCCESS) rc = d_w2s.Upload(w2s.data(), w2_scale);
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Zero();
+  // Zeroed so a dispatch that never writes `activated` is visible as zeros
+  // rather than as whatever the allocator handed back.
+  if (rc == ACL_SUCCESS) rc = d_ws.Zero();
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_expert", AclFail("aclrtMemcpy(H2D)", rc));
+    return;
+  }
+
+  const Status st = LaunchDsv4MoeExpert(
+      d_w1p.as<Mxfp4Pair>(), d_w1s.as<E8M0>(), d_w3p.as<Mxfp4Pair>(),
+      d_w3s.as<E8M0>(), d_w2p.as<Mxfp4Pair>(), d_w2s.as<E8M0>(),
+      kHidden / 2, kHidden / kGroup, kInter / 2, kInter / kGroup,
+      d_x.as<float>(), kHidden, kInter, d_y.as<float>(), d_ws.get(),
+      workspace_bytes, stream);
+  if (st != Status::success) {
+    rep.fail("device dsv4_moe_expert", LaunchFail("LaunchDsv4MoeExpert", st));
+    return;
+  }
+
+  // The wrapper synchronizes the stream before it returns (§3.7), so both
+  // dispatches have retired and `activated` is readable.
+  std::vector<float> got_activated(kInter, 0.0F);
+  std::vector<float> got_y(kHidden, 0.0F);
+  rc = d_ws.Download(got_activated.data(),
+                     static_cast<std::size_t>(kInter) * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_y.Download(got_y.data(), kHidden * sizeof(float));
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_expert", AclFail("aclrtMemcpy(D2H)", rc));
+    return;
+  }
+
+  // --- stage 1: activated, the gate_up dispatch -------------------------
+  {
+    const double cos = CosineSimilarity(got_activated.data(), want_activated, kInter);
+    const double l2 = RelativeL2(got_activated.data(), want_activated, kInter);
+    const Spread ref = MeasureSpread(want_activated, kInter);
+    const bool finite = AllFinite(got_activated.data(), kInter);
+    char detail[400];
+    std::snprintf(detail, sizeof(detail),
+                  "activated[%u] (gate_up, from workspace): cos %.9f (floor "
+                  "0.99999), relL2 %.3e (ceil 1e-4), finite=%d, golden rms "
+                  "%.3e stddev %.3e range [%.3f, %.3f] non-degenerate=%d, "
+                  "seed 0x%llx",
+                  kInter, cos, l2, static_cast<int>(finite), ref.rms,
+                  ref.stddev, ref.min, ref.max,
+                  static_cast<int>(ref.NonDegenerate()),
+                  static_cast<unsigned long long>(rng.seed()));
+    rep.check(finite && ref.NonDegenerate() && cos >= 0.99999 && l2 <= 1e-4,
+              "device dsv4_moe_expert activated (silu(clamp(gate)) * "
+              "clamp(up)) matches the in-memory golden",
+              detail);
+  }
+
+  // --- stage 2: y, the down dispatch ------------------------------------
+  {
+    const double cos = CosineSimilarity(got_y.data(), want_y.data(), kHidden);
+    const double l2 = RelativeL2(got_y.data(), want_y.data(), kHidden);
+    const Spread ref = MeasureSpread(want_y.data(), kHidden);
+    const bool finite = AllFinite(got_y.data(), kHidden);
+    char detail[400];
+    std::snprintf(detail, sizeof(detail),
+                  "y[%u] (down): cos %.9f (floor 0.9999), relL2 %.3e (ceil "
+                  "1e-4), finite=%d, golden rms %.3e stddev %.3e range "
+                  "[%.3f, %.3f] non-degenerate=%d, seed 0x%llx",
+                  kHidden, cos, l2, static_cast<int>(finite), ref.rms,
+                  ref.stddev, ref.min, ref.max,
+                  static_cast<int>(ref.NonDegenerate()),
+                  static_cast<unsigned long long>(rng.seed()));
+    rep.check(finite && ref.NonDegenerate() && cos >= 0.9999 && l2 <= 1e-4,
+              "device dsv4_moe_expert y matches moe_expert_swiglu_mxfp4_cpu",
+              detail);
+  }
+
+  // --- the clamp was actually exercised ---------------------------------
+  // The fixture's whole point. If neither clamp half ever engaged, the case
+  // verified three GEMVs and a silu, not the DSV4 activation -- and if a half
+  // engaged everywhere, the GEMV feeding it was unobservable. Measured on the
+  // GOLDEN (§4.8), not by comparing a device value with itself.
+  {
+    std::vector<float> gate(kInter, 0.0F);
+    std::vector<float> up(kInter, 0.0F);
+    moe::emu::mxfp4_gemv_cpu(w1, x.data(), gate.data());
+    moe::emu::mxfp4_gemv_cpu(w3, x.data(), up.data());
+    std::size_t gate_sat = 0;
+    std::size_t up_sat = 0;
+    for (std::uint32_t i = 0; i < kInter; ++i) {
+      if (gate[i] >= kLimit) ++gate_sat;
+      if (up[i] >= kLimit || up[i] <= -kLimit) ++up_sat;
+    }
+    const double gate_pct = 100.0 * static_cast<double>(gate_sat) / kInter;
+    const double up_pct = 100.0 * static_cast<double>(up_sat) / kInter;
+    char detail[320];
+    std::snprintf(detail, sizeof(detail),
+                  "golden saturation at limit %.1f: gate(upper) %.1f%%, "
+                  "up(two-sided) %.1f%%; both must land in (1%%, 90%%) or the "
+                  "fixture is testing the clamp instead of the GEMVs, or the "
+                  "GEMVs instead of the clamp",
+                  static_cast<double>(kLimit), gate_pct, up_pct);
+    rep.check(gate_pct > 1.0 && gate_pct < 90.0 && up_pct > 1.0 &&
+                  up_pct < 90.0,
+              "the fixture exercises both halves of the asymmetric clamp "
+              "without saturating either",
+              detail);
+  }
+}
+
 }  // namespace
 
 void RunDeviceCases(Report& rep) {
@@ -1072,6 +1328,7 @@ void RunDeviceCases(Report& rep) {
   DeviceFp8IndexerTopK(rep, g_stream);
   DeviceMhcPreNormSinkhorn(rep, g_stream);
   DevicePagedCompressorRope(rep, g_stream);
+  DeviceDsv4MoeExpert(rep, g_stream);
 }
 
 }  // namespace moe::kerntest
@@ -1080,7 +1337,7 @@ int main() {
   using moe::kerntest::Report;
 
   std::printf("test_custom_kernels_npu_device\n");
-  std::printf("  scope: the five arch35 operators on real hardware, compared\n"
+  std::printf("  scope: the six arch35 operators on real hardware, compared\n"
               "         against the in-memory CPU golden (moe_emu)\n");
   std::printf("  references: generated per run, no disk fixtures\n\n");
 

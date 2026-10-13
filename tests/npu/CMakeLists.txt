@@ -48,7 +48,7 @@ foreach(_test IN LISTS _npu_tests)
 endforeach()
 
 # ---------------------------------------------------------------------------
-# On-device verification of the five arch35 operators (CLAUDE.md section 4).
+# On-device verification of the six arch35 operators (CLAUDE.md section 4).
 #
 # Separate from the loop above because it links the BiSheng-built launch layer
 # rather than ascend_moe_engine, and because it only exists when that layer
