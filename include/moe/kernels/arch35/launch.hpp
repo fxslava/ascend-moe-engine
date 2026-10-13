@@ -192,7 +192,7 @@ Status LaunchDsv4MoeExpert(
 // ---------------------------------------------------------------------------
 // bf16_block_quant_fp8
 //
-// BF16 -> FP8 E4M3 with one FP32 scale per 32 elements, for the activation
+// BF16/FP32 -> FP8 E4M3 with one FP32 scale per 128 elements, for the activation
 // quantizer sites that feed the FP8 projections.
 //
 // This REPLACES the aclnnDynamicMxQuant + aclnnCast pair those sites used:
@@ -201,11 +201,11 @@ Status LaunchDsv4MoeExpert(
 // cost two launches, and on hardware it failed with EZ1009. One dispatch
 // here, with the scales already in the dtype the matmul wants.
 //
-// `width` must be a multiple of 32 (whole scale blocks) and at most 65,536;
+// `width` must be a multiple of 128 (whole scale blocks) and at most 65,536;
 // the live sites are 1,024 / 2,048 / 4,096 / 8,192 / 32,768. x, y and scale
 // must not alias.
 //
-// `scale` holds width/32 floats and is NOT power-of-two quantized -- see the
+// `scale` holds width/128 floats and is NOT power-of-two quantized -- see the
 // divergence note in op_host/bf16_block_quant_fp8_tiling.h.
 // ---------------------------------------------------------------------------
 inline constexpr std::size_t kBlockQuantFp8WorkspaceBytes = 0;
@@ -215,7 +215,7 @@ Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
                                std::size_t workspace_bytes,
                                aclrtStream stream);
 
-// FP32 input uses the same block-32 scales and FP8 encoding without a BF16
+// FP32 input uses the same block-128 scales and FP8 encoding without a BF16
 // rounding step. Workspace and shape restrictions are identical.
 Status LaunchBf16BlockQuantFp8(const float* x_gm, std::uint32_t width,
                              Fp8E4M3* y_gm, float* scale_gm, void* workspace,

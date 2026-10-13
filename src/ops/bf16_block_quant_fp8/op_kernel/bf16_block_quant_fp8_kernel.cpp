@@ -2,7 +2,7 @@
 // dav-3510, 32 AIVs, hybrid SIMD/SIMT).
 //
 // Math (oracle: moe::emu::bf16_block_quant_fp8_cpu):
-//   for each block b of 32 consecutive elements:
+//   for each block b of 128 consecutive elements:
 //     m        = max over the block of |x|
 //     scale[b] = (m > 0) ? m / 448 : 1          FP32, NOT a power of two
 //     q[i]     = e4m3( x[i] * (448 / m) )       saturating, round-to-nearest
@@ -16,8 +16,8 @@
 //
 // Per tile: MTE2 the BF16 tile and widen with a SIMD Cast, or MTE2 FP32
 // directly into the same FP32 buffer, then ONE
-// SIMT launch of 512 threads = 32 blocks x 16 lanes. Each lane owns a
-// float2, reduces the block max through an in-register butterfly, converts
+// SIMT launch of 512 threads = 8 blocks x 64 lanes. Each lane owns a
+// float2, reduces four 32-element chunks and combines their maxima in UB, converts
 // its pair with the hardware E4M3 encoder, and lane 0 writes the block's
 // FP32 scale. The SIMD side then stores both outputs.
 //
@@ -35,14 +35,21 @@ namespace moe::kernels::arch35::bf16_block_quant_fp8 {
 
 using namespace AscendC;
 
+static_assert(kBlockSize == kBlockQuantBlockSize &&
+              kElemsPerTile == kBlockQuantElemsPerTile &&
+              kBlocksPerTile == kBlockQuantBlocksPerTile &&
+              kDynUbBytes == BlockQuantDynUbBytes(),
+              "host tiling and device geometry must agree");
+
 __simt_vf__ __aicore__ __launch_bounds__(kSimtThreads) inline void
 BlockQuantTileSimt(__ubuf__ const float* x_ub,     // [kElemsPerTile]
                    __ubuf__ std::uint8_t* q_ub,    // [kElemsPerTile]
                    __ubuf__ float* scale_ub,       // [kBlocksPerTile]
-                   std::uint32_t tile_elems) {     // multiple of 32
+                   __ubuf__ float* partials_ub,    // [kPartialsPerTile]
+                   std::uint32_t tile_elems) {     // multiple of 128
   const std::uint32_t t = threadIdx.x;
-  const std::uint32_t block = t / kLanesPerBlock;  // 0..31
-  const std::uint32_t lane = t % kLanesPerBlock;   // 0..15
+  const std::uint32_t block = t / kLanesPerBlock;  // 0..7
+  const std::uint32_t lane = t % kLanesPerBlock;   // 0..63
   const std::uint32_t i0 = block * kBlockSize + 2u * lane;
 
   // Whole blocks only: MakeBf16BlockQuantFp8Tiling rejects a width that is
@@ -61,14 +68,20 @@ BlockQuantTileSimt(__ubuf__ const float* x_ub,     // [kElemsPerTile]
   }
 
   float m = fmaxf(fabsf(a0), fabsf(a1));
-  // In-register block reduction across the 16 lanes of this block. The xor
-  // masks 1,2,4,8 at width 16 stay inside the aligned 16-lane group, so the
-  // 32 blocks of the launch reduce independently and every lane ends holding
-  // its own block's maximum -- which is what removes the broadcast step.
-  m = fmaxf(m, asc_shfl_xor(m, 1, kLanesPerBlock));
-  m = fmaxf(m, asc_shfl_xor(m, 2, kLanesPerBlock));
-  m = fmaxf(m, asc_shfl_xor(m, 4, kLanesPerBlock));
-  m = fmaxf(m, asc_shfl_xor(m, 8, kLanesPerBlock));
+  // Four independent 32-element chunks, each reduced within 16 lanes.
+  // A shuffle cannot span the two warps of a 64-lane scale block.
+  m = fmaxf(m, asc_shfl_xor(m, 1, kLanesPerChunk));
+  m = fmaxf(m, asc_shfl_xor(m, 2, kLanesPerChunk));
+  m = fmaxf(m, asc_shfl_xor(m, 4, kLanesPerChunk));
+  m = fmaxf(m, asc_shfl_xor(m, 8, kLanesPerChunk));
+  if (lane % kLanesPerChunk == 0u) {
+    partials_ub[block * kChunksPerBlock + lane / kLanesPerChunk] = m;
+  }
+  // All 512 threads participate, including inactive blocks in a short tile.
+  asc_syncthreads();
+  const std::uint32_t partial_base = block * kChunksPerBlock;
+  m = fmaxf(fmaxf(partials_ub[partial_base], partials_ub[partial_base + 1u]),
+            fmaxf(partials_ub[partial_base + 2u], partials_ub[partial_base + 3u]));
 
   // An all-zero block gets scale 1 and codes 0. Deriving the scale from a
   // zero max would emit 0 or a denormal, and the consuming matmul would then
@@ -138,7 +151,7 @@ class Bf16BlockQuantFp8 {
     // constructor and the toolkit leaves LocalMemAllocator::LocalMemAllocator()
     // without a reachable definition on this include path, which produces
     // -Wundefined-inline. head_ starts at 0 per instance, so a local is
-    // equivalent -- all four tensors are allocated here, once, in this order.
+    // equivalent -- all five tensors are allocated here, once, in this order.
     //
     // Alloc()'s tileSize is in ELEMENTS, not bytes.
     LocalMemAllocator<> alloc;
@@ -146,6 +159,7 @@ class Bf16BlockQuantFp8 {
     xF32Tensor_ = alloc.Alloc<float>(kElemsPerTile);
     qTensor_ = alloc.Alloc<std::uint8_t>(kElemsPerTile);
     scaleTensor_ = alloc.Alloc<float>(kBlocksPerTile);
+    partialsTensor_ = alloc.Alloc<float>(kPartialsPerTile);
   }
 
   __aicore__ inline void Process() {
@@ -180,13 +194,20 @@ class Bf16BlockQuantFp8 {
           reinterpret_cast<__ubuf__ float*>(xF32Tensor_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ std::uint8_t*>(qTensor_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float*>(scaleTensor_.GetPhyAddr()),
+          reinterpret_cast<__ubuf__ float*>(partialsTensor_.GetPhyAddr()),
           tile_elems);
       DataSyncBarrier<MemDsbT::ALL>();
 
       SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
       WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
       DataCopy(yGm_[base], qTensor_, tile_elems);
-      DataCopy(scaleGm_[base / kBlockSize], scaleTensor_, tile_blocks);
+      // A partial tile has fewer than eight scales (32 B). Use byte-count
+      // DMA so it neither drops the tail nor overwrites the next GM buffer.
+      DataCopyExtParams scale_copy{
+          1u, tile_blocks * static_cast<std::uint32_t>(sizeof(float)), 0u, 0u, 0u};
+      DataCopyPad(scaleGm_[base / kBlockSize], scaleTensor_, scale_copy);
+      SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
+      WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
     }
   }
 
@@ -198,6 +219,7 @@ class Bf16BlockQuantFp8 {
   LocalTensor<float> xF32Tensor_;
   LocalTensor<std::uint8_t> qTensor_;
   LocalTensor<float> scaleTensor_;
+  LocalTensor<float> partialsTensor_;
 
   GlobalTensor<bfloat16_t> xGm_;
   GlobalTensor<float> xF32Gm_;

@@ -58,7 +58,7 @@ Status LaunchBlockQuantFp8(const void* x_gm, std::uint32_t input_is_fp32,
 
   // The second chevron slot is dyn_ub_size (uint32 BYTES), not an l2ctrl
   // pointer: the 950PR hybrid launch is
-  // kernel<<<block_num, dyn_ub_size, stream>>>. Three of this kernel's four
+  // kernel<<<block_num, dyn_ub_size, stream>>>. Four of this kernel's five
   // UB buffers are addressed by the SIMT VF, and a declared size of 0 leaves
   // the VF addressing a region the launch never reserved -- the error-341 /
   // aclError-507035 class. CLAUDE.md §3.1 prescribes nullptr for this slot;

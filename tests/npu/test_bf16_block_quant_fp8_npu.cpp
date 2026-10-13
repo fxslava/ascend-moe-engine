@@ -138,7 +138,8 @@ float InputFloat(std::uint16_t value) { return Bf16ToFloat(value); }
 float InputFloat(float value) { return value; }
 
 template <typename Input>
-void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
+void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream,
+                 bool chunk_pattern = false) {
   std::printf("  input: %s\n", std::is_same_v<Input, float> ? "FP32" : "BF16");
   std::printf("\n-- width %u (%u blocks of %d), seed 0x%08X\n", width,
               width / kBlock, kBlock, seed);
@@ -165,6 +166,19 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
       std::fill_n(x.begin() + kBlock, kBlock, 0.0F);
     }
   }
+  if (chunk_pattern) {
+    // Distinct maxima in all four chunks, with the largest value in a
+    // different lane of every block. Exercise both sides of the warp boundary.
+    for (std::uint32_t i = 0; i < width; ++i) {
+      const std::uint32_t block = i / 128u;
+      const std::uint32_t lane = i % 128u;
+      float value = std::ldexp(1.0F, static_cast<int>(lane / 32u));
+      if (lane == (block * 37u + 127u) % 128u) value = -448.0F;
+      value *= std::ldexp(1.0F, static_cast<int>(block % 5u));
+      if constexpr (std::is_same_v<Input, float>) x[i] = value;
+      else x[i] = FloatToBf16(value);
+    }
+  }
 
   // Host golden, from the same bits the device will see.
   std::vector<std::uint8_t> want_q(width);
@@ -176,8 +190,10 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
   DeviceBuffer d_q;
   DeviceBuffer d_scale;
   aclError rc = d_x.Alloc(static_cast<std::size_t>(width) * sizeof(Input));
-  if (rc == ACL_SUCCESS) rc = d_q.Alloc(width);
-  if (rc == ACL_SUCCESS) rc = d_scale.Alloc(static_cast<std::size_t>(blocks) * 4);
+  constexpr std::size_t kGuardBytes = 32;
+  const std::size_t scale_bytes = static_cast<std::size_t>(blocks) * sizeof(float);
+  if (rc == ACL_SUCCESS) rc = d_q.Alloc(width + kGuardBytes);
+  if (rc == ACL_SUCCESS) rc = d_scale.Alloc(scale_bytes + kGuardBytes);
   if (rc == ACL_SUCCESS) {
     rc = d_x.Upload(x.data(), static_cast<std::size_t>(width) * sizeof(Input));
   }
@@ -204,6 +220,21 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
     return;
   }
   Check(true, "launch and synchronize returned success");
+
+  // Check exact output extents, especially the 4/8/28-byte scale tails.
+  std::vector<std::uint8_t> q_storage(width + kGuardBytes);
+  std::vector<std::uint8_t> scale_storage(scale_bytes + kGuardBytes);
+  rc = d_q.Download(q_storage.data(), q_storage.size());
+  if (rc == ACL_SUCCESS) rc = d_scale.Download(scale_storage.data(), scale_storage.size());
+  if (rc != ACL_SUCCESS) {
+    Check(false, AclFail("aclrtMemcpy output canaries", rc));
+    return;
+  }
+  Check(std::all_of(q_storage.begin() + width, q_storage.end(),
+                    [](std::uint8_t c) { return c == 0xA5u; }) &&
+            std::all_of(scale_storage.begin() + scale_bytes, scale_storage.end(),
+                        [](std::uint8_t c) { return c == 0xA5u; }),
+        "output canaries preserved: exactly width codes and width/128 scales");
 
   std::vector<std::uint8_t> got_q(width);
   std::vector<float> got_scale(static_cast<std::size_t>(blocks));
@@ -370,7 +401,7 @@ void VerifyRejections(aclrtStream stream) {
   DeviceBuffer d_q;
   DeviceBuffer d_scale;
   if (d_x.Alloc(4096 * 2) != ACL_SUCCESS || d_q.Alloc(4096) != ACL_SUCCESS ||
-      d_scale.Alloc(128 * 4) != ACL_SUCCESS) {
+      d_scale.Alloc((4096 / kBlock) * sizeof(float)) != ACL_SUCCESS) {
     Check(false, "setup allocation for the rejection cases failed");
     return;
   }
@@ -389,13 +420,13 @@ void VerifyRejections(aclrtStream stream) {
                               stream) == Status::invalid_argument,
         "a null FP32 input is invalid_argument");
 
-  // 1000 is not a whole number of 32-element blocks: geometry v1 declines,
+  // 1056 is block-32 aligned but not block-128 aligned: geometry declines,
   // which is unsupported_shape and must NOT be collapsed into
   // invalid_argument.
-  Check(LaunchBf16BlockQuantFp8(x, 1000, q, s, nullptr,
+  Check(LaunchBf16BlockQuantFp8(x, 1056, q, s, nullptr,
                                 kBlockQuantFp8WorkspaceBytes,
                                 stream) == Status::unsupported_shape,
-        "a width that is not a multiple of 32 is unsupported_shape");
+        "a width aligned to 32 but not 128 is unsupported_shape");
 
   Check(LaunchBf16BlockQuantFp8(x, 1u << 20, q, s, nullptr,
                                 kBlockQuantFp8WorkspaceBytes,
@@ -466,6 +497,10 @@ int main() {
     VerifyWidth<float>(kModelWidths[i], kSeedBase + i * 0x9E3779B9u, stream);
   }
   VerifyWidth<float>(65536u, kSeedBase, stream);  // grid-stride UB reuse
+  for (std::uint32_t width : {128u, 256u, 896u, 1152u, 65536u}) {
+    VerifyWidth<Bf16>(width, kSeedBase, stream, true);
+    VerifyWidth<float>(width, kSeedBase, stream, true);
+  }
   VerifyRejections(stream);
 
   (void)aclrtDestroyStream(stream);

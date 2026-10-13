@@ -2,7 +2,7 @@
 #define BF16_BLOCK_QUANT_FP8_TILING_H
 
 // Tiling POD and v1 contract geometry for bf16_block_quant_fp8: BF16/FP32 ->
-// FP8 E4M3 with one FP32 scale per 32 elements.
+// FP8 E4M3 with one FP32 scale per 128 elements.
 //
 // WHY THIS OPERATOR EXISTS
 // The five activation quantizer sites in apps/dsv4_semi_e2e_bench_npu.cpp
@@ -32,22 +32,14 @@
 
 namespace moe::kernels::arch35 {
 
-// One scale per 32 elements. Matches kRoutedScaleBlock in
-// include/moe/core/config.hpp, which is what the consuming matmul's
-// `groupSize` describes; the two must not drift apart.
-inline constexpr std::uint32_t kBlockQuantBlockSize = 32;
+// Dense FP8 QuantMatmulV5 requires ceil(K/128) activation scales for its
+// 128x128 weight grid. Routed MXFP4's block-32 scales are a separate format.
+inline constexpr std::uint32_t kBlockQuantBlockSize = 128;
 
-// SIMT geometry: a 32-element scale block is owned by 16 lanes, each handling
-// a float2. 16 is forced by the hardware conversion primitive -- the only
-// FP8 E4M3 encoder in this toolkit is
-// __asc_cvt_float2_to_fp8x2(float2, saturation, interpretation) in
-// simt_api/asc_fp8.h, which converts exactly TWO floats per call. One lane
-// per element would leave half the conversion slots idle and need a second
-// reduction width; one lane per pair makes the block reduction the same
-// aligned 16-lane butterfly (xor masks 1,2,4,8) that mxfp4_expert_gemv and
-// dsv4_moe_expert already use.
-inline constexpr std::uint32_t kBlockQuantLanesPerBlock = 16;
-inline constexpr std::uint32_t kBlockQuantBlocksPerTile = 32;
+// One float2 per lane; four 16-lane chunk maxima are combined through UB.
+inline constexpr std::uint32_t kBlockQuantLanesPerBlock = 64;
+inline constexpr std::uint32_t kBlockQuantBlocksPerTile = 8;
+inline constexpr std::uint32_t kBlockQuantPartialsPerTile = 32;
 inline constexpr std::uint32_t kBlockQuantElemsPerTile =
     kBlockQuantBlockSize * kBlockQuantBlocksPerTile;  // 1024
 inline constexpr std::uint32_t kBlockQuantBlockDim = 32;  // 32 AIVs
@@ -76,16 +68,18 @@ inline constexpr std::size_t kBlockQuantWorkspaceBytes = 0;
 //   xBf16   1024 bf16    2,048 B   MTE2 staging
 //   xF32    1024 floats  4,096 B   widened, read by the VF
 //   qOut    1024 bytes   1,024 B   E4M3 result, written by the VF
-//   scaleOut  32 floats    128 B   per-block FP32 scale, written by the VF
+//   scaleOut   8 floats     32 B   per-block FP32 scale, written by the VF
+//   partials  32 floats    128 B   chunk maxima shared within the VF
 //
-// Fixed at 7,296 B regardless of width, because the tile is fixed and a
+// Fixed at 7,328 B regardless of width, because the tile is fixed and a
 // narrow width simply runs fewer tiles. That is why this returns no
 // width parameter.
 inline constexpr std::uint64_t BlockQuantDynUbBytes() noexcept {
   return static_cast<std::uint64_t>(kBlockQuantElemsPerTile) * 2u +
          static_cast<std::uint64_t>(kBlockQuantElemsPerTile) * 4u +
          static_cast<std::uint64_t>(kBlockQuantElemsPerTile) * 1u +
-         static_cast<std::uint64_t>(kBlockQuantBlocksPerTile) * 4u;
+         static_cast<std::uint64_t>(kBlockQuantBlocksPerTile) * 4u +
+         static_cast<std::uint64_t>(kBlockQuantPartialsPerTile) * 4u;
 }
 
 inline constexpr std::uint32_t kBlockQuantDynUbCeilingBytes = 221184u;  // 216 KiB
@@ -96,10 +90,10 @@ inline constexpr std::uint32_t kBlockQuantDynUbCeilingBytes = 221184u;  // 216 K
 struct Bf16BlockQuantFp8TilingData {
   std::uint32_t abi_version;      // 1
   std::uint32_t block_dim;        // 32 AIVs, grid-stride over tiles
-  std::uint32_t width;            // elements; multiple of 32
-  std::uint32_t block_size;       // 32
+  std::uint32_t width;            // elements; multiple of 128
+  std::uint32_t block_size;       // 128; rejects legacy block-32 tiling
   std::uint32_t elems_per_tile;   // 1024
-  std::uint32_t blocks_per_tile;  // 32
+  std::uint32_t blocks_per_tile;  // 8
   std::uint32_t num_tiles;        // ceil(width / 1024)
   std::uint32_t input_is_fp32;    // 0: BF16 (legacy default), 1: FP32
 };

@@ -29,6 +29,7 @@
 #include "moe/emu/fp8_types.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -399,10 +400,71 @@ void HalfwayRoundsToEven(emu_test::Runner& runner) {
                    std::to_string(ties) + " disagree)");
 }
 
+void Block128Reduction(emu_test::Runner& runner) {
+  runner.Section("128-element reduction across four chunks and two warps");
+  runner.Check(kBlock == 128, "dense FP8 uses 128-element scale blocks");
+  // Sweep the winning magnitude across every input position. Each chunk has
+  // a distinct background maximum, so a block-32 reduction cannot pass.
+  bool scales_ok = true;
+  bool network_ok = true;
+  bool codes_ok = true;
+  bool guards_ok = true;
+  for (int peak = 0; peak < 128; ++peak) {
+    std::array<float, 256> x{};
+    std::array<std::uint16_t, 256> bf16{};
+    for (int i = 0; i < 128; ++i) {
+      x[i] = std::ldexp(1.0F, i / 32);  // 1, 2, 4, 8 across the four chunks
+      x[128 + i] = 2.0F * x[i];
+    }
+    x[peak] = -448.0F;
+    x[128 + (127 - peak)] = 896.0F;
+    for (std::size_t i = 0; i < x.size(); ++i) bf16[i] = FloatToBf16(x[i]);
+    std::array<std::uint8_t, 258> q{}, q_bf16{};
+    q.fill(0xA5u);
+    q_bf16.fill(0xA5u);
+    std::array<float, 4> scales{-99.0F, -99.0F, -99.0F, -99.0F};
+    auto scales_bf16 = scales;
+    bf16_block_quant_fp8_cpu(x.data(), 256, q.data() + 1, scales.data() + 1);
+    bf16_block_quant_fp8_cpu(bf16.data(), 256, q_bf16.data() + 1, scales_bf16.data() + 1);
+    scales_ok &= scales[1] == 1.0F && scales[2] == 2.0F && scales == scales_bf16;
+    guards_ok &= scales.front() == -99.0F && scales.back() == -99.0F &&
+                 q.front() == 0xA5u && q.back() == 0xA5u && q_bf16 == q;
+    for (int i = 0; i < 256; ++i) {
+      const auto want = moe::emu::EncodeFp8E4M3(x[i] / (i < 128 ? 1.0F : 2.0F));
+      codes_ok &= q[i + 1] == want;
+    }
+
+    // Host simulation of the device's lane ownership and shuffle network,
+    // checked against known maxima independently of the linear CPU oracle.
+    // Eight blocks include six inactive groups that must still reach barriers.
+    std::array<float, 512> lanes{};
+    for (int t = 0; t < 128; ++t) {
+      lanes[t] = std::max(std::fabs(x[2 * t]), std::fabs(x[2 * t + 1]));
+    }
+    for (int mask : {1, 2, 4, 8}) {
+      const auto previous = lanes;
+      for (int t = 0; t < 512; ++t) lanes[t] = std::max(previous[t], previous[t ^ mask]);
+    }
+    std::array<float, 32> partials{};
+    for (int chunk = 0; chunk < 32; ++chunk) partials[chunk] = lanes[chunk * 16];
+    for (int t = 0; t < 512; ++t) {
+      const int block = t / 64;
+      const int base = block * 4;
+      const float got = std::max(std::max(partials[base], partials[base + 1]),
+                                 std::max(partials[base + 2], partials[base + 3]));
+      network_ok &= got == (block == 0 ? 448.0F : block == 1 ? 896.0F : 0.0F);
+    }
+  }
+  runner.Check(scales_ok, "BF16 and FP32 emit one independent scale per 128 values");
+  runner.Check(codes_ok, "all four chunks use their block's full maximum");
+  runner.Check(guards_ok, "exact scale/code counts preserve surrounding sentinels");
+  runner.Check(network_ok, "64-lane reduction broadcasts every peak across both warps");
+}
+
 void Fp32Input(emu_test::Runner& runner) {
   // Include a partial tile and a second grid-stride iteration as well as all
   // model widths. Powers of two keep scaled test values exactly representable.
-  for (int width : {32, 1024, 1056, 2048, 4096, 8192, 32768, 65536}) {
+  for (int width : {128, 1024, 1152, 2048, 4096, 8192, 32768, 65536}) {
     std::vector<float> x(static_cast<std::size_t>(width), 0.0F);
     std::vector<std::uint8_t> q(x.size());
     std::vector<float> scales(x.size() / kBlock);
@@ -453,5 +515,6 @@ int main() {
   EdgeCases(runner);
   HalfwayRoundsToEven(runner);
   Fp32Input(runner);
+  Block128Reduction(runner);
   return runner.Summary();
 }

@@ -3,14 +3,13 @@
 //
 // This is the source of truth the device kernel is compared against
 // (CLAUDE.md §4.1). It deliberately does NOT mirror the kernel's structure:
-// the kernel reduces a 32-element block through a 16-lane register butterfly
-// because that is what the hardware FP8 encoder's float2 granularity forces,
-// while this walks the block linearly. Two different shapes computing the
+// the kernel combines four 32-element chunk maxima through shared UB,
+// while this walks each 128-element block linearly. Two shapes computing the
 // same function is the point -- a transcription of the kernel would agree
 // with it even when both are wrong.
 //
 // The quantizer:
-//   m        = max over the 32-element block of |x|
+//   m        = max over the 128-element block of |x|
 //   scale[b] = (m > 0) ? m / 448 : 1
 //   q[i]     = e4m3_rne_sat( x[i] * (448 / m) )
 //

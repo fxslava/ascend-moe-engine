@@ -162,7 +162,6 @@ using ascend_moe::kGatingKGroup;
 using ascend_moe::kGatingNormTypePreNormalized;
 using ascend_moe::kGatingRenormL1;
 using ascend_moe::kRotaryLayoutBsnd;
-using ascend_moe::kRoutedScaleBlock;
 using ascend_moe::kSoftplusBeta;
 using ascend_moe::kSoftplusThreshold;
 using ascend_moe::kSwigluAxisLast;
@@ -1188,10 +1187,10 @@ int main(int argc, char** argv) {
     // FP32 twins written by an aclnnCast from an E8M0 original;
     // bf16_block_quant_fp8 writes them directly, so the E8M0 buffers and the
     // four casts are gone.
-    void* a_h_scale_f32 = arena.Take((kHiddenSize / kRoutedScaleBlock) * 4, "attn.h_scale_f32");
-    void* a_q_scale_f32 = arena.Take((kQLoraRank / kRoutedScaleBlock) * 4, "attn.q_scale_f32");
-    void* a_attn_scale_f32 = arena.Take((kAttnQkvWidth / kRoutedScaleBlock) * 4, "attn.out_scale_f32");
-    void* a_o_scale_f32 = arena.Take((kWoAOutput / kRoutedScaleBlock) * 4, "attn.o_scale_f32");
+    void* a_h_scale_f32 = arena.Take((kHiddenSize / kFp8BlockSize) * sizeof(float), "attn.h_scale_f32");
+    void* a_q_scale_f32 = arena.Take((kQLoraRank / kFp8BlockSize) * sizeof(float), "attn.q_scale_f32");
+    void* a_attn_scale_f32 = arena.Take((kAttnQkvWidth / kFp8BlockSize) * sizeof(float), "attn.out_scale_f32");
+    void* a_o_scale_f32 = arena.Take((kWoAOutput / kFp8BlockSize) * sizeof(float), "attn.o_scale_f32");
     void* a_rstd = arena.Take(4 * 8, "attn.rstd");
     void* a_rope_cos = arena.Take(static_cast<std::size_t>(kAttnRopeHeadDim) * 2, "attn.rope_cos");
     void* a_rope_sin = arena.Take(static_cast<std::size_t>(kAttnRopeHeadDim) * 2, "attn.rope_sin");
@@ -1200,12 +1199,12 @@ int main(int argc, char** argv) {
 
     aclTensor* t_h_fp8 = bag.Tensor({1, kHiddenSize}, kAclFloat8E4m3Fn, a_h_fp8, "attn.h_fp8");
     aclTensor* t_h_scale_f32 =
-        bag.Tensor({1, kHiddenSize / kRoutedScaleBlock}, kAclFloat32, a_h_scale_f32, "attn.h_scale_f32");
+        bag.Tensor({1, kHiddenSize / kFp8BlockSize}, kAclFloat32, a_h_scale_f32, "attn.h_scale_f32");
     aclTensor* t_q_a = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_a, "attn.q_a");
     aclTensor* t_q_normed = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_normed, "attn.q_normed");
     aclTensor* t_q_fp8 = bag.Tensor({1, kQLoraRank}, kAclFloat8E4m3Fn, a_q_fp8, "attn.q_fp8");
     aclTensor* t_q_scale_f32 =
-        bag.Tensor({1, kQLoraRank / kRoutedScaleBlock}, kAclFloat32, a_q_scale_f32, "attn.q_scale_f32");
+        bag.Tensor({1, kQLoraRank / kFp8BlockSize}, kAclFloat32, a_q_scale_f32, "attn.q_scale_f32");
     aclTensor* t_q_flat = bag.Tensor({1, kAttnQkvWidth}, kAclBf16, a_q_heads, "attn.q_flat");
     aclTensor* t_q_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_q_heads, "attn.q_bsnd");
     aclTensor* t_kv = bag.Tensor({1, kAttnHeadDim}, kAclBf16, a_kv, "attn.kv");
@@ -1216,7 +1215,7 @@ int main(int argc, char** argv) {
     // dense [1, 32768] view has no consumer left.
     aclTensor* t_o_fp8 = bag.Tensor({1, kWoAOutput}, kAclFloat8E4m3Fn, a_o_fp8, "attn.o_fp8");
     aclTensor* t_o_scale_f32 =
-        bag.Tensor({1, kWoAOutput / kRoutedScaleBlock}, kAclFloat32, a_o_scale_f32, "attn.o_scale_f32");
+        bag.Tensor({1, kWoAOutput / kFp8BlockSize}, kAclFloat32, a_o_scale_f32, "attn.o_scale_f32");
     aclTensor* t_rstd = bag.Tensor({1, 1}, kAclFloat32, a_rstd, "attn.rstd");
     aclTensor* t_rope_cos = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_cos, "attn.rope_cos");
     aclTensor* t_rope_sin = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_sin, "attn.rope_sin");
@@ -1316,9 +1315,9 @@ int main(int argc, char** argv) {
                        static_cast<std::uint8_t*>(a_attn_fp8) + static_cast<std::size_t>(g) * kWoAGroupInput,
                        "attn.o_x_group", kAttnQkvWidth);
         aclTensor* x_group_scale = bag.Tensor(
-            {1, kWoAGroupInput / kRoutedScaleBlock}, kAclFloat32,
-            static_cast<float*>(a_attn_scale_f32) + static_cast<std::size_t>(g) * (kWoAGroupInput / kRoutedScaleBlock),
-            "attn.o_x_group_scale", kAttnQkvWidth / kRoutedScaleBlock);
+            {1, kWoAGroupInput / kFp8BlockSize}, kAclFloat32,
+            static_cast<float*>(a_attn_scale_f32) + static_cast<std::size_t>(g) * (kWoAGroupInput / kFp8BlockSize),
+            "attn.o_x_group_scale", kAttnQkvWidth / kFp8BlockSize);
         aclTensor* w_group =
             bag.Tensor({kOLoraRank, kWoAGroupInput}, kAclFloat8E4m3Fn,
                        static_cast<std::uint8_t*>(wo_a.weight) +
@@ -1619,7 +1618,7 @@ int main(int argc, char** argv) {
     void* s_gate_up_bf16 = arena.Take(static_cast<std::size_t>(2 * kMoeIntermediate) * 2, "shared.gate_up_bf16");
     void* s_hidden_fp8 = arena.Take(kMoeIntermediate, "shared.hidden_fp8");
     void* s_hidden_scale_f32 =
-        arena.Take((kMoeIntermediate / kRoutedScaleBlock) * 4, "shared.hidden_scale_f32");
+        arena.Take((kMoeIntermediate / kFp8BlockSize) * sizeof(float), "shared.hidden_scale_f32");
     void* s_out_bf16 = arena.Take(static_cast<std::size_t>(kHiddenSize) * 2, "shared.out_bf16");
 
     aclTensor* t_s_gate_bf16 = bag.Tensor({1, kMoeIntermediate}, kAclBf16, s_gate_up_bf16, "shared.gate_bf16",
@@ -1630,7 +1629,7 @@ int main(int argc, char** argv) {
     aclTensor* t_s_gate_f32 = t_gate_half;  // reuse the FP32 gate/up pair
     aclTensor* t_s_up_f32 = t_up_half;
     aclTensor* t_s_hidden_fp8 = bag.Tensor({1, kMoeIntermediate}, kAclFloat8E4m3Fn, s_hidden_fp8, "shared.hidden_fp8");
-    aclTensor* t_s_hidden_scale_f32 = bag.Tensor({1, kMoeIntermediate / kRoutedScaleBlock}, kAclFloat32,
+    aclTensor* t_s_hidden_scale_f32 = bag.Tensor({1, kMoeIntermediate / kFp8BlockSize}, kAclFloat32,
                                                  s_hidden_scale_f32, "shared.hidden_scale_f32");
     aclTensor* t_s_out_bf16 = bag.Tensor({1, kHiddenSize}, kAclBf16, s_out_bf16, "shared.out_bf16");
 
