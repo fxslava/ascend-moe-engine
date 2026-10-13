@@ -346,6 +346,59 @@ void EdgeCases(emu_test::Runner& runner) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 5. The encoder rounds halfway values to NEAREST-EVEN
+// ---------------------------------------------------------------------------
+// Regression guard. EncodeFp8E4M3 used a bare `error < best_error`, which with
+// an ascending scan over a monotone table keeps the SMALLER magnitude on an
+// exact tie -- round-half-toward-zero, not round-to-nearest-even. It differed
+// from RNE on exactly those ties whose lower code is odd: 63 of 126. That is
+// what produced 3 code mismatches in 4,096 the first time
+// bf16_block_quant_fp8 ran on an Ascend950PR_9589, and the GOLDEN was the
+// wrong side of it.
+//
+// This asserts the rule directly on the shared encoder rather than through
+// the quantizer, because the encoder is used by other fixtures too
+// (src/emu/semi_e2e_pipeline.cpp) and they inherited the same skew.
+void HalfwayRoundsToEven(emu_test::Runner& runner) {
+  runner.Section("E4M3 encoder rounds exact ties to nearest-even");
+
+  const moe::emu::Fp8Table& table = moe::emu::Fp8E4M3Table();
+  int ties = 0;
+  int disagreements = 0;
+  for (std::uint32_t code = 0; code < 0x7EU; ++code) {
+    const float low = table[code];
+    const float high = table[code + 1];
+    if (!std::isfinite(low) || !std::isfinite(high) || high <= low) {
+      continue;
+    }
+    const float mid = static_cast<float>(
+        (static_cast<double>(low) + static_cast<double>(high)) / 2.0);
+    // Only a genuine tie if the midpoint is exactly equidistant in FP32.
+    if (std::fabs(mid - low) != std::fabs(high - mid)) {
+      continue;
+    }
+    ++ties;
+    const std::uint8_t got = moe::emu::EncodeFp8E4M3(mid);
+    const std::uint8_t want = (code % 2U == 0U)
+                                  ? static_cast<std::uint8_t>(code)
+                                  : static_cast<std::uint8_t>(code + 1);
+    if (got != want) {
+      ++disagreements;
+    }
+  }
+
+  // Vacuity guard: if the table ever stops producing exact midpoints this
+  // section must fail loudly rather than pass having checked nothing.
+  runner.Check(ties > 100,
+               "found exact halfway values to test (got " +
+                   std::to_string(ties) + ", expected >100)");
+  runner.Check(disagreements == 0,
+               "every exact tie rounds to the even code (" +
+                   std::to_string(disagreements) + " of " +
+                   std::to_string(ties) + " disagree)");
+}
+
 }  // namespace
 
 int main() {
@@ -354,5 +407,6 @@ int main() {
   NonDegeneracy(runner);
   RoundTrip(runner);
   EdgeCases(runner);
+  HalfwayRoundsToEven(runner);
   return runner.Summary();
 }

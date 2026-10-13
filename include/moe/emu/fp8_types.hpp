@@ -202,6 +202,36 @@ inline const Fp8Table& Fp8E8M0Table() noexcept {
 // Only the tests need to go this direction -- they build FP8 fixtures from
 // FP32 and then assert the round trip. Saturating rather than overflowing to
 // NaN matches the checkpoint's `"activation_scheme": "dynamic"` quantizer.
+//
+// TIE-BREAKING, AND A BUG THAT LIVED HERE
+// On an EXACT tie the two candidates are adjacent codes, and the rule below
+// keeps the one whose low bit is zero -- round-to-nearest-EVEN, which is what
+// IEEE-style converters and the 950PR's own
+// __asc_cvt_float2_to_fp8x2 do.
+//
+// Until 2026-10-13 these loops used a bare `error < best_error`, which with
+// an ascending scan over a monotone table keeps the SMALLER magnitude on a
+// tie -- round-half-toward-zero, not round-to-nearest-even, despite the
+// comment that used to claim otherwise. It differs from RNE on exactly those
+// ties whose lower code is odd, i.e. half of them: a host probe over the
+// E4M3 table found 63 disagreements in 126 exact ties. That is what produced
+// 3 code mismatches in 4,096 when bf16_block_quant_fp8 was first run on an
+// Ascend950PR_9589 -- the GOLDEN was wrong on halfway values, not the
+// hardware. Fixed here rather than absorbed into a +/-1 tolerance in the
+// device test, because a blanket one-code tolerance would also hide a
+// genuine off-by-one in the encoder.
+//
+// Helper rather than an inline condition so both encoders share one rule.
+namespace detail {
+
+// True when `candidate` should displace `best` at equal error: prefer the
+// even code. Only ever called with two adjacent codes, so "even" is a total
+// tie-break.
+inline bool PrefersEvenOnTie(std::uint32_t candidate, std::uint8_t best) noexcept {
+  return (candidate % 2U == 0U) && (best % 2U != 0U);
+}
+
+}  // namespace detail
 
 inline std::uint8_t EncodeFp8E4M3(float value) noexcept {
   if (std::isnan(value)) {
@@ -225,10 +255,12 @@ inline std::uint8_t EncodeFp8E4M3(float value) noexcept {
       continue;
     }
     const float error = std::fabs(candidate - magnitude);
-    // Strict `<` keeps the first (smaller-magnitude, even-mantissa) code on a
-    // tie, which is round-to-nearest-even for this monotone table.
     if (error < best_error) {
       best_error = error;
+      best = static_cast<std::uint8_t>(code);
+    } else if (error == best_error && detail::PrefersEvenOnTie(code, best)) {
+      // Exact tie: take the even code (round-to-nearest-even). See the
+      // tie-breaking note above for why a bare `<` was wrong here.
       best = static_cast<std::uint8_t>(code);
     }
   }
@@ -254,6 +286,9 @@ inline std::uint8_t EncodeFp8E5M2(float value) noexcept {
     const float error = std::fabs(table[code] - magnitude);
     if (error < best_error) {
       best_error = error;
+      best = static_cast<std::uint8_t>(code);
+    } else if (error == best_error && detail::PrefersEvenOnTie(code, best)) {
+      // Round-to-nearest-even on an exact tie, as in EncodeFp8E4M3.
       best = static_cast<std::uint8_t>(code);
     }
   }

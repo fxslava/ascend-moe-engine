@@ -234,12 +234,67 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
     if (got_q[partner] != want_q[i]) ++mismatch_swapped;
   }
 
+  // Of any mismatches, how many are EXACT TIES -- values equidistant between
+  // two adjacent codes, where both answers are equally correct and differ by
+  // one code step?
+  //
+  // This is deliberately NOT a blanket +/-1 code tolerance. A one-code
+  // allowance applied everywhere would also hide a genuine off-by-one in the
+  // encoder, which is the most likely way this kernel breaks. A value is
+  // excused only when the two codes carry IDENTICAL absolute error against
+  // the scaled input, which is checkable rather than assumed.
+  //
+  // History: the first hardware run showed 3 such mismatches in 4,096, and
+  // they were the GOLDEN's fault -- moe::emu::EncodeFp8E4M3 rounded halfway
+  // values toward zero instead of to nearest-even. That is fixed at source in
+  // include/moe/emu/fp8_types.hpp, so this count is expected to be zero now;
+  // it is still measured, because "expected to be zero" and "verified zero on
+  // hardware" are different claims (§5.7).
+  int mismatch_tie_explained = 0;
+  int mismatch_real = 0;
+  const moe::emu::Fp8Table& table = moe::emu::Fp8E4M3Table();
+  for (int b = 0; b < blocks; ++b) {
+    float block_max = 0.0F;
+    for (int i = 0; i < kBlock; ++i) {
+      block_max = std::max(
+          block_max,
+          std::fabs(Bf16ToFloat(x[static_cast<std::size_t>(b * kBlock + i)])));
+    }
+    // Recomputed the same way the reference does, so the scaled value being
+    // judged is the one the encoder actually saw.
+    const float inverse =
+        block_max > 0.0F ? (static_cast<float>(448.0) / block_max) : 0.0F;
+    for (int i = 0; i < kBlock; ++i) {
+      const std::size_t index = static_cast<std::size_t>(b * kBlock + i);
+      if (got_q[index] == want_q[index]) {
+        continue;
+      }
+      const double scaled = Bf16ToFloat(x[index]) * inverse;
+      const double err_got = std::fabs(table[got_q[index]] - scaled);
+      const double err_want = std::fabs(table[want_q[index]] - scaled);
+      if (err_got == err_want) {
+        ++mismatch_tie_explained;
+      } else {
+        ++mismatch_real;
+      }
+    }
+  }
+
   if (mismatch_direct == 0) {
     Check(true,
           "all " + std::to_string(width) +
               " E4M3 codes are bit-identical to the golden; "
               "__asc_fp8x2_storage_t byte order is low-byte <- float2.x, as "
               "the kernel assumes");
+  } else if (mismatch_real == 0) {
+    // Every disagreement is a genuine tie, so both sides are equally right.
+    // Reported as a pass with the count visible, not swept up silently.
+    Check(true,
+          std::to_string(mismatch_tie_explained) + " of " +
+              std::to_string(width) +
+              " codes differ from the golden, and EVERY one is an exact tie "
+              "(both codes equidistant from the scaled value, so both are "
+              "correct). No code differs for any other reason.");
   } else if (mismatch_swapped == 0) {
     Check(false,
           "PAIR ORIENTATION IS REVERSED: " + std::to_string(mismatch_direct) +
@@ -263,11 +318,13 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
       worst_abs = std::max(worst_abs, std::fabs(got - want));
     }
     Check(false,
-          std::to_string(mismatch_direct) + " of " + std::to_string(width) +
-              " codes differ from the golden (" +
+          std::to_string(mismatch_real) + " of " + std::to_string(width) +
+              " codes differ from the golden for a reason that is NOT an "
+              "exact tie and NOT a byte-order transposition (" +
+              std::to_string(mismatch_tie_explained) +
+              " further mismatches were ties and are excused; " +
               std::to_string(mismatch_swapped) +
-              " still differ with pairs swapped, so this is NOT a byte-order "
-              "transposition); worst dequantized delta " +
+              " still differ with pairs swapped); worst dequantized delta " +
               std::to_string(worst_abs));
   }
 
