@@ -67,13 +67,25 @@
 // WHERE THIS DIVERGES FROM THE HOST BENCH, BY CONSTRUCTION
 // ---------------------------------------------------------------------------
 // The host emulation dequantizes each FP8 block matrix and does the GEMV in
-// FP32 (semi-E2E investigation, section 2.2). A device FP8 GEMV cannot:aclnn-
-// QuantMatmulV5 consumes a QUANTIZED activation, so every projection here
-// quantizes its input with aclnnDynamicMxQuant first. That is closer to the
-// upstream model's own quantized-activation path than the host reference is,
-// but it means a systematic delta against golden_semi_e2e_ref.bin that is not
-// a bug. The parity gate below is therefore cosine-only, with the bound
-// justified by the format at its definition.
+// FP32 (semi-E2E investigation, section 2.2). A device FP8 GEMV cannot:
+// aclnnQuantMatmulV5 consumes a QUANTIZED activation, so every projection
+// here quantizes its input first. That is closer to the upstream model's own
+// quantized-activation path than the host reference is, but it means a
+// systematic delta against golden_semi_e2e_ref.bin that is not a bug. The
+// parity gate below is therefore cosine-only, with the bound justified by the
+// format at its definition.
+//
+// The four BF16 quantizer sites now use the arch35 bf16_block_quant_fp8
+// operator instead of aclnnDynamicMxQuant + aclnnCast: one dispatch emitting
+// E4M3 codes and FP32 block scales directly. That ALSO moves the parity
+// baseline, in a second way and deliberately -- DynamicMxQuant emitted OCP
+// E8M0 power-of-two scales, and these are arbitrary FP32, which uses the
+// E4M3 range strictly better. Quantization error goes down; the numbers
+// differ from any figure taken before 2026-10-13.
+//
+// The FIFTH site (shared expert, "quantize hidden") still runs
+// aclnnDynamicMxQuant, because its input t_hidden is FP32 and the arch35
+// operator takes BF16. See the note at that site.
 //
 // ---------------------------------------------------------------------------
 // ZERO-ALLOCATION: WHAT IS AND IS NOT TRUE
@@ -1026,6 +1038,12 @@ int main(int argc, char** argv) {
     DSV4_REQUIRE(ops.runtime_reachable(),
                  "the aclnn runtime is not on this process's loader path; the operator entry points "
                  "are resolved out of the already-linked CANN libraries");
+    // kDynamicMxQuant is still required by exactly ONE site: the shared
+    // expert's "quantize hidden", whose input is FP32 rather than BF16 (see
+    // that site). The four BF16 attention quantizers no longer use it. It
+    // cannot be dropped from this list until that site is handled, and on
+    // ascend950 it is the operator that fails with EZ1009 -- so this list is
+    // currently what will stop a run at the shared expert.
     ops.RequireAll({OpId::kDynamicMxQuant, OpId::kQuantMatmulV5, OpId::kRmsNorm, OpId::kApplyRotaryPosEmbV2,
                     OpId::kFusedInferAttentionScoreV5, OpId::kMoeGatingTopKV2, OpId::kSwiGlu, OpId::kClamp,
                     OpId::kCast, OpId::kMatmul, OpId::kMul, OpId::kInplaceAdd, OpId::kSoftplus, OpId::kSqrt});
@@ -1119,6 +1137,31 @@ int main(int argc, char** argv) {
       });
     };
 
+    // Replaces the aclnnDynamicMxQuant + aclnnCast pair that every BF16
+    // activation quantizer site used to run. DynamicMxQuant emitted E8M0
+    // scales while the ascend950 QuantBatchMatmulV3 binary takes
+    // pertoken_scale in FP32, so each site cost two launches and a scale
+    // round trip -- and on hardware the pair failed with EZ1009. This is one
+    // dispatch producing E4M3 codes and FP32 block scales directly, so the
+    // a_*_scale_f32 windows are now written at source rather than cast into.
+    //
+    // Sync-inclusive like every arch35 row (the wrapper synchronizes before
+    // releasing its tiling staging buffer, CLAUDE.md §3.7), where the two
+    // aclnn stages it replaces were enqueue-only and timed in a group. The
+    // launch COUNT goes down by two per site; the per-site wall time is not
+    // comparable to the old grouped figure.
+    const auto block_quant = [&](const char* name, const void* src_bf16,
+                                 std::uint32_t width, void* dst_fp8,
+                                 void* dst_scale_f32) {
+      TimedArch35(timeline, name, [&] {
+        return arch35::LaunchBf16BlockQuantFp8(
+            static_cast<const arch35::Bf16*>(src_bf16), width,
+            static_cast<arch35::Fp8E4M3*>(dst_fp8),
+            static_cast<float*>(dst_scale_f32), nullptr,
+            arch35::kBlockQuantFp8WorkspaceBytes, stream);
+      });
+    };
+
     // =======================================================================
     // The shared-KV SWA attention core, planned once per layer.
     //
@@ -1131,24 +1174,19 @@ int main(int argc, char** argv) {
     // been executed.
     // =======================================================================
     struct AttentionPlan {
-      PipelineStage* quant_h = nullptr;
       PipelineStage* q_a = nullptr;
       PipelineStage* q_norm = nullptr;
-      PipelineStage* quant_q = nullptr;
       PipelineStage* q_b = nullptr;
       PipelineStage* kv_proj = nullptr;
       PipelineStage* kv_norm = nullptr;
       PipelineStage* rope = nullptr;
       PipelineStage* attention = nullptr;
-      PipelineStage* quant_attn = nullptr;
       PipelineStage* o_group[kOGroups] = {};
-      PipelineStage* quant_o = nullptr;
       PipelineStage* o_b = nullptr;
-      // One E8M0 -> FP32 cast per activation quantizer; see Fp8Matrix.
-      PipelineStage* cast_h_scale = nullptr;
-      PipelineStage* cast_q_scale = nullptr;
-      PipelineStage* cast_attn_scale = nullptr;
-      PipelineStage* cast_o_scale = nullptr;
+      // The four activation quantizers and their E8M0 -> FP32 casts are gone:
+      // bf16_block_quant_fp8 replaces each pair with one arch35 dispatch that
+      // writes the FP32 scales directly (see `block_quant` above), and an
+      // arch35 launch is a direct call rather than a planned aclnn stage.
       void* kv_cache = nullptr;
       void* kv_normed = nullptr;
       std::size_t kv_row_bytes = 0;
@@ -1156,23 +1194,20 @@ int main(int argc, char** argv) {
 
     // Attention scratch, shared by both layers: the two never overlap in time.
     void* a_h_fp8 = arena.Take(kHiddenSize, "attn.h_fp8");
-    void* a_h_scale = arena.Take(kHiddenSize / kRoutedScaleBlock, "attn.h_scale");
     void* a_q_a = arena.Take(kQLoraRank * 2, "attn.q_a");
     void* a_q_normed = arena.Take(kQLoraRank * 2, "attn.q_normed");
     void* a_q_fp8 = arena.Take(kQLoraRank, "attn.q_fp8");
-    void* a_q_scale = arena.Take(kQLoraRank / kRoutedScaleBlock, "attn.q_scale");
     void* a_q_heads = arena.Take(static_cast<std::size_t>(kAttnQkvWidth) * 2, "attn.q_heads");
     void* a_kv = arena.Take(static_cast<std::size_t>(kAttnHeadDim) * 2, "attn.kv");
     void* a_attn_out = arena.Take(static_cast<std::size_t>(kAttnQkvWidth) * 2, "attn.out");
     void* a_attn_fp8 = arena.Take(kAttnQkvWidth, "attn.out_fp8");
-    void* a_attn_scale = arena.Take(kAttnQkvWidth / kRoutedScaleBlock, "attn.out_scale");
     void* a_o_mid = arena.Take(static_cast<std::size_t>(kWoAOutput) * 2, "attn.o_mid");
     void* a_o_fp8 = arena.Take(kWoAOutput, "attn.o_fp8");
-    void* a_o_scale = arena.Take(kWoAOutput / kRoutedScaleBlock, "attn.o_scale");
-    // FP32 twins of the activation MX scales. aclnnDynamicMxQuant emits E8M0,
-    // but the ascend950 binary this graph binds to takes `pertoken_scale` in
-    // FP32 (see the Fp8Matrix comment), so each one is cast on device before
-    // it reaches a QuantMatmulV5. One cast per quantizer, planned once.
+    // Per-block activation scales, FP32 -- the dtype the ascend950 binary
+    // takes for `pertoken_scale` (see the Fp8Matrix comment). These used to be
+    // FP32 twins written by an aclnnCast from an E8M0 original;
+    // bf16_block_quant_fp8 writes them directly, so the E8M0 buffers and the
+    // four casts are gone.
     void* a_h_scale_f32 = arena.Take((kHiddenSize / kRoutedScaleBlock) * 4, "attn.h_scale_f32");
     void* a_q_scale_f32 = arena.Take((kQLoraRank / kRoutedScaleBlock) * 4, "attn.q_scale_f32");
     void* a_attn_scale_f32 = arena.Take((kAttnQkvWidth / kRoutedScaleBlock) * 4, "attn.out_scale_f32");
@@ -1184,29 +1219,22 @@ int main(int argc, char** argv) {
     void* a_softmax_lse = arena.Take(static_cast<std::size_t>(kAttnHeads) * 4, "attn.softmax_lse");
 
     aclTensor* t_h_fp8 = bag.Tensor({1, kHiddenSize}, kAclFloat8E4m3Fn, a_h_fp8, "attn.h_fp8");
-    aclTensor* t_h_scale =
-        bag.Tensor({1, kHiddenSize / kRoutedScaleBlock}, kAclFloat8E8m0, a_h_scale, "attn.h_scale");
     aclTensor* t_h_scale_f32 =
         bag.Tensor({1, kHiddenSize / kRoutedScaleBlock}, kAclFloat32, a_h_scale_f32, "attn.h_scale_f32");
     aclTensor* t_q_a = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_a, "attn.q_a");
     aclTensor* t_q_normed = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_normed, "attn.q_normed");
     aclTensor* t_q_fp8 = bag.Tensor({1, kQLoraRank}, kAclFloat8E4m3Fn, a_q_fp8, "attn.q_fp8");
-    aclTensor* t_q_scale = bag.Tensor({1, kQLoraRank / kRoutedScaleBlock}, kAclFloat8E8m0, a_q_scale, "attn.q_scale");
     aclTensor* t_q_scale_f32 =
         bag.Tensor({1, kQLoraRank / kRoutedScaleBlock}, kAclFloat32, a_q_scale_f32, "attn.q_scale_f32");
     aclTensor* t_q_flat = bag.Tensor({1, kAttnQkvWidth}, kAclBf16, a_q_heads, "attn.q_flat");
     aclTensor* t_q_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_q_heads, "attn.q_bsnd");
     aclTensor* t_kv = bag.Tensor({1, kAttnHeadDim}, kAclBf16, a_kv, "attn.kv");
-    aclTensor* t_attn_flat = bag.Tensor({1, kAttnQkvWidth}, kAclBf16, a_attn_out, "attn.out_flat");
     aclTensor* t_attn_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_attn_out, "attn.out_bsnd");
-    aclTensor* t_attn_fp8 = bag.Tensor({1, kAttnQkvWidth}, kAclFloat8E4m3Fn, a_attn_fp8, "attn.out_fp8");
-    aclTensor* t_attn_scale =
-        bag.Tensor({1, kAttnQkvWidth / kRoutedScaleBlock}, kAclFloat8E8m0, a_attn_scale, "attn.out_scale");
-    aclTensor* t_attn_scale_f32 = bag.Tensor({1, kAttnQkvWidth / kRoutedScaleBlock}, kAclFloat32, a_attn_scale_f32,
-                                              "attn.out_scale_f32");
-    aclTensor* t_o_mid = bag.Tensor({1, kWoAOutput}, kAclBf16, a_o_mid, "attn.o_mid");
+    // No whole-tensor views of attn_fp8 / attn_scale_f32: the eight wo_a
+    // groups build their own offset sub-views from the arena pointers, and
+    // the block quantizer takes raw pointers rather than aclTensors, so a
+    // dense [1, 32768] view has no consumer left.
     aclTensor* t_o_fp8 = bag.Tensor({1, kWoAOutput}, kAclFloat8E4m3Fn, a_o_fp8, "attn.o_fp8");
-    aclTensor* t_o_scale = bag.Tensor({1, kWoAOutput / kRoutedScaleBlock}, kAclFloat8E8m0, a_o_scale, "attn.o_scale");
     aclTensor* t_o_scale_f32 =
         bag.Tensor({1, kWoAOutput / kRoutedScaleBlock}, kAclFloat32, a_o_scale_f32, "attn.o_scale_f32");
     aclTensor* t_rstd = bag.Tensor({1, 1}, kAclFloat32, a_rstd, "attn.rstd");
@@ -1261,21 +1289,13 @@ int main(int argc, char** argv) {
       // legal rather than an aliasing bug.
       aclTensorList* kv_list = bag.List({t_kv_cache}, "attn.kv_list");
 
-      plan->quant_h = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
-          "attn: quantize h_norm", OpId::kDynamicMxQuant, t_h_norm, kSwigluAxisLast, kRoundModeRint,
-          static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_h_fp8, t_h_scale);
-      plan->cast_h_scale = &graph.Plan<ascend_moe::CastPlanFn>(
-          "attn: h scale -> f32", OpId::kCast, t_h_scale, static_cast<aclDataType>(kAclFloat32), t_h_scale_f32);
+      // h_norm -> (h_fp8, h_scale_f32) is now block_quant(), called from the
+      // execution path below rather than planned here.
       plan->q_a = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wq_a", OpId::kQuantMatmulV5, t_h_fp8, t_wq_a, t_h_scale_f32, t_wq_a_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_a);
       plan->q_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: q_norm", OpId::kRmsNorm, t_q_a, t_q_norm_w,
                                                             kRmsEpsilon, t_q_normed, t_rstd);
-      plan->quant_q = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
-          "attn: quantize q", OpId::kDynamicMxQuant, t_q_normed, kSwigluAxisLast, kRoundModeRint,
-          static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_q_fp8, t_q_scale);
-      plan->cast_q_scale = &graph.Plan<ascend_moe::CastPlanFn>(
-          "attn: q scale -> f32", OpId::kCast, t_q_scale, static_cast<aclDataType>(kAclFloat32), t_q_scale_f32);
       plan->q_b = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wq_b", OpId::kQuantMatmulV5, t_q_fp8, t_wq_b, t_q_scale_f32, t_wq_b_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_flat);
@@ -1303,13 +1323,6 @@ int main(int argc, char** argv) {
           static_cast<std::int64_t>(kSlidingWindow), kFiaAntiquantModeNone, /*softmax_lse_flag=*/false,
           kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone, kFiaPseTypeNone, t_attn_bsnd,
           t_softmax_lse);
-
-      plan->quant_attn = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
-          "attn: quantize output", OpId::kDynamicMxQuant, t_attn_flat, kSwigluAxisLast, kRoundModeRint,
-          static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_attn_fp8,
-          t_attn_scale);
-      plan->cast_attn_scale = &graph.Plan<ascend_moe::CastPlanFn>(
-          "attn: out scale -> f32", OpId::kCast, t_attn_scale, static_cast<aclDataType>(kAclFloat32), t_attn_scale_f32);
 
       // wo_a is block-diagonal: 8 groups of 4096 attention lanes each produce
       // 1024 of the 8192-wide intermediate. One QuantMatmulV5 per group over
@@ -1345,11 +1358,6 @@ int main(int argc, char** argv) {
             nullptr, nullptr, nullptr, false, true, options.dense_group_size, out_group);
       }
 
-      plan->quant_o = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
-          "attn: quantize o_mid", OpId::kDynamicMxQuant, t_o_mid, kSwigluAxisLast, kRoundModeRint,
-          static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_o_fp8, t_o_scale);
-      plan->cast_o_scale = &graph.Plan<ascend_moe::CastPlanFn>(
-          "attn: o scale -> f32", OpId::kCast, t_o_scale, static_cast<aclDataType>(kAclFloat32), t_o_scale_f32);
       plan->o_b = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wo_b", OpId::kQuantMatmulV5, t_o_fp8, t_wo_b, t_o_scale_f32, t_wo_b_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_h_out);
@@ -1368,16 +1376,23 @@ int main(int argc, char** argv) {
       DSV4_ACL_CHECK(aclrtMemcpyAsync(a_rope_sin, rope_bytes, sin_table.data(), rope_bytes,
                                       ACL_MEMCPY_HOST_TO_DEVICE, stream));
 
+      // TIMING, NOW THAT THE QUANTIZERS ARE arch35 LAUNCHES
+      // Each block_quant() records its own sync-inclusive row through
+      // TimedArch35, and the ones below sit INSIDE the span `start` brackets
+      // because stream order requires it (q_b consumes q_fp8, so the
+      // quantizer cannot be hoisted out of the sequence). The aclnn group row
+      // is therefore inclusive of the interleaved arch35 rows: the two
+      // OVERLAP and must not be summed. The aclnn launch counts passed to
+      // timeline.Add() drop accordingly -- two fewer enqueues per site, since
+      // each quantizer replaced a DynamicMxQuant plus its scale Cast.
       const auto start = Clock::now();
-      graph.Launch(*plan.quant_h, stream);
-      graph.Launch(*plan.cast_h_scale, stream);
+      block_quant("bf16_block_quant_fp8: h_norm", h_norm, kHiddenSize, a_h_fp8, a_h_scale_f32);
       graph.Launch(*plan.kv_proj, stream);
       graph.Launch(*plan.kv_norm, stream);
       if (!warm) {
         graph.Launch(*plan.q_a, stream);
         graph.Launch(*plan.q_norm, stream);
-        graph.Launch(*plan.quant_q, stream);
-      graph.Launch(*plan.cast_q_scale, stream);
+        block_quant("bf16_block_quant_fp8: q_normed", a_q_normed, kQLoraRank, a_q_fp8, a_q_scale_f32);
         graph.Launch(*plan.q_b, stream);
       }
       graph.Launch(*plan.rope, stream);
@@ -1393,16 +1408,18 @@ int main(int argc, char** argv) {
 
       if (!warm) {
         graph.Launch(*plan.attention, stream);
-        graph.Launch(*plan.quant_attn, stream);
-      graph.Launch(*plan.cast_attn_scale, stream);
+        block_quant("bf16_block_quant_fp8: attn_out", a_attn_out, kAttnQkvWidth, a_attn_fp8, a_attn_scale_f32);
         for (PipelineStage* group : plan.o_group) graph.Launch(*group, stream);
-        graph.Launch(*plan.quant_o, stream);
-      graph.Launch(*plan.cast_o_scale, stream);
+        block_quant("bf16_block_quant_fp8: o_mid", a_o_mid, kWoAOutput, a_o_fp8, a_o_scale_f32);
         graph.Launch(*plan.o_b, stream);
       }
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
+      // aclnn enqueues only: 3 on a warm token (kv_proj, kv_norm, rope) and
+      // 7 + kOGroups on a full one (+ q_a, q_norm, q_b, attention, o_b). The
+      // four quantizers that used to contribute 8 of these enqueues are now
+      // arch35 launches with their own rows.
       timeline.Add(warm ? "attention: KV warmup (aclnn)" : "attention: shared-KV SWA (aclnn)",
-                   MicrosecondsSince(start), warm ? 4 : 13 + kOGroups, false);
+                   MicrosecondsSince(start), warm ? 3 : 7 + kOGroups, false);
     };
 
     // =======================================================================
@@ -1661,6 +1678,14 @@ int main(int argc, char** argv) {
         t_s_gate_f32);
     PipelineStage& shared_up_cast = graph.Plan<ascend_moe::CastPlanFn>(
         "shared expert: up -> f32", OpId::kCast, t_s_up_bf16, static_cast<aclDataType>(kAclFloat32), t_s_up_f32);
+    // THE ONE REMAINING aclnnDynamicMxQuant.
+    // t_hidden is FP32 (kAclFloat32 over e_hidden), not BF16, so
+    // bf16_block_quant_fp8 cannot be substituted here: handing it this buffer
+    // would reinterpret every FP32 as two BF16 values. The arch35 operator
+    // needs an FP32 input mode before this site can move, which is a kernel
+    // change (a tiling flag plus a branch on the staging load), not a
+    // rewiring. Left on the aclnn path rather than silently misreading the
+    // bytes -- and this is the site that will still hit EZ1009 on ascend950.
     PipelineStage& shared_quant = graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
         "shared expert: quantize hidden", OpId::kDynamicMxQuant, t_hidden, kSwigluAxisLast, kRoundModeRint,
         static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_s_hidden_fp8,
@@ -1841,15 +1866,19 @@ int main(int argc, char** argv) {
 
       const auto moe_start = Clock::now();
       graph.Launch(cast_h_norm, stream);
-      graph.Launch(*layer2_attention.quant_h, stream);  // h_norm -> FP8 for the shared expert
-      graph.Launch(*layer2_attention.cast_h_scale, stream);
+      // h_norm -> FP8 for the shared expert's w1/w3. Same arch35 quantizer as
+      // the attention sites; the layer-2 AttentionPlan no longer owns a
+      // quant_h stage to borrow.
+      block_quant("bf16_block_quant_fp8: h_norm (shared)", h_norm, kHiddenSize, a_h_fp8, a_h_scale_f32);
       graph.Launch(router_matmul, stream);
       graph.Launch(router_cast, stream);
       graph.Launch(router_softplus, stream);
       graph.Launch(router_sqrt, stream);
       graph.Launch(router_gating, stream);
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
-      timeline.Add("router: hash route (aclnn)", MicrosecondsSince(moe_start), 7, false);
+      // 6 aclnn enqueues: the h_norm quantizer and its scale cast are now one
+      // arch35 launch with its own row (and overlap this span, as above).
+      timeline.Add("router: hash route (aclnn)", MicrosecondsSince(moe_start), 6, false);
 
       // The device router's expert ids must agree with the hash row the host
       // staged from. A mismatch means the six staged weight matrices are not
