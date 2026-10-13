@@ -33,9 +33,15 @@
 
 namespace moe::emu {
 
-void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
-                              std::uint8_t* q_out, float* scale_out) {
-  if (x_bf16 == nullptr || q_out == nullptr || scale_out == nullptr ||
+namespace {
+
+float InputFloat(std::uint16_t value) { return Bf16ToFloat(value); }
+float InputFloat(float value) { return value; }
+
+template <typename Input>
+void BlockQuantFp8Cpu(const Input* x, int width,
+                      std::uint8_t* q_out, float* scale_out) {
+  if (x == nullptr || q_out == nullptr || scale_out == nullptr ||
       width <= 0) {
     return;
   }
@@ -49,7 +55,7 @@ void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
     // Cast is not a source of divergence.
     float magnitude_max = 0.0F;
     for (int i = 0; i < kBlockQuantRefBlockSize; ++i) {
-      const float value = Bf16ToFloat(x_bf16[base + i]);
+      const float value = InputFloat(x[base + i]);
       const float magnitude = std::fabs(value);
       if (magnitude > magnitude_max) {
         magnitude_max = magnitude;
@@ -66,12 +72,24 @@ void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
     const float inverse = nonzero ? (kFp8E4M3Max / magnitude_max) : 0.0F;
 
     for (int i = 0; i < kBlockQuantRefBlockSize; ++i) {
-      const float value = Bf16ToFloat(x_bf16[base + i]);
+      const float value = InputFloat(x[base + i]);
       // EncodeFp8E4M3 is round-to-nearest-even and saturates at +/-448,
       // which is what __ASC_SATFINITE asks the hardware encoder for.
       q_out[base + i] = EncodeFp8E4M3(value * inverse);
     }
   }
+}
+
+}  // namespace
+
+void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
+                            std::uint8_t* q_out, float* scale_out) {
+  BlockQuantFp8Cpu(x_bf16, width, q_out, scale_out);
+}
+
+void bf16_block_quant_fp8_cpu(const float* x, int width,
+                            std::uint8_t* q_out, float* scale_out) {
+  BlockQuantFp8Cpu(x, width, q_out, scale_out);
 }
 
 float bf16_block_quant_fp8_dequant(std::uint8_t code, float scale) noexcept {

@@ -215,6 +215,12 @@ Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
                                std::size_t workspace_bytes,
                                aclrtStream stream);
 
+// FP32 input uses the same block-32 scales and FP8 encoding without a BF16
+// rounding step. Workspace and shape restrictions are identical.
+Status LaunchBf16BlockQuantFp8(const float* x_gm, std::uint32_t width,
+                             Fp8E4M3* y_gm, float* scale_gm, void* workspace,
+                             std::size_t workspace_bytes, aclrtStream stream);
+
 }  // namespace moe::kernels::arch35
 
 #endif  // MOE_KERNELS_ARCH35_LAUNCH_HPP

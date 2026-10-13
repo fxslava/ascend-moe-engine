@@ -17,7 +17,7 @@
 //
 //   offset   size     segment
 //   0        2,048    xBf16     1024 BF16, MTE2 staging
-//   2,048    4,096    xF32      1024 FP32, widened; read by the VF
+//   2,048    4,096    xF32      1024 FP32, widened or direct MTE2; read by VF
 //   6,144    1,024    qOut      1024 E4M3 bytes; written by the VF
 //   7,168      128    scaleOut  32 FP32 block scales; written by the VF
 //
@@ -44,7 +44,7 @@
 // regardless, and doing the reduction there too costs nothing extra.
 //
 // Event plan (EVENT_ID0..3 only; arch35 has no EVENT_ID4..7):
-//   EVENT_ID0  MTE2 -> V    xBf16 tile arrival
+//   EVENT_ID0  MTE2 -> V    xBf16 or xF32 tile arrival
 //   EVENT_ID1  V    -> MTE3 qOut / scaleOut store readiness
 // Phase boundaries around the SIMT launch use DataSyncBarrier<MemDsbT::ALL>.
 

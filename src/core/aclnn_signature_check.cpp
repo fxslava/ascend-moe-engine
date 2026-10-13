@@ -38,7 +38,11 @@
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_apply_rotary_pos_emb_v2.h>
 #include <aclnnop/aclnn_argmax.h>
+#if __has_include(<aclnnop/aclnn_clamp.h>)
+#include <aclnnop/aclnn_clamp.h>
+#else
 #include <aclnnop/level2/aclnn_clamp.h>
+#endif
 #include <aclnnop/aclnn_dynamic_mx_quant.h>
 #include <aclnnop/aclnn_fused_infer_attention_score_v5.h>
 #include <aclnnop/aclnn_grouped_matmul_finalize_routing_v3.h>

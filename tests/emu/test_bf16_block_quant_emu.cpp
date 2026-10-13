@@ -399,6 +399,50 @@ void HalfwayRoundsToEven(emu_test::Runner& runner) {
                    std::to_string(ties) + " disagree)");
 }
 
+void Fp32Input(emu_test::Runner& runner) {
+  // Include a partial tile and a second grid-stride iteration as well as all
+  // model widths. Powers of two keep scaled test values exactly representable.
+  for (int width : {32, 1024, 1056, 2048, 4096, 8192, 32768, 65536}) {
+    std::vector<float> x(static_cast<std::size_t>(width), 0.0F);
+    std::vector<std::uint8_t> q(x.size());
+    std::vector<float> scales(x.size() / kBlock);
+    for (int b = 0; b < width / kBlock; ++b) {
+      const float s = std::ldexp(1.0F, b % 9 - 4);
+      x[b * kBlock] = 448.0F * s;
+      x[b * kBlock + 1] = -448.0F * s;
+      // Just above the midpoint 1.0625: BF16 rounds back to the midpoint,
+      // whose even code is 0x38. Full FP32 must instead produce 0x39.
+      x[b * kBlock + 2] = 1.063F * s;
+      x[b * kBlock + 3] = -1.063F * s;
+    }
+    bf16_block_quant_fp8_cpu(x.data(), width, q.data(), scales.data());
+    bool correct = true;
+    for (int b = 0; b < width / kBlock; ++b) {
+      correct &= scales[b] == std::ldexp(1.0F, b % 9 - 4);
+      correct &= q[b * kBlock] == 0x7Eu && q[b * kBlock + 1] == 0xFEu;
+      correct &= q[b * kBlock + 2] == 0x39u && q[b * kBlock + 3] == 0xB9u;
+    }
+    runner.Check(correct, "FP32 precision and block ownership, width " + std::to_string(width));
+
+    std::fill(x.begin(), x.end(), 0.0F);
+    bf16_block_quant_fp8_cpu(x.data(), width, q.data(), scales.data());
+    runner.Check(std::all_of(q.begin(), q.end(), [](std::uint8_t c) { return c == 0; }) &&
+                     std::all_of(scales.begin(), scales.end(), [](float s) { return s == 1.0F; }),
+                 "FP32 all-zero blocks, width " + std::to_string(width));
+  }
+
+  // The maximum itself must also retain FP32 precision.
+  std::vector<float> x(kBlock, 3.1415927F);
+  std::vector<std::uint8_t> q(kBlock);
+  float scale = 0.0F;
+  bf16_block_quant_fp8_cpu(x.data(), kBlock, q.data(), &scale);
+  runner.CheckNear(scale, static_cast<double>(x[0]) / 448.0,
+                   Fp32Tolerance(static_cast<double>(x[0]) / 448.0),
+                   "FP32 scale retains a maximum not representable in BF16");
+  runner.Check(std::all_of(q.begin(), q.end(), [](std::uint8_t c) { return c == 0x7E; }),
+               "FP32 constant block saturates at the positive maximum");
+}
+
 }  // namespace
 
 int main() {
@@ -408,5 +452,6 @@ int main() {
   RoundTrip(runner);
   EdgeCases(runner);
   HalfwayRoundsToEven(runner);
+  Fp32Input(runner);
   return runner.Summary();
 }

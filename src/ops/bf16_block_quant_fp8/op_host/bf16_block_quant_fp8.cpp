@@ -20,12 +20,10 @@ extern "C" __global__ __aicore__ void bf16_block_quant_fp8(GM_ADDR x,
 
 constexpr const char* kOp = "bf16_block_quant_fp8";
 
-}  // namespace
-
-Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
-                               Fp8E4M3* y_gm, float* scale_gm, void* workspace,
-                               std::size_t workspace_bytes,
-                               aclrtStream stream) {
+Status LaunchBlockQuantFp8(const void* x_gm, std::uint32_t input_is_fp32,
+                          std::uint32_t width, Fp8E4M3* y_gm, float* scale_gm,
+                          void* workspace, std::size_t workspace_bytes,
+                          aclrtStream stream) {
   detail::ClearLaunchFailure();
 
   if (x_gm == nullptr || y_gm == nullptr || scale_gm == nullptr ||
@@ -50,6 +48,7 @@ Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
   if (shape != Status::success) {
     return shape;
   }
+  tiling.input_is_fp32 = input_is_fp32;
 
   detail::TilingStaging staging;
   const Status staged = staging.Stage(kOp, &tiling, sizeof(tiling));
@@ -75,6 +74,22 @@ Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
       detail::Gm(x_gm), detail::Gm(y_gm), detail::Gm(scale_gm),
       detail::Gm(workspace), detail::Gm(staging.get()));
   return detail::FinishLaunch(kOp, stream);
+}
+
+}  // namespace
+
+Status LaunchBf16BlockQuantFp8(const Bf16* x_gm, std::uint32_t width,
+                             Fp8E4M3* y_gm, float* scale_gm, void* workspace,
+                             std::size_t workspace_bytes, aclrtStream stream) {
+  return LaunchBlockQuantFp8(x_gm, 0u, width, y_gm, scale_gm, workspace,
+                            workspace_bytes, stream);
+}
+
+Status LaunchBf16BlockQuantFp8(const float* x_gm, std::uint32_t width,
+                             Fp8E4M3* y_gm, float* scale_gm, void* workspace,
+                             std::size_t workspace_bytes, aclrtStream stream) {
+  return LaunchBlockQuantFp8(x_gm, 1u, width, y_gm, scale_gm, workspace,
+                            workspace_bytes, stream);
 }
 
 }  // namespace moe::kernels::arch35

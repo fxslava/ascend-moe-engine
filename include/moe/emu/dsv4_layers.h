@@ -331,6 +331,10 @@ inline constexpr int kBlockQuantRefBlockSize = 32;
 void bf16_block_quant_fp8_cpu(const std::uint16_t* x_bf16, int width,
                               std::uint8_t* q_out, float* scale_out);
 
+// FP32 activations are consumed at full precision, without rounding to BF16.
+void bf16_block_quant_fp8_cpu(const float* x, int width,
+                            std::uint8_t* q_out, float* scale_out);
+
 // Decode one code against its block scale. The dequantization the consuming
 // matmul performs, factored out so tests state the round trip once.
 float bf16_block_quant_fp8_dequant(std::uint8_t code, float scale) noexcept;

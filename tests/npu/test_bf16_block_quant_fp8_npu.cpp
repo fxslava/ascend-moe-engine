@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -133,7 +134,12 @@ class DeviceBuffer {
 // ---------------------------------------------------------------------------
 // One width, end to end
 // ---------------------------------------------------------------------------
+float InputFloat(std::uint16_t value) { return Bf16ToFloat(value); }
+float InputFloat(float value) { return value; }
+
+template <typename Input>
 void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
+  std::printf("  input: %s\n", std::is_same_v<Input, float> ? "FP32" : "BF16");
   std::printf("\n-- width %u (%u blocks of %d), seed 0x%08X\n", width,
               width / kBlock, kBlock, seed);
 
@@ -141,9 +147,23 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
   std::mt19937 engine(seed);
   std::uniform_real_distribution<float> dist(-6.0F, 6.0F);
 
-  std::vector<std::uint16_t> x(width);
-  for (std::uint16_t& bits : x) {
-    bits = FloatToBf16(dist(engine));
+  std::vector<Input> x(width);
+  for (Input& value : x) {
+    if constexpr (std::is_same_v<Input, float>) {
+      value = dist(engine);
+    } else {
+      value = FloatToBf16(dist(engine));
+    }
+  }
+  if constexpr (std::is_same_v<Input, float>) {
+    // Detect accidental BF16 rounding and exercise the zero-block path.
+    std::fill_n(x.begin(), kBlock, 0.0F);
+    x[0] = 448.0F;
+    x[1] = 1.063F;
+    x[2] = -1.063F;
+    if (width >= 2u * kBlock) {
+      std::fill_n(x.begin() + kBlock, kBlock, 0.0F);
+    }
   }
 
   // Host golden, from the same bits the device will see.
@@ -155,11 +175,11 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
   DeviceBuffer d_x;
   DeviceBuffer d_q;
   DeviceBuffer d_scale;
-  aclError rc = d_x.Alloc(static_cast<std::size_t>(width) * 2);
+  aclError rc = d_x.Alloc(static_cast<std::size_t>(width) * sizeof(Input));
   if (rc == ACL_SUCCESS) rc = d_q.Alloc(width);
   if (rc == ACL_SUCCESS) rc = d_scale.Alloc(static_cast<std::size_t>(blocks) * 4);
   if (rc == ACL_SUCCESS) {
-    rc = d_x.Upload(x.data(), static_cast<std::size_t>(width) * 2);
+    rc = d_x.Upload(x.data(), static_cast<std::size_t>(width) * sizeof(Input));
   }
   // Poison the outputs: a kernel that returns early without writing must not
   // be able to pass by inheriting a zeroed buffer that happens to look right.
@@ -171,7 +191,7 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
   }
 
   const Status st = LaunchBf16BlockQuantFp8(
-      reinterpret_cast<const Bf16*>(d_x.get()), width,
+      static_cast<const Input*>(d_x.get()), width,
       reinterpret_cast<Fp8E4M3*>(d_q.get()), d_scale.as<float>(), nullptr,
       kBlockQuantFp8WorkspaceBytes, stream);
   if (st != Status::success) {
@@ -258,7 +278,7 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
     for (int i = 0; i < kBlock; ++i) {
       block_max = std::max(
           block_max,
-          std::fabs(Bf16ToFloat(x[static_cast<std::size_t>(b * kBlock + i)])));
+          std::fabs(InputFloat(x[static_cast<std::size_t>(b * kBlock + i)])));
     }
     // Recomputed the same way the reference does, so the scaled value being
     // judged is the one the encoder actually saw.
@@ -269,7 +289,7 @@ void VerifyWidth(std::uint32_t width, std::uint32_t seed, aclrtStream stream) {
       if (got_q[index] == want_q[index]) {
         continue;
       }
-      const double scaled = Bf16ToFloat(x[index]) * inverse;
+      const double scaled = InputFloat(x[index]) * inverse;
       const double err_got = std::fabs(table[got_q[index]] - scaled);
       const double err_want = std::fabs(table[want_q[index]] - scaled);
       if (err_got == err_want) {
@@ -359,10 +379,15 @@ void VerifyRejections(aclrtStream stream) {
   Fp8E4M3* q = reinterpret_cast<Fp8E4M3*>(d_q.get());
   float* s = d_scale.as<float>();
 
-  Check(LaunchBf16BlockQuantFp8(nullptr, 4096, q, s, nullptr,
+  Check(LaunchBf16BlockQuantFp8(static_cast<const Bf16*>(nullptr), 4096, q, s, nullptr,
                                 kBlockQuantFp8WorkspaceBytes,
                                 stream) == Status::invalid_argument,
         "a null input is invalid_argument (a caller mistake, §2.6)");
+
+  Check(LaunchBf16BlockQuantFp8(static_cast<const float*>(nullptr), 2048, q, s,
+                              nullptr, kBlockQuantFp8WorkspaceBytes,
+                              stream) == Status::invalid_argument,
+        "a null FP32 input is invalid_argument");
 
   // 1000 is not a whole number of 32-element blocks: geometry v1 declines,
   // which is unsupported_shape and must NOT be collapsed into
@@ -437,8 +462,10 @@ int main() {
   constexpr std::uint32_t kSeedBase = 0xB10CB10Cu;
   for (std::uint32_t i = 0; i < sizeof(kModelWidths) / sizeof(kModelWidths[0]);
        ++i) {
-    VerifyWidth(kModelWidths[i], kSeedBase + i * 0x9E3779B9u, stream);
+    VerifyWidth<Bf16>(kModelWidths[i], kSeedBase + i * 0x9E3779B9u, stream);
+    VerifyWidth<float>(kModelWidths[i], kSeedBase + i * 0x9E3779B9u, stream);
   }
+  VerifyWidth<float>(65536u, kSeedBase, stream);  // grid-stride UB reuse
   VerifyRejections(stream);
 
   (void)aclrtDestroyStream(stream);

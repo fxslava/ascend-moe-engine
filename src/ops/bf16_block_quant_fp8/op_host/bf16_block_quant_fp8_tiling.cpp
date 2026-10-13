@@ -62,7 +62,7 @@ Status MakeBf16BlockQuantFp8Tiling(
   t.elems_per_tile = kBlockQuantElemsPerTile;
   t.blocks_per_tile = kBlockQuantBlocksPerTile;
   t.num_tiles = static_cast<std::uint32_t>(tiles);
-  t.reserved = 0u;  // §2.3: reserved fields are written zero
+  t.input_is_fp32 = 0u;  // Legacy callers retain BF16 input.
   *out = t;
   return Status::success;
 }

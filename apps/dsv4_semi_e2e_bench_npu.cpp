@@ -75,17 +75,11 @@
 // parity gate below is therefore cosine-only, with the bound justified by the
 // format at its definition.
 //
-// The four BF16 quantizer sites now use the arch35 bf16_block_quant_fp8
-// operator instead of aclnnDynamicMxQuant + aclnnCast: one dispatch emitting
-// E4M3 codes and FP32 block scales directly. That ALSO moves the parity
-// baseline, in a second way and deliberately -- DynamicMxQuant emitted OCP
-// E8M0 power-of-two scales, and these are arbitrary FP32, which uses the
-// E4M3 range strictly better. Quantization error goes down; the numbers
-// differ from any figure taken before 2026-10-13.
-//
-// The FIFTH site (shared expert, "quantize hidden") still runs
-// aclnnDynamicMxQuant, because its input t_hidden is FP32 and the arch35
-// operator takes BF16. See the note at that site.
+// All five activation quantizer sites use arch35 bf16_block_quant_fp8:
+// four accept BF16 and the shared expert consumes FP32 SwiGLU output.
+// Each dispatch emits E4M3 codes and FP32 block scales directly. These
+// arbitrary FP32 scales use the E4M3 range more fully than the previous
+// E8M0 power-of-two scales, so parity figures from that path differ by design.
 //
 // ---------------------------------------------------------------------------
 // ZERO-ALLOCATION: WHAT IS AND IS NOT TRUE
@@ -152,7 +146,6 @@ using ascend_moe::PlanAclnnOp;
 using ascend_moe::kAclBf16;
 using ascend_moe::kAclFloat32;
 using ascend_moe::kAclFloat8E4m3Fn;
-using ascend_moe::kAclFloat8E8m0;
 using ascend_moe::kAclInt32;
 using ascend_moe::kCubeMathTypeKeepDtype;
 using ascend_moe::kFiaAntiquantModeNone;
@@ -173,7 +166,6 @@ using ascend_moe::kRoutedScaleBlock;
 using ascend_moe::kSoftplusBeta;
 using ascend_moe::kSoftplusThreshold;
 using ascend_moe::kSwigluAxisLast;
-using ascend_moe::kSwigluScaleAlgOcp;
 
 namespace arch35 = moe::kernels::arch35;
 
@@ -184,7 +176,6 @@ double MicrosecondsSince(Clock::time_point start) {
 }
 
 // aclnn takes these as `char*`, so they cannot be string literals.
-char kRoundModeRint[] = "rint";
 char kRotaryModeHalf[] = "half";
 char kFiaLayout[] = "TND";
 
@@ -1038,13 +1029,7 @@ int main(int argc, char** argv) {
     DSV4_REQUIRE(ops.runtime_reachable(),
                  "the aclnn runtime is not on this process's loader path; the operator entry points "
                  "are resolved out of the already-linked CANN libraries");
-    // kDynamicMxQuant is still required by exactly ONE site: the shared
-    // expert's "quantize hidden", whose input is FP32 rather than BF16 (see
-    // that site). The four BF16 attention quantizers no longer use it. It
-    // cannot be dropped from this list until that site is handled, and on
-    // ascend950 it is the operator that fails with EZ1009 -- so this list is
-    // currently what will stop a run at the shared expert.
-    ops.RequireAll({OpId::kDynamicMxQuant, OpId::kQuantMatmulV5, OpId::kRmsNorm, OpId::kApplyRotaryPosEmbV2,
+    ops.RequireAll({OpId::kQuantMatmulV5, OpId::kRmsNorm, OpId::kApplyRotaryPosEmbV2,
                     OpId::kFusedInferAttentionScoreV5, OpId::kMoeGatingTopKV2, OpId::kSwiGlu, OpId::kClamp,
                     OpId::kCast, OpId::kMatmul, OpId::kMul, OpId::kInplaceAdd, OpId::kSoftplus, OpId::kSqrt});
 
@@ -1137,13 +1122,8 @@ int main(int argc, char** argv) {
       });
     };
 
-    // Replaces the aclnnDynamicMxQuant + aclnnCast pair that every BF16
-    // activation quantizer site used to run. DynamicMxQuant emitted E8M0
-    // scales while the ascend950 QuantBatchMatmulV3 binary takes
-    // pertoken_scale in FP32, so each site cost two launches and a scale
-    // round trip -- and on hardware the pair failed with EZ1009. This is one
-    // dispatch producing E4M3 codes and FP32 block scales directly, so the
-    // a_*_scale_f32 windows are now written at source rather than cast into.
+    // One dispatch produces E4M3 codes and the FP32 block scales consumed
+    // directly by the ascend950 QuantBatchMatmulV3 binary.
     //
     // Sync-inclusive like every arch35 row (the wrapper synchronizes before
     // releasing its tiling staging buffer, CLAUDE.md §3.7), where the two
@@ -1384,7 +1364,7 @@ int main(int argc, char** argv) {
       // is therefore inclusive of the interleaved arch35 rows: the two
       // OVERLAP and must not be summed. The aclnn launch counts passed to
       // timeline.Add() drop accordingly -- two fewer enqueues per site, since
-      // each quantizer replaced a DynamicMxQuant plus its scale Cast.
+      // each quantizer replaced two aclnn stages.
       const auto start = Clock::now();
       block_quant("bf16_block_quant_fp8: h_norm", h_norm, kHiddenSize, a_h_fp8, a_h_scale_f32);
       graph.Launch(*plan.kv_proj, stream);
@@ -1638,7 +1618,6 @@ int main(int argc, char** argv) {
 
     void* s_gate_up_bf16 = arena.Take(static_cast<std::size_t>(2 * kMoeIntermediate) * 2, "shared.gate_up_bf16");
     void* s_hidden_fp8 = arena.Take(kMoeIntermediate, "shared.hidden_fp8");
-    void* s_hidden_scale = arena.Take(kMoeIntermediate / kRoutedScaleBlock, "shared.hidden_scale");
     void* s_hidden_scale_f32 =
         arena.Take((kMoeIntermediate / kRoutedScaleBlock) * 4, "shared.hidden_scale_f32");
     void* s_out_bf16 = arena.Take(static_cast<std::size_t>(kHiddenSize) * 2, "shared.out_bf16");
@@ -1651,8 +1630,6 @@ int main(int argc, char** argv) {
     aclTensor* t_s_gate_f32 = t_gate_half;  // reuse the FP32 gate/up pair
     aclTensor* t_s_up_f32 = t_up_half;
     aclTensor* t_s_hidden_fp8 = bag.Tensor({1, kMoeIntermediate}, kAclFloat8E4m3Fn, s_hidden_fp8, "shared.hidden_fp8");
-    aclTensor* t_s_hidden_scale = bag.Tensor({1, kMoeIntermediate / kRoutedScaleBlock}, kAclFloat8E8m0,
-                                             s_hidden_scale, "shared.hidden_scale");
     aclTensor* t_s_hidden_scale_f32 = bag.Tensor({1, kMoeIntermediate / kRoutedScaleBlock}, kAclFloat32,
                                                  s_hidden_scale_f32, "shared.hidden_scale_f32");
     aclTensor* t_s_out_bf16 = bag.Tensor({1, kHiddenSize}, kAclBf16, s_out_bf16, "shared.out_bf16");
@@ -1678,21 +1655,6 @@ int main(int argc, char** argv) {
         t_s_gate_f32);
     PipelineStage& shared_up_cast = graph.Plan<ascend_moe::CastPlanFn>(
         "shared expert: up -> f32", OpId::kCast, t_s_up_bf16, static_cast<aclDataType>(kAclFloat32), t_s_up_f32);
-    // THE ONE REMAINING aclnnDynamicMxQuant.
-    // t_hidden is FP32 (kAclFloat32 over e_hidden), not BF16, so
-    // bf16_block_quant_fp8 cannot be substituted here: handing it this buffer
-    // would reinterpret every FP32 as two BF16 values. The arch35 operator
-    // needs an FP32 input mode before this site can move, which is a kernel
-    // change (a tiling flag plus a branch on the staging load), not a
-    // rewiring. Left on the aclnn path rather than silently misreading the
-    // bytes -- and this is the site that will still hit EZ1009 on ascend950.
-    PipelineStage& shared_quant = graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
-        "shared expert: quantize hidden", OpId::kDynamicMxQuant, t_hidden, kSwigluAxisLast, kRoundModeRint,
-        static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_s_hidden_fp8,
-        t_s_hidden_scale);
-    PipelineStage& shared_hidden_scale_cast = graph.Plan<ascend_moe::CastPlanFn>(
-        "shared expert: hidden scale -> f32", OpId::kCast, t_s_hidden_scale,
-        static_cast<aclDataType>(kAclFloat32), t_s_hidden_scale_f32);
     PipelineStage& shared_down = graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
         "shared expert: w2", OpId::kQuantMatmulV5, t_s_hidden_fp8, t_sw2, t_s_hidden_scale_f32, t_sw2_s, nullptr,
         nullptr, nullptr, nullptr, nullptr, false, true, options.dense_group_size, t_s_out_bf16);
@@ -1953,13 +1915,20 @@ int main(int argc, char** argv) {
       graph.Launch(clamp_gate, stream);
       graph.Launch(clamp_up, stream);
       graph.Launch(expert_swiglu, stream);
-      graph.Launch(shared_quant, stream);
-      graph.Launch(shared_hidden_scale_cast, stream);
+      // SwiGLU writes FP32 into e_hidden; preserve those values through quantization.
+      TimedArch35(timeline, "bf16_block_quant_fp8: shared hidden", [&] {
+        return arch35::LaunchBf16BlockQuantFp8(
+            static_cast<const float*>(e_hidden), kMoeIntermediate,
+            static_cast<arch35::Fp8E4M3*>(s_hidden_fp8),
+            static_cast<float*>(s_hidden_scale_f32), nullptr,
+            arch35::kBlockQuantFp8WorkspaceBytes, stream);
+      });
       graph.Launch(shared_down, stream);
       graph.Launch(routed_to_bf16, stream);
       graph.Launch(add_shared, stream);
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
-      timeline.Add("shared expert + combine (aclnn)", MicrosecondsSince(shared_start), 12, false);
+      // This span includes the quantizer row above; the rows overlap.
+      timeline.Add("shared expert + combine (aclnn)", MicrosecondsSince(shared_start), 10, false);
 
       mhc_epilogue(x_ping, x_pong);
     }

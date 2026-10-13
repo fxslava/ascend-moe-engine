@@ -1,7 +1,7 @@
 #ifndef BF16_BLOCK_QUANT_FP8_TILING_H
 #define BF16_BLOCK_QUANT_FP8_TILING_H
 
-// Tiling POD and v1 contract geometry for bf16_block_quant_fp8: BF16 ->
+// Tiling POD and v1 contract geometry for bf16_block_quant_fp8: BF16/FP32 ->
 // FP8 E4M3 with one FP32 scale per 32 elements.
 //
 // WHY THIS OPERATOR EXISTS
@@ -101,7 +101,7 @@ struct Bf16BlockQuantFp8TilingData {
   std::uint32_t elems_per_tile;   // 1024
   std::uint32_t blocks_per_tile;  // 32
   std::uint32_t num_tiles;        // ceil(width / 1024)
-  std::uint32_t reserved;         // 0
+  std::uint32_t input_is_fp32;    // 0: BF16 (legacy default), 1: FP32
 };
 
 MOE_ARCH35_ASSERT_TILING_POD(Bf16BlockQuantFp8TilingData, 32);

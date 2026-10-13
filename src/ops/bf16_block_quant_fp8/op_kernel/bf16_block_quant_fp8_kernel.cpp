@@ -14,7 +14,8 @@
 // disjoint tiles, so there is no cross-core synchronization and no GM
 // scratch.
 //
-// Per tile: MTE2 the BF16 tile, widen to FP32 with a SIMD Cast, then ONE
+// Per tile: MTE2 the BF16 tile and widen with a SIMD Cast, or MTE2 FP32
+// directly into the same FP32 buffer, then ONE
 // SIMT launch of 512 threads = 32 blocks x 16 lanes. Each lane owns a
 // float2, reduces the block max through an in-register butterfly, converts
 // its pair with the hardware E4M3 encoder, and lane 0 writes the block's
@@ -118,9 +119,11 @@ class Bf16BlockQuantFp8 {
     tiling_.elems_per_tile = tiling->elems_per_tile;
     tiling_.blocks_per_tile = tiling->blocks_per_tile;
     tiling_.num_tiles = tiling->num_tiles;
+    tiling_.input_is_fp32 = tiling->input_is_fp32;
 
     xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(x),
                          tiling_.width);
+    xF32Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), tiling_.width);
     yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ std::uint8_t*>(y),
                          tiling_.width);
     scaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scale),
@@ -156,14 +159,20 @@ class Bf16BlockQuantFp8 {
           remaining < kElemsPerTile ? remaining : kElemsPerTile;
       const std::uint32_t tile_blocks = tile_elems / kBlockSize;
 
-      DataCopy(xBf16Tensor_, xGm_[base], tile_elems);
+      if (tiling_.input_is_fp32 == 1u) {
+        DataCopy(xF32Tensor_, xF32Gm_[base], tile_elems);
+      } else {
+        DataCopy(xBf16Tensor_, xGm_[base], tile_elems);
+      }
       SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
       WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
 
       // Widen on the SIMD side: the VF reads FP32 so the per-lane max and the
       // multiply happen at full precision, and BF16 -> FP32 is exact, so this
       // introduces no error of its own.
-      Cast(xF32Tensor_, xBf16Tensor_, RoundMode::CAST_NONE, tile_elems);
+      if (tiling_.input_is_fp32 == 0u) {
+        Cast(xF32Tensor_, xBf16Tensor_, RoundMode::CAST_NONE, tile_elems);
+      }
       DataSyncBarrier<MemDsbT::ALL>();
 
       asc_vf_call<BlockQuantTileSimt>(
@@ -191,6 +200,7 @@ class Bf16BlockQuantFp8 {
   LocalTensor<float> scaleTensor_;
 
   GlobalTensor<bfloat16_t> xGm_;
+  GlobalTensor<float> xF32Gm_;
   GlobalTensor<std::uint8_t> yGm_;
   GlobalTensor<float> scaleGm_;
 };
@@ -213,7 +223,7 @@ extern "C" __global__ __aicore__ void bf16_block_quant_fp8(
                td->block_dim != kBlockQuantBlockDim ||
                td->block_size != kBlockSize ||
                td->elems_per_tile != kElemsPerTile ||
-               td->blocks_per_tile != kBlocksPerTile || td->reserved != 0u ||
+               td->blocks_per_tile != kBlocksPerTile || td->input_is_fp32 > 1u ||
                td->width == 0u || td->width % kBlockSize != 0u ||
                td->width > kBlockQuantMaxWidth || td->num_tiles == 0u)) {
     return;
