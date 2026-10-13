@@ -99,6 +99,7 @@ fused_mhc_post_residual
 paged_compressor_rope
 fast_fp8_indexer_topk
 mxfp4_expert_gemv
+dsv4_moe_expert
 "
 
 pass=0; fail=0

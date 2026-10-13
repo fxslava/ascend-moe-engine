@@ -163,6 +163,32 @@ Status LaunchMxfp4ExpertGemv(
     float* y_gm, void* workspace, std::size_t workspace_bytes,
     aclrtStream stream);
 
+// ---------------------------------------------------------------------------
+// dsv4_moe_expert
+//
+// One DeepSeek-V4 routed expert for one token, fused: gate GEMV, up GEMV, the
+// model's ASYMMETRIC clamped SwiGLU (gate bounded above at 10, up bounded
+// two-sided), and the down GEMV. v1 geometry is hidden = 4096, inter = 2048.
+//
+// Unlike the other four wrappers this one issues TWO chevron dispatches on
+// `stream`. The down leg reduces over the whole `activated` vector while the
+// gate/up legs are split across 32 cores by row tile, so the phases need a
+// barrier, and stream ordering is it. `activated` lives in `workspace` in
+// between -- which is why this is the one operator here whose workspace is a
+// real inter-stage operand rather than scratch, and why it must not alias x
+// or y.
+// ---------------------------------------------------------------------------
+std::size_t Dsv4MoeExpertWorkspaceBytes(std::uint32_t inter) noexcept;
+
+Status LaunchDsv4MoeExpert(
+    const Mxfp4Pair* w1_packed_gm, const E8M0* w1_scale_gm,
+    const Mxfp4Pair* w3_packed_gm, const E8M0* w3_scale_gm,
+    const Mxfp4Pair* w2_packed_gm, const E8M0* w2_scale_gm,
+    std::uint32_t w13_packed_row_stride, std::uint32_t w13_scale_row_stride,
+    std::uint32_t w2_packed_row_stride, std::uint32_t w2_scale_row_stride,
+    const float* x_gm, std::uint32_t hidden, std::uint32_t inter, float* y_gm,
+    void* workspace, std::size_t workspace_bytes, aclrtStream stream);
+
 }  // namespace moe::kernels::arch35
 
 #endif  // MOE_KERNELS_ARCH35_LAUNCH_HPP

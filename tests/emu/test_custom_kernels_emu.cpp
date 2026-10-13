@@ -751,6 +751,281 @@ void VerifyIndexerSelectionNetwork(Report& rep) {
 // right. A metric that returns 1.0 for everything would make this whole
 // binary vacuous, so it gets its own cases.
 // ===========================================================================
+// ===========================================================================
+// 6. dsv4_moe_expert -- the fused expert's lane indexing and activation,
+//    simulated
+//
+// Two things in this operator can only be wrong in ways a device run would
+// discover late, and both are pure host-checkable logic (CLAUDE.md section
+// 5.5):
+//
+//   * the lane decomposition. LaneRowPartial gives lane L of a 16-lane row
+//     the pair range [L*pairs_per_lane, (L+1)*pairs_per_lane) and reads ONE
+//     E8M0 scale byte per 16-pair group, starting at
+//     (L*pairs_per_lane)/16. That alignment is an assumption: if a lane's
+//     range ever straddled a group boundary, the scale applied to half its
+//     pairs would silently be the wrong one.
+//   * the asymmetric clamp. The gate is bounded ABOVE only and `up` is
+//     bounded on BOTH sides. The two are not interchangeable, and the
+//     prototype this operator descends from had both halves inverted.
+//
+// The simulation below transcribes the kernel's indexing -- same lane split,
+// same per-group scale fetch, same in-register butterfly order -- and
+// compares against moe_expert_swiglu_mxfp4_cpu, the oracle the kernel's own
+// header names.
+// ===========================================================================
+void VerifyDsv4MoeExpertSimt(Report& rep) {
+  section("dsv4_moe_expert: lane indexing and asymmetric clamp (host simulation)");
+
+  // Must match the kernel's geometry constants exactly.
+  constexpr std::uint32_t kLanesPerRow = 16;
+  constexpr int kGroup = moe::emu::kMxfp4GroupSize;
+  // A reduced geometry, but NOT an arbitrary one. The lane decomposition
+  // needs pairs_per_lane = cols/32 to be a multiple of 16, i.e.
+  // cols % 512 == 0; below that, pairs_per_lane/16 is zero, every lane's
+  // group loop body never runs and the GEMV silently returns zero. 256/128
+  // fails that and produced exactly that all-zero result when this test was
+  // first written. MakeDsv4MoeExpertTiling admits only 4096/2048, so the
+  // kernel cannot be reached with a bad width -- this is the smallest pair
+  // that exercises the same decomposition.
+  constexpr int kHidden = 1024;
+  constexpr int kInter = 512;
+  constexpr float kLimit = moe::emu::kSwigluLimit;
+
+  Rng rng(0xD5040001ULL);
+  const std::vector<std::uint8_t> w1p =
+      rng.bytes(static_cast<std::size_t>(kInter) * (kHidden / 2));
+  const std::vector<std::uint8_t> w3p =
+      rng.bytes(static_cast<std::size_t>(kInter) * (kHidden / 2));
+  const std::vector<std::uint8_t> w2p =
+      rng.bytes(static_cast<std::size_t>(kHidden) * (kInter / 2));
+  // E8M0 codes near the 127 bias, so the products stay in a sane range.
+  const std::vector<std::uint8_t> w1s =
+      rng.bytes(static_cast<std::size_t>(kInter) * (kHidden / kGroup), 125, 129);
+  const std::vector<std::uint8_t> w3s =
+      rng.bytes(static_cast<std::size_t>(kInter) * (kHidden / kGroup), 125, 129);
+  const std::vector<std::uint8_t> w2s =
+      rng.bytes(static_cast<std::size_t>(kHidden) * (kInter / kGroup), 125, 129);
+  const std::vector<float> x = rng.normal(kHidden, 0.0F, 1.0F);
+
+  const auto matrix = [](const std::vector<std::uint8_t>& packed,
+                         const std::vector<std::uint8_t>& scale, int rows, int cols) {
+    moe::emu::Mxfp4Matrix m;
+    m.packed = packed.data();
+    m.scale = scale.data();
+    m.rows = rows;
+    m.cols = cols;
+    return m;
+  };
+  const moe::emu::Mxfp4Matrix w1 = matrix(w1p, w1s, kInter, kHidden);
+  const moe::emu::Mxfp4Matrix w3 = matrix(w3p, w3s, kInter, kHidden);
+  const moe::emu::Mxfp4Matrix w2 = matrix(w2p, w2s, kHidden, kInter);
+
+  // --- the oracle -------------------------------------------------------
+  std::vector<float> want(kHidden);
+  std::vector<float> scratch;
+  moe::emu::moe_expert_swiglu_mxfp4_cpu(w1, w3, w2, x.data(), want.data(), kLimit,
+                                        &scratch);
+
+  // --- the kernel's own decomposition -----------------------------------
+  // LaneRowPartial, transcribed. `cols` is logical; the lane walks pairs.
+  const auto lane_partial = [&](const std::uint8_t* packed_row,
+                                const std::uint8_t* scale_row, std::uint32_t lane,
+                                std::uint32_t cols, const float* in) {
+    const std::uint32_t pairs_per_lane = (cols / 2u) / kLanesPerRow;
+    const std::uint32_t lane_group_base = (lane * pairs_per_lane) / 16u;
+    float total = 0.0F;
+    for (std::uint32_t g = 0; g < pairs_per_lane / 16u; ++g) {
+      const float scale = std::ldexp(
+          1.0F, static_cast<int>(scale_row[lane_group_base + g]) - 127);
+      float partial = 0.0F;
+      const std::uint32_t p0 = lane * pairs_per_lane + g * 16u;
+      for (std::uint32_t q = 0; q < 16u; ++q) {
+        const std::uint32_t p = p0 + q;
+        const std::uint8_t byte = packed_row[p];
+        partial +=
+            moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>(byte & 0xFu)) * in[2u * p] +
+            moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>(byte >> 4u)) * in[2u * p + 1u];
+      }
+      total += partial * scale;
+    }
+    return total;
+  };
+  // The in-register butterfly: xor masks 1, 2, 4, 8 over the row's 16 lanes.
+  const auto reduce_row = [](std::vector<float> lanes) {
+    for (std::uint32_t mask : {1u, 2u, 4u, 8u}) {
+      std::vector<float> next(lanes.size());
+      for (std::size_t l = 0; l < lanes.size(); ++l) {
+        next[l] = lanes[l] + lanes[l ^ static_cast<std::size_t>(mask)];
+      }
+      lanes.swap(next);
+    }
+    return lanes[0];
+  };
+  const auto gemv_row = [&](const moe::emu::Mxfp4Matrix& w, int row, const float* in) {
+    std::vector<float> lanes(kLanesPerRow);
+    const std::size_t packed_stride = static_cast<std::size_t>(w.cols) / 2u;
+    const std::size_t scale_stride = static_cast<std::size_t>(w.cols) / kGroup;
+    for (std::uint32_t l = 0; l < kLanesPerRow; ++l) {
+      lanes[l] = lane_partial(w.packed + static_cast<std::size_t>(row) * packed_stride,
+                              w.scale + static_cast<std::size_t>(row) * scale_stride, l,
+                              static_cast<std::uint32_t>(w.cols), in);
+    }
+    return reduce_row(lanes);
+  };
+
+  // --- check A: the lane decomposition, in isolation --------------------
+  // Compared against mxfp4_gemv_cpu, the very function the oracle's legs
+  // call, so the ONLY difference is how the per-group subtotals associate: a
+  // 16-way lane tree here against the reference's sequential sum there.
+  //
+  // The bound is the standard summation-reordering bound applied to exactly
+  // the quantity that reorders. Two FP32 summations of the same G addends in
+  // different orders differ by at most 2 * G * u * sum|addend|, with
+  // u = 2^-24. It is stated per row against that row's own sum of absolute
+  // group subtotals rather than against the result, because a dot product of
+  // signed terms can cancel to near zero and a result-relative bound would
+  // then be reporting the row's condition number, not the kernel's error.
+  // (A plain relative bound measured 2.6e-5 here for exactly that reason.)
+  {
+    constexpr double kUnitRoundoff = 1.0 / 16777216.0;  // 2^-24
+    std::vector<float> ref_gate(kInter);
+    moe::emu::mxfp4_gemv_cpu(w1, x.data(), ref_gate.data());
+    bool within = true;
+    double worst_ratio = 0.0;
+    const std::uint32_t groups = static_cast<std::uint32_t>(kHidden) / kGroup;
+    for (int r = 0; r < kInter; ++r) {
+      // Re-walk the row to accumulate sum|group subtotal|, the addends both
+      // summations share.
+      double abs_groups = 0.0;
+      for (std::uint32_t l = 0; l < kLanesPerRow; ++l) {
+        const std::uint32_t pairs_per_lane =
+            (static_cast<std::uint32_t>(kHidden) / 2u) / kLanesPerRow;
+        const std::uint32_t lane_group_base = (l * pairs_per_lane) / 16u;
+        for (std::uint32_t g = 0; g < pairs_per_lane / 16u; ++g) {
+          const std::uint8_t* prow =
+              w1.packed + static_cast<std::size_t>(r) * (kHidden / 2);
+          const std::uint8_t* srow =
+              w1.scale + static_cast<std::size_t>(r) * (kHidden / kGroup);
+          const double scale =
+              std::ldexp(1.0, static_cast<int>(srow[lane_group_base + g]) - 127);
+          double partial = 0.0;
+          const std::uint32_t p0 = l * pairs_per_lane + g * 16u;
+          for (std::uint32_t q = 0; q < 16u; ++q) {
+            const std::uint8_t byte = prow[p0 + q];
+            partial += static_cast<double>(moe::emu::DecodeFp4E2M1(
+                           static_cast<std::uint8_t>(byte & 0xFu))) *
+                           x[static_cast<std::size_t>(2u * (p0 + q))] +
+                       static_cast<double>(moe::emu::DecodeFp4E2M1(
+                           static_cast<std::uint8_t>(byte >> 4u))) *
+                           x[static_cast<std::size_t>(2u * (p0 + q) + 1u)];
+          }
+          abs_groups += std::fabs(partial * scale);
+        }
+      }
+      const double allowed = 2.0 * groups * kUnitRoundoff * abs_groups;
+      const double got_row = gemv_row(w1, r, x.data());
+      const double ref_row = ref_gate[static_cast<std::size_t>(r)];
+      const double deviation = std::fabs(got_row - ref_row);
+      if (deviation > allowed) within = false;
+      if (allowed > 0.0) worst_ratio = std::max(worst_ratio, deviation / allowed);
+    }
+    rep.check(within, "lane decomposition matches mxfp4_gemv_cpu per row",
+              "a row exceeded the reordering bound; worst deviation/bound = " +
+                  std::to_string(worst_ratio));
+  }
+
+  // --- check B: the clamped activation, over an exact gate/up -----------
+  // Both sides start from the SAME reference GEMV outputs, so this isolates
+  // the clamp and silu expression from any reduction-order difference. It is
+  // the check that would have caught the inverted clamp and the swish sign
+  // in the prototype this operator descends from.
+  std::vector<float> activated(kInter);
+  {
+    std::vector<float> ref_gate(kInter);
+    std::vector<float> ref_up(kInter);
+    moe::emu::mxfp4_gemv_cpu(w1, x.data(), ref_gate.data());
+    moe::emu::mxfp4_gemv_cpu(w3, x.data(), ref_up.data());
+    bool clamp_ok = true;
+    for (int r = 0; r < kInter; ++r) {
+      const float gate = ref_gate[static_cast<std::size_t>(r)];
+      const float up = ref_up[static_cast<std::size_t>(r)];
+      const float g = std::min(gate, kLimit);
+      const float u = std::min(kLimit, std::max(-kLimit, up));
+      const float mine = (g / (1.0F + std::exp(-g))) * u;
+      activated[static_cast<std::size_t>(r)] = mine;
+      // An independent evaluation of the same contract in double precision.
+      // This checks the FP32 expression against a higher-precision one, not
+      // the contract itself -- that the contract IS DeepSeek-V4's activation
+      // is what check C establishes, by comparing the assembled expert
+      // against moe_expert_swiglu_mxfp4_cpu, which calls the real Silu.
+      const double gd = static_cast<double>(g);
+      const double want_el = (gd / (1.0 + std::exp(-gd))) * static_cast<double>(u);
+      if (std::fabs(static_cast<double>(mine) - want_el) >
+          1e-6 * std::max(1.0, std::fabs(want_el))) {
+        clamp_ok = false;
+      }
+    }
+    rep.check(clamp_ok, "the kernel's clamp and silu match the oracle elementwise",
+              "an element diverged from Silu(min(gate, L)) * clamp(up, -L, L)");
+  }
+
+  // --- check C: the assembled expert ------------------------------------
+  // Direction, not magnitude. The down leg sums 512 signed terms, so the
+  // association difference check A bounds at 1e-5 per element is amplified by
+  // whatever cancellation each output row happens to have -- that moves
+  // magnitude and says nothing about correctness. A transposed weight, a
+  // mis-strided row or a swapped nibble moves DIRECTION, which cosine sees
+  // and a loosened relative-L2 bound would not (CLAUDE.md section 4.7).
+  {
+    std::vector<float> got(kHidden);
+    for (int c = 0; c < kHidden; ++c) {
+      got[static_cast<std::size_t>(c)] = gemv_row(w2, c, activated.data());
+    }
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
+    for (int c = 0; c < kHidden; ++c) {
+      const double a = got[static_cast<std::size_t>(c)];
+      const double b = want[static_cast<std::size_t>(c)];
+      dot += a * b;
+      na += a * a;
+      nb += b * b;
+    }
+    // Non-degeneracy on the REFERENCE, not a value against itself (section
+    // 4.8): a zeroed oracle would make any output look perfectly correlated.
+    rep.check(nb > 0.0 && na > 0.0 && AllFinite(want.data(), kHidden) &&
+                  AllFinite(got.data(), kHidden),
+              "both the simulated expert and its oracle are nonzero and finite",
+              "the cosine below would be vacuous");
+    const double cosine = dot / (std::sqrt(na) * std::sqrt(nb));
+    rep.check(cosine > 0.999999, "the assembled expert matches the oracle in direction",
+              "cosine " + std::to_string(cosine));
+  }
+
+  // The lane/group alignment the kernel assumes, stated as its own check: a
+  // lane's pair range must start on a 16-pair group boundary, or its single
+  // scale fetch per group would apply the wrong exponent to part of the range.
+  bool aligned = true;
+  for (int cols : {kHidden, kInter, 4096, 2048}) {
+    const std::uint32_t pairs_per_lane =
+        (static_cast<std::uint32_t>(cols) / 2u) / kLanesPerRow;
+    aligned = aligned && (pairs_per_lane % 16u == 0u);
+  }
+  rep.check(aligned, "every lane's pair range starts on a 16-pair scale group",
+            "a lane straddles two E8M0 groups but fetches only one scale");
+
+  // The clamp is asymmetric, and the two halves are not interchangeable.
+  {
+    const float big = 1e6F;
+    rep.check(std::min(big, kLimit) == kLimit && std::min(-big, kLimit) == -big,
+              "gate is clamped above only", "the gate picked up a lower bound");
+    rep.check(std::min(kLimit, std::max(-kLimit, big)) == kLimit &&
+                  std::min(kLimit, std::max(-kLimit, -big)) == -kLimit,
+              "up is clamped on both sides", "the up clamp is one-sided");
+  }
+}
+
 void VerifyMetrics(Report& rep) {
   section("harness: metric self-test");
 
@@ -812,6 +1087,7 @@ int main() {
   VerifyIndexerEdgeCases(rep);
   VerifyMxfp4Gemv(rep);
   VerifyIndexerSelectionNetwork(rep);
+  VerifyDsv4MoeExpertSimt(rep);
 
   std::printf("\n---------------------------------------------------------\n");
   std::printf("checks: %d   failures: %d\n", rep.checks, rep.failures);

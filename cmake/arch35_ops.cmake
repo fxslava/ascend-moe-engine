@@ -19,6 +19,7 @@ set(MOE_ARCH35_OPS
   paged_compressor_rope
   fast_fp8_indexer_topk
   mxfp4_expert_gemv
+  dsv4_moe_expert
 )
 
 set(MOE_ARCH35_OP_ASC_SOURCES "")
@@ -63,6 +64,11 @@ endforeach()
 #
 # Adding one: put it in the owning operator's op_kernel/ and list it here, and
 # add it to scripts/device_compile_kernels.sh (CLAUDE.md §5.1).
+# dsv4_moe_expert likewise has two entry points, but both live in its single
+# op_kernel/<op>_kernel.cpp, so the derivation above already covers it and it
+# needs no entry here: the gate_up/down split exists because the down leg
+# reduces over the whole `activated` vector while the gate/up legs are split
+# across cores by row tile, and the barrier between them is stream ordering.
 set(MOE_ARCH35_EXTRA_KERNEL_SOURCES
   "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_score_kernel.cpp"
   "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_select_kernel.cpp"

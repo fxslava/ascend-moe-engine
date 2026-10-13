@@ -31,8 +31,9 @@
 //             + fast_fp8_indexer_topk, top-512 over the key cache
 //             -> fused_mhc_post_residual
 //   layer 1   fused_mhc_pre_norm_sinkhorn
-//             -> MoE: aclnn MoeGatingTopKV2 hash route, mxfp4_expert_gemv per
-//                routed expert, aclnn Clamp/SwiGlu, QuantMatmulV5 shared expert
+//             -> MoE: aclnn MoeGatingTopKV2 hash route, dsv4_moe_expert per
+//                routed expert (gate/up GEMV + clamped SwiGLU + down GEMV in
+//                one wrapper call), QuantMatmulV5 shared expert
 //             -> fused_mhc_post_residual
 //
 // ---------------------------------------------------------------------------
@@ -1553,6 +1554,13 @@ int main(int argc, char** argv) {
     void* e_routed = arena.Take(static_cast<std::size_t>(kHiddenSize) * 4, "expert.routed_sum");
     void* e_scaled = arena.Take(static_cast<std::size_t>(kHiddenSize) * 4, "expert.scaled");
     void* e_weight_broadcast = arena.Take(static_cast<std::size_t>(kHiddenSize) * 4, "expert.weight_broadcast");
+    // dsv4_moe_expert's `activated`, written by its gate_up pass and read by
+    // its down pass. Unlike the other arch35 operators' workspaces this is a
+    // real inter-stage operand, not scratch, and it must not alias x or y --
+    // the wrapper refuses if it does.
+    const std::size_t e_expert_workspace_bytes =
+        arch35::Dsv4MoeExpertWorkspaceBytes(static_cast<std::uint32_t>(kMoeIntermediate));
+    void* e_expert_workspace = arena.Take(e_expert_workspace_bytes, "expert.activated");
 
     auto* e_gate_f32 = static_cast<float*>(e_gate_up);
     auto* e_up_f32 = static_cast<float*>(e_gate_up) + kMoeIntermediate;
@@ -1868,39 +1876,30 @@ int main(int argc, char** argv) {
       // --- the six routed experts, MXFP4 ----------------------------------
       for (int i = 0; i < kNumExpertsPerTok; ++i) {
         const RoutedExpert& expert = routed_experts[static_cast<std::size_t>(i)];
-        // gate = w1 @ h_norm and up = w3 @ h_norm land back to back in one
-        // [2 * 2048] buffer, so the SwiGLU split below is exactly gate/up.
-        TimedArch35(timeline, "mxfp4_expert_gemv", [&] {
-          return arch35::LaunchMxfp4ExpertGemv(
-              static_cast<const arch35::Mxfp4Pair*>(expert.w1.packed), static_cast<std::uint32_t>(kHiddenSize / 2),
+        // One launch for the whole expert: gate GEMV, up GEMV, the model's
+        // asymmetric clamped SwiGLU and the down GEMV. This replaces three
+        // LaunchMxfp4ExpertGemv calls and the aclnn Clamp/Clamp/SwiGlu trio
+        // that used to sit between them -- six dispatches and two stream
+        // synchronizations per expert, down to one wrapper call.
+        //
+        // The clamp now lives inside the operator, where tiling carries its
+        // bound, rather than in two aclnn stages whose argument order
+        // encoded the asymmetry at the call site. The shared expert below
+        // still uses the aclnn path because it is FP8, not MXFP4.
+        TimedArch35(timeline, "dsv4_moe_expert", [&] {
+          return arch35::LaunchDsv4MoeExpert(
+              static_cast<const arch35::Mxfp4Pair*>(expert.w1.packed),
               static_cast<const arch35::E8M0*>(expert.w1.scale),
-              static_cast<std::uint32_t>(kHiddenSize / kMxfp4GroupSize), h_norm_f32,
-              static_cast<std::uint32_t>(kMoeIntermediate), static_cast<std::uint32_t>(kHiddenSize), e_gate_f32,
-              nullptr, arch35::kMxfp4GemvWorkspaceBytes, stream);
-        });
-        TimedArch35(timeline, "mxfp4_expert_gemv", [&] {
-          return arch35::LaunchMxfp4ExpertGemv(
-              static_cast<const arch35::Mxfp4Pair*>(expert.w3.packed), static_cast<std::uint32_t>(kHiddenSize / 2),
+              static_cast<const arch35::Mxfp4Pair*>(expert.w3.packed),
               static_cast<const arch35::E8M0*>(expert.w3.scale),
-              static_cast<std::uint32_t>(kHiddenSize / kMxfp4GroupSize), h_norm_f32,
-              static_cast<std::uint32_t>(kMoeIntermediate), static_cast<std::uint32_t>(kHiddenSize), e_up_f32,
-              nullptr, arch35::kMxfp4GemvWorkspaceBytes, stream);
-        });
-
-        const auto act_start = Clock::now();
-        graph.Launch(clamp_gate, stream);
-        graph.Launch(clamp_up, stream);
-        graph.Launch(expert_swiglu, stream);
-        DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
-        timeline.Add("expert: clamped SwiGLU (aclnn)", MicrosecondsSince(act_start), 3, false);
-
-        TimedArch35(timeline, "mxfp4_expert_gemv", [&] {
-          return arch35::LaunchMxfp4ExpertGemv(
               static_cast<const arch35::Mxfp4Pair*>(expert.w2.packed),
-              static_cast<std::uint32_t>(kMoeIntermediate / 2), static_cast<const arch35::E8M0*>(expert.w2.scale),
-              static_cast<std::uint32_t>(kMoeIntermediate / kMxfp4GroupSize), static_cast<const float*>(e_hidden),
+              static_cast<const arch35::E8M0*>(expert.w2.scale),
+              static_cast<std::uint32_t>(kHiddenSize / 2),
+              static_cast<std::uint32_t>(kHiddenSize / kMxfp4GroupSize),
+              static_cast<std::uint32_t>(kMoeIntermediate / 2),
+              static_cast<std::uint32_t>(kMoeIntermediate / kMxfp4GroupSize), h_norm_f32,
               static_cast<std::uint32_t>(kHiddenSize), static_cast<std::uint32_t>(kMoeIntermediate),
-              static_cast<float*>(e_out), nullptr, arch35::kMxfp4GemvWorkspaceBytes, stream);
+              static_cast<float*>(e_out), e_expert_workspace, e_expert_workspace_bytes, stream);
         });
 
         // routed_sum += route_weight[i] * expert_out. aclnnMul needs the
