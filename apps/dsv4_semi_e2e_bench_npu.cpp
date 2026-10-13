@@ -45,13 +45,22 @@
 // behaviour until it has run on hardware.
 //
 // Decisions that only a device can settle are marked UNVERIFIED at their site.
-// The largest is aclnnQuantMatmulV5's `groupSize`: CANN 9.2.0-beta.2 declares
-// the argument and documents neither its encoding nor its range, so the dense
-// block-128 weight scale cannot be expressed from the headers alone. This
-// bench inherits the engine's existing resolution of that open question --
-// RuntimeConfig::dense_group_size, defaulting to 0 ("ask the operator for its
-// default") with a --dense-group-size override for a device A/B. See the
-// comment at config.hpp's declaration; this is the same unknown, not a new one.
+//
+// The FP8 projection path is bound to a binary that was confirmed present in
+// this toolkit rather than assumed:
+//   opp/.../kernel/ascend950/ops_nn/quant_batch_matmul_v3/
+//     QuantBatchMatmulV3_ND_ND_fp8e4m3_fp8e4m3_fp32_bf16_high_performance.{o,json}
+// whose supportInfo declares x1/x2 float8_e4m3fn, scale and pertoken_scale
+// float32, y bfloat16, all ND and dynamic-rank. The checkpoint's 128x128 E8M0
+// scale grid is rewritten to FP32 at staging to reach it -- see Fp8Matrix for
+// why the mxfp8/E8M0 binaries are the wrong granularity despite matching on
+// dtype -- and `groupSize` carries the 128x128 block geometry.
+//
+// Note this bench and src/pipeline/pipeline.cpp now differ deliberately:
+// RuntimeConfig::dense_group_size still defaults to 0 ("ask the operator")
+// because that path feeds the MLA decode, while this one passes the packed
+// 128|128<<16 value. Neither has run on hardware; --dense-group-size exists
+// so the two can be A/B'd against each other once one can.
 //
 // ---------------------------------------------------------------------------
 // WHERE THIS DIVERGES FROM THE HOST BENCH, BY CONSTRUCTION
@@ -110,6 +119,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -226,7 +236,20 @@ struct Options {
   int layer2 = 2;
   int moe_layer = 1;
   int warmup_window_tokens = 8;
-  std::int64_t dense_group_size = 0;
+  // aclnnQuantMatmulV5's `groupSize` packs the three per-axis block sizes:
+  //   groupSize = groupSizeK | groupSizeN << 16 | groupSizeM << 32
+  // documented in aclnnop/aclnn_quant_grouped_matmul_inplace_add.h:37 (the
+  // quant_matmul_v5 header itself only says "int64"). The checkpoint's dense
+  // FP8 scale grid is 128x128, so K = N = 128 and M is left at 0 for this
+  // one-token GEMV: 128 | (128 << 16) == 8388736.
+  //
+  // UNVERIFIED: the formula is documented for the grouped operator and the
+  // dense one takes the same scalar, but no device has confirmed that the
+  // dense path reads it identically, nor what groupSizeM means at M = 1.
+  // --dense-group-size overrides it for a hardware A/B; 0 asks the operator
+  // for its own default, which is what RuntimeConfig::dense_group_size still
+  // uses in src/pipeline.
+  std::int64_t dense_group_size = (128 | (static_cast<std::int64_t>(128) << 16));
   double memory_budget_mb = 4096.0;
   double time_budget_ms = 1500.0;
   bool golden = true;
@@ -521,6 +544,13 @@ class Checkpoint {
     return host;
   }
 
+  // Assert a tensor's declared dtype and shape without staging it. Used by
+  // callers that read the payload themselves to reformat it.
+  void Require(const std::string& name, const char* dtype, const std::vector<std::int64_t>& shape) {
+    RequireDtype(name, dtype);
+    RequireShape(name, shape);
+  }
+
   bool Has(const std::string& name) const { return source_.HasNamed(name); }
   std::string Dtype(const std::string& name) const { return source_.NamedDtype(name); }
   std::vector<std::int64_t> Shape(const std::string& name) const { return source_.NamedShape(name); }
@@ -554,24 +584,67 @@ class Checkpoint {
   std::size_t bytes_ = 0;
 };
 
-// An FP8 block-scaled matrix staged on device, with its 128x128 E8M0 grid.
+// E8M0 is a bare power-of-two exponent with bias 127; 0xFF is the NaN code.
+// The conversion to FP32 is therefore EXACT -- every representable E8M0 value
+// is a normal float -- which is what makes the staging-time rewrite below a
+// reformat rather than a precision loss.
+float DecodeE8M0(std::uint8_t code) {
+  if (code == 0xFFU) return std::numeric_limits<float>::quiet_NaN();
+  return std::ldexp(1.0F, static_cast<int>(code) - 127);
+}
+
+// An FP8 block-scaled matrix staged on device.
+//
+// WHY THE SCALE GRID IS REWRITTEN TO FP32
+// The checkpoint stores a 128x128 E8M0 block grid. On ascend950,
+// QuantBatchMatmulV3's compiled binaries split into two families and neither
+// takes that combination directly:
+//
+//   ND_ND_fp8e4m3_fp8e4m3_fp32_bf16      scale fp32,        pertoken_scale fp32
+//   ND_ND_mxfp8e4m3_mxfp8e4m3_e8m0_bf16  scale float8_e8m0, pertoken_scale e8m0
+//
+// Every E8M0-scaled binary in that directory is an `mx*` one, i.e. OCP
+// microscaling at block-32 along K -- NOT a 128x128 dense grid. So the MX
+// family matches our dtype and not our granularity. The FP32 family matches
+// our granularity (expressed through `groupSize`) and not our scale dtype.
+//
+// Converting E8M0 -> FP32 once at staging costs one float per 128x128 block
+// (a 4096x4096 matrix needs 32x32 floats = 4 KB) and binds us to the family
+// whose granularity is right. Verified present:
+//   opp/built-in/op_impl/ai_core/tbe/kernel/ascend950/ops_nn/
+//     quant_batch_matmul_v3/
+//     QuantBatchMatmulV3_ND_ND_fp8e4m3_fp8e4m3_fp32_bf16_high_performance.{o,json}
 struct Fp8Matrix {
   void* weight = nullptr;
-  void* scale = nullptr;
+  float* scale = nullptr;  // FP32, rewritten from the checkpoint's E8M0 grid
   std::int64_t rows = 0;
   std::int64_t cols = 0;
   std::int64_t scale_rows = 0;
   std::int64_t scale_cols = 0;
 };
 
-Fp8Matrix StageFp8(Checkpoint& checkpoint, const std::string& stem, std::int64_t rows, std::int64_t cols) {
+Fp8Matrix StageFp8(Checkpoint& checkpoint, DeviceArena& arena, const std::string& stem, std::int64_t rows,
+                   std::int64_t cols) {
   Fp8Matrix matrix;
   matrix.rows = rows;
   matrix.cols = cols;
   matrix.scale_rows = (rows + kFp8BlockSize - 1) / kFp8BlockSize;
   matrix.scale_cols = (cols + kFp8BlockSize - 1) / kFp8BlockSize;
   matrix.weight = checkpoint.Stage(stem + ".weight", "F8_E4M3", {rows, cols});
-  matrix.scale = checkpoint.Stage(stem + ".scale", "F8_E8M0", {matrix.scale_rows, matrix.scale_cols});
+
+  const std::string scale_name = stem + ".scale";
+  checkpoint.Require(scale_name, "F8_E8M0", {matrix.scale_rows, matrix.scale_cols});
+  const std::vector<std::uint8_t> codes = checkpoint.ReadHost(scale_name);
+  const std::size_t elements = static_cast<std::size_t>(matrix.scale_rows) * matrix.scale_cols;
+  DSV4_REQUIRE(codes.size() == elements,
+               scale_name << ": E8M0 payload is " << codes.size() << " B, expected " << elements);
+  std::vector<float> decoded(elements);
+  for (std::size_t i = 0; i < elements; ++i) {
+    decoded[i] = DecodeE8M0(codes[i]);
+    DSV4_REQUIRE(std::isfinite(decoded[i]),
+                 scale_name << "[" << i << "] is the E8M0 NaN code (0xFF); the checkpoint grid is corrupt");
+  }
+  matrix.scale = static_cast<float*>(arena.Stage(decoded.data(), decoded.size() * sizeof(float), scale_name.c_str()));
   return matrix;
 }
 
@@ -1070,6 +1143,11 @@ int main(int argc, char** argv) {
       PipelineStage* o_group[kOGroups] = {};
       PipelineStage* quant_o = nullptr;
       PipelineStage* o_b = nullptr;
+      // One E8M0 -> FP32 cast per activation quantizer; see Fp8Matrix.
+      PipelineStage* cast_h_scale = nullptr;
+      PipelineStage* cast_q_scale = nullptr;
+      PipelineStage* cast_attn_scale = nullptr;
+      PipelineStage* cast_o_scale = nullptr;
       void* kv_cache = nullptr;
       void* kv_normed = nullptr;
       std::size_t kv_row_bytes = 0;
@@ -1090,6 +1168,14 @@ int main(int argc, char** argv) {
     void* a_o_mid = arena.Take(static_cast<std::size_t>(kWoAOutput) * 2, "attn.o_mid");
     void* a_o_fp8 = arena.Take(kWoAOutput, "attn.o_fp8");
     void* a_o_scale = arena.Take(kWoAOutput / kRoutedScaleBlock, "attn.o_scale");
+    // FP32 twins of the activation MX scales. aclnnDynamicMxQuant emits E8M0,
+    // but the ascend950 binary this graph binds to takes `pertoken_scale` in
+    // FP32 (see the Fp8Matrix comment), so each one is cast on device before
+    // it reaches a QuantMatmulV5. One cast per quantizer, planned once.
+    void* a_h_scale_f32 = arena.Take((kHiddenSize / kRoutedScaleBlock) * 4, "attn.h_scale_f32");
+    void* a_q_scale_f32 = arena.Take((kQLoraRank / kRoutedScaleBlock) * 4, "attn.q_scale_f32");
+    void* a_attn_scale_f32 = arena.Take((kAttnQkvWidth / kRoutedScaleBlock) * 4, "attn.out_scale_f32");
+    void* a_o_scale_f32 = arena.Take((kWoAOutput / kRoutedScaleBlock) * 4, "attn.o_scale_f32");
     void* a_rstd = arena.Take(4 * 8, "attn.rstd");
     void* a_rope_cos = arena.Take(static_cast<std::size_t>(kAttnRopeHeadDim) * 2, "attn.rope_cos");
     void* a_rope_sin = arena.Take(static_cast<std::size_t>(kAttnRopeHeadDim) * 2, "attn.rope_sin");
@@ -1099,10 +1185,14 @@ int main(int argc, char** argv) {
     aclTensor* t_h_fp8 = bag.Tensor({1, kHiddenSize}, kAclFloat8E4m3Fn, a_h_fp8, "attn.h_fp8");
     aclTensor* t_h_scale =
         bag.Tensor({1, kHiddenSize / kRoutedScaleBlock}, kAclFloat8E8m0, a_h_scale, "attn.h_scale");
+    aclTensor* t_h_scale_f32 =
+        bag.Tensor({1, kHiddenSize / kRoutedScaleBlock}, kAclFloat32, a_h_scale_f32, "attn.h_scale_f32");
     aclTensor* t_q_a = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_a, "attn.q_a");
     aclTensor* t_q_normed = bag.Tensor({1, kQLoraRank}, kAclBf16, a_q_normed, "attn.q_normed");
     aclTensor* t_q_fp8 = bag.Tensor({1, kQLoraRank}, kAclFloat8E4m3Fn, a_q_fp8, "attn.q_fp8");
     aclTensor* t_q_scale = bag.Tensor({1, kQLoraRank / kRoutedScaleBlock}, kAclFloat8E8m0, a_q_scale, "attn.q_scale");
+    aclTensor* t_q_scale_f32 =
+        bag.Tensor({1, kQLoraRank / kRoutedScaleBlock}, kAclFloat32, a_q_scale_f32, "attn.q_scale_f32");
     aclTensor* t_q_flat = bag.Tensor({1, kAttnQkvWidth}, kAclBf16, a_q_heads, "attn.q_flat");
     aclTensor* t_q_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_q_heads, "attn.q_bsnd");
     aclTensor* t_kv = bag.Tensor({1, kAttnHeadDim}, kAclBf16, a_kv, "attn.kv");
@@ -1111,9 +1201,13 @@ int main(int argc, char** argv) {
     aclTensor* t_attn_fp8 = bag.Tensor({1, kAttnQkvWidth}, kAclFloat8E4m3Fn, a_attn_fp8, "attn.out_fp8");
     aclTensor* t_attn_scale =
         bag.Tensor({1, kAttnQkvWidth / kRoutedScaleBlock}, kAclFloat8E8m0, a_attn_scale, "attn.out_scale");
+    aclTensor* t_attn_scale_f32 = bag.Tensor({1, kAttnQkvWidth / kRoutedScaleBlock}, kAclFloat32, a_attn_scale_f32,
+                                              "attn.out_scale_f32");
     aclTensor* t_o_mid = bag.Tensor({1, kWoAOutput}, kAclBf16, a_o_mid, "attn.o_mid");
     aclTensor* t_o_fp8 = bag.Tensor({1, kWoAOutput}, kAclFloat8E4m3Fn, a_o_fp8, "attn.o_fp8");
     aclTensor* t_o_scale = bag.Tensor({1, kWoAOutput / kRoutedScaleBlock}, kAclFloat8E8m0, a_o_scale, "attn.o_scale");
+    aclTensor* t_o_scale_f32 =
+        bag.Tensor({1, kWoAOutput / kRoutedScaleBlock}, kAclFloat32, a_o_scale_f32, "attn.o_scale_f32");
     aclTensor* t_rstd = bag.Tensor({1, 1}, kAclFloat32, a_rstd, "attn.rstd");
     aclTensor* t_rope_cos = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_cos, "attn.rope_cos");
     aclTensor* t_rope_sin = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_sin, "attn.rope_sin");
@@ -1130,11 +1224,11 @@ int main(int argc, char** argv) {
 
     const auto plan_attention = [&](int layer, AttentionPlan* plan) {
       const std::string prefix = layer_name(layer, "attn");
-      const Fp8Matrix wq_a = StageFp8(checkpoint, prefix + ".wq_a", kQLoraRank, kHiddenSize);
-      const Fp8Matrix wq_b = StageFp8(checkpoint, prefix + ".wq_b", kAttnQkvWidth, kQLoraRank);
-      const Fp8Matrix wkv = StageFp8(checkpoint, prefix + ".wkv", kAttnHeadDim, kHiddenSize);
-      const Fp8Matrix wo_a = StageFp8(checkpoint, prefix + ".wo_a", kWoAOutput, kWoAGroupInput);
-      const Fp8Matrix wo_b = StageFp8(checkpoint, prefix + ".wo_b", kHiddenSize, kWoAOutput);
+      const Fp8Matrix wq_a = StageFp8(checkpoint, arena, prefix + ".wq_a", kQLoraRank, kHiddenSize);
+      const Fp8Matrix wq_b = StageFp8(checkpoint, arena, prefix + ".wq_b", kAttnQkvWidth, kQLoraRank);
+      const Fp8Matrix wkv = StageFp8(checkpoint, arena, prefix + ".wkv", kAttnHeadDim, kHiddenSize);
+      const Fp8Matrix wo_a = StageFp8(checkpoint, arena, prefix + ".wo_a", kWoAOutput, kWoAGroupInput);
+      const Fp8Matrix wo_b = StageFp8(checkpoint, arena, prefix + ".wo_b", kHiddenSize, kWoAOutput);
       void* q_norm_w = checkpoint.Stage(prefix + ".q_norm.weight", "BF16", {kQLoraRank});
       void* kv_norm_w = checkpoint.Stage(prefix + ".kv_norm.weight", "BF16", {kAttnHeadDim});
       void* attn_sink = checkpoint.Stage(prefix + ".attn_sink", "F32", {kAttnHeads});
@@ -1147,15 +1241,15 @@ int main(int argc, char** argv) {
 
       aclTensor* t_wq_a = bag.Tensor({kQLoraRank, kHiddenSize}, kAclFloat8E4m3Fn, wq_a.weight, "wq_a");
       aclTensor* t_wq_a_s =
-          bag.Tensor({wq_a.scale_rows, wq_a.scale_cols}, kAclFloat8E8m0, wq_a.scale, "wq_a.scale");
+          bag.Tensor({wq_a.scale_rows, wq_a.scale_cols}, kAclFloat32, wq_a.scale, "wq_a.scale");
       aclTensor* t_wq_b = bag.Tensor({kAttnQkvWidth, kQLoraRank}, kAclFloat8E4m3Fn, wq_b.weight, "wq_b");
       aclTensor* t_wq_b_s =
-          bag.Tensor({wq_b.scale_rows, wq_b.scale_cols}, kAclFloat8E8m0, wq_b.scale, "wq_b.scale");
+          bag.Tensor({wq_b.scale_rows, wq_b.scale_cols}, kAclFloat32, wq_b.scale, "wq_b.scale");
       aclTensor* t_wkv = bag.Tensor({kAttnHeadDim, kHiddenSize}, kAclFloat8E4m3Fn, wkv.weight, "wkv");
-      aclTensor* t_wkv_s = bag.Tensor({wkv.scale_rows, wkv.scale_cols}, kAclFloat8E8m0, wkv.scale, "wkv.scale");
+      aclTensor* t_wkv_s = bag.Tensor({wkv.scale_rows, wkv.scale_cols}, kAclFloat32, wkv.scale, "wkv.scale");
       aclTensor* t_wo_b = bag.Tensor({kHiddenSize, kWoAOutput}, kAclFloat8E4m3Fn, wo_b.weight, "wo_b");
       aclTensor* t_wo_b_s =
-          bag.Tensor({wo_b.scale_rows, wo_b.scale_cols}, kAclFloat8E8m0, wo_b.scale, "wo_b.scale");
+          bag.Tensor({wo_b.scale_rows, wo_b.scale_cols}, kAclFloat32, wo_b.scale, "wo_b.scale");
       aclTensor* t_q_norm_w = bag.Tensor({kQLoraRank}, kAclBf16, q_norm_w, "q_norm.weight");
       aclTensor* t_kv_norm_w = bag.Tensor({kAttnHeadDim}, kAclBf16, kv_norm_w, "kv_norm.weight");
       aclTensor* t_sink = bag.Tensor({kAttnHeads}, kAclFloat32, attn_sink, "attn_sink");
@@ -1169,19 +1263,23 @@ int main(int argc, char** argv) {
       plan->quant_h = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
           "attn: quantize h_norm", OpId::kDynamicMxQuant, t_h_norm, kSwigluAxisLast, kRoundModeRint,
           static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_h_fp8, t_h_scale);
+      plan->cast_h_scale = &graph.Plan<ascend_moe::CastPlanFn>(
+          "attn: h scale -> f32", OpId::kCast, t_h_scale, static_cast<aclDataType>(kAclFloat32), t_h_scale_f32);
       plan->q_a = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-          "attn: wq_a", OpId::kQuantMatmulV5, t_h_fp8, t_wq_a, t_h_scale, t_wq_a_s, nullptr, nullptr, nullptr,
+          "attn: wq_a", OpId::kQuantMatmulV5, t_h_fp8, t_wq_a, t_h_scale_f32, t_wq_a_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_a);
       plan->q_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: q_norm", OpId::kRmsNorm, t_q_a, t_q_norm_w,
                                                             kRmsEpsilon, t_q_normed, t_rstd);
       plan->quant_q = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
           "attn: quantize q", OpId::kDynamicMxQuant, t_q_normed, kSwigluAxisLast, kRoundModeRint,
           static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_q_fp8, t_q_scale);
+      plan->cast_q_scale = &graph.Plan<ascend_moe::CastPlanFn>(
+          "attn: q scale -> f32", OpId::kCast, t_q_scale, static_cast<aclDataType>(kAclFloat32), t_q_scale_f32);
       plan->q_b = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-          "attn: wq_b", OpId::kQuantMatmulV5, t_q_fp8, t_wq_b, t_q_scale, t_wq_b_s, nullptr, nullptr, nullptr,
+          "attn: wq_b", OpId::kQuantMatmulV5, t_q_fp8, t_wq_b, t_q_scale_f32, t_wq_b_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_flat);
       plan->kv_proj = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-          "attn: wkv", OpId::kQuantMatmulV5, t_h_fp8, t_wkv, t_h_scale, t_wkv_s, nullptr, nullptr, nullptr,
+          "attn: wkv", OpId::kQuantMatmulV5, t_h_fp8, t_wkv, t_h_scale_f32, t_wkv_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_kv);
       plan->kv_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: kv_norm", OpId::kRmsNorm, t_kv, t_kv_norm_w,
                                                              kRmsEpsilon, t_kv, t_rstd);
@@ -1209,6 +1307,8 @@ int main(int argc, char** argv) {
           "attn: quantize output", OpId::kDynamicMxQuant, t_attn_flat, kSwigluAxisLast, kRoundModeRint,
           static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_attn_fp8,
           t_attn_scale);
+      plan->cast_attn_scale = &graph.Plan<ascend_moe::CastPlanFn>(
+          "attn: out scale -> f32", OpId::kCast, t_attn_scale, static_cast<aclDataType>(kAclFloat32), t_attn_scale_f32);
 
       // wo_a is block-diagonal: 8 groups of 4096 attention lanes each produce
       // 1024 of the 8192-wide intermediate. One QuantMatmulV5 per group over
@@ -1222,8 +1322,8 @@ int main(int argc, char** argv) {
                        static_cast<std::uint8_t*>(a_attn_fp8) + static_cast<std::size_t>(g) * kWoAGroupInput,
                        "attn.o_x_group", kAttnQkvWidth);
         aclTensor* x_group_scale = bag.Tensor(
-            {1, kWoAGroupInput / kRoutedScaleBlock}, kAclFloat8E8m0,
-            static_cast<std::uint8_t*>(a_attn_scale) + static_cast<std::size_t>(g) * (kWoAGroupInput / kRoutedScaleBlock),
+            {1, kWoAGroupInput / kRoutedScaleBlock}, kAclFloat32,
+            static_cast<float*>(a_attn_scale_f32) + static_cast<std::size_t>(g) * (kWoAGroupInput / kRoutedScaleBlock),
             "attn.o_x_group_scale", kAttnQkvWidth / kRoutedScaleBlock);
         aclTensor* w_group =
             bag.Tensor({kOLoraRank, kWoAGroupInput}, kAclFloat8E4m3Fn,
@@ -1232,9 +1332,8 @@ int main(int argc, char** argv) {
                        "attn.wo_a_group", wo_a.rows * wo_a.cols);
         const std::int64_t group_scale_rows = kOLoraRank / kFp8BlockSize;
         aclTensor* w_group_scale =
-            bag.Tensor({group_scale_rows, wo_a.scale_cols}, kAclFloat8E8m0,
-                       static_cast<std::uint8_t*>(wo_a.scale) +
-                           static_cast<std::size_t>(g) * group_scale_rows * wo_a.scale_cols,
+            bag.Tensor({group_scale_rows, wo_a.scale_cols}, kAclFloat32,
+                       wo_a.scale + static_cast<std::size_t>(g) * group_scale_rows * wo_a.scale_cols,
                        "attn.wo_a_group_scale", wo_a.scale_rows * wo_a.scale_cols);
         aclTensor* out_group =
             bag.Tensor({1, kOLoraRank}, kAclBf16,
@@ -1248,8 +1347,10 @@ int main(int argc, char** argv) {
       plan->quant_o = &graph.Plan<ascend_moe::DynamicMxQuantPlanFn>(
           "attn: quantize o_mid", OpId::kDynamicMxQuant, t_o_mid, kSwigluAxisLast, kRoundModeRint,
           static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_o_fp8, t_o_scale);
+      plan->cast_o_scale = &graph.Plan<ascend_moe::CastPlanFn>(
+          "attn: o scale -> f32", OpId::kCast, t_o_scale, static_cast<aclDataType>(kAclFloat32), t_o_scale_f32);
       plan->o_b = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-          "attn: wo_b", OpId::kQuantMatmulV5, t_o_fp8, t_wo_b, t_o_scale, t_wo_b_s, nullptr, nullptr, nullptr,
+          "attn: wo_b", OpId::kQuantMatmulV5, t_o_fp8, t_wo_b, t_o_scale_f32, t_wo_b_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_h_out);
     };
 
@@ -1268,12 +1369,14 @@ int main(int argc, char** argv) {
 
       const auto start = Clock::now();
       graph.Launch(*plan.quant_h, stream);
+      graph.Launch(*plan.cast_h_scale, stream);
       graph.Launch(*plan.kv_proj, stream);
       graph.Launch(*plan.kv_norm, stream);
       if (!warm) {
         graph.Launch(*plan.q_a, stream);
         graph.Launch(*plan.q_norm, stream);
         graph.Launch(*plan.quant_q, stream);
+      graph.Launch(*plan.cast_q_scale, stream);
         graph.Launch(*plan.q_b, stream);
       }
       graph.Launch(*plan.rope, stream);
@@ -1290,8 +1393,10 @@ int main(int argc, char** argv) {
       if (!warm) {
         graph.Launch(*plan.attention, stream);
         graph.Launch(*plan.quant_attn, stream);
+      graph.Launch(*plan.cast_attn_scale, stream);
         for (PipelineStage* group : plan.o_group) graph.Launch(*group, stream);
         graph.Launch(*plan.quant_o, stream);
+      graph.Launch(*plan.cast_o_scale, stream);
         graph.Launch(*plan.o_b, stream);
       }
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
@@ -1502,13 +1607,15 @@ int main(int argc, char** argv) {
     }
 
     // The shared expert is FP8, not MXFP4, in this slice.
-    const Fp8Matrix shared_w1 = StageFp8(checkpoint, moe_prefix + ".shared_experts.w1", kMoeIntermediate, kHiddenSize);
-    const Fp8Matrix shared_w3 = StageFp8(checkpoint, moe_prefix + ".shared_experts.w3", kMoeIntermediate, kHiddenSize);
-    const Fp8Matrix shared_w2 = StageFp8(checkpoint, moe_prefix + ".shared_experts.w2", kHiddenSize, kMoeIntermediate);
+    const Fp8Matrix shared_w1 = StageFp8(checkpoint, arena, moe_prefix + ".shared_experts.w1", kMoeIntermediate, kHiddenSize);
+    const Fp8Matrix shared_w3 = StageFp8(checkpoint, arena, moe_prefix + ".shared_experts.w3", kMoeIntermediate, kHiddenSize);
+    const Fp8Matrix shared_w2 = StageFp8(checkpoint, arena, moe_prefix + ".shared_experts.w2", kHiddenSize, kMoeIntermediate);
 
     void* s_gate_up_bf16 = arena.Take(static_cast<std::size_t>(2 * kMoeIntermediate) * 2, "shared.gate_up_bf16");
     void* s_hidden_fp8 = arena.Take(kMoeIntermediate, "shared.hidden_fp8");
     void* s_hidden_scale = arena.Take(kMoeIntermediate / kRoutedScaleBlock, "shared.hidden_scale");
+    void* s_hidden_scale_f32 =
+        arena.Take((kMoeIntermediate / kRoutedScaleBlock) * 4, "shared.hidden_scale_f32");
     void* s_out_bf16 = arena.Take(static_cast<std::size_t>(kHiddenSize) * 2, "shared.out_bf16");
 
     aclTensor* t_s_gate_bf16 = bag.Tensor({1, kMoeIntermediate}, kAclBf16, s_gate_up_bf16, "shared.gate_bf16",
@@ -1521,23 +1628,25 @@ int main(int argc, char** argv) {
     aclTensor* t_s_hidden_fp8 = bag.Tensor({1, kMoeIntermediate}, kAclFloat8E4m3Fn, s_hidden_fp8, "shared.hidden_fp8");
     aclTensor* t_s_hidden_scale = bag.Tensor({1, kMoeIntermediate / kRoutedScaleBlock}, kAclFloat8E8m0,
                                              s_hidden_scale, "shared.hidden_scale");
+    aclTensor* t_s_hidden_scale_f32 = bag.Tensor({1, kMoeIntermediate / kRoutedScaleBlock}, kAclFloat32,
+                                                 s_hidden_scale_f32, "shared.hidden_scale_f32");
     aclTensor* t_s_out_bf16 = bag.Tensor({1, kHiddenSize}, kAclBf16, s_out_bf16, "shared.out_bf16");
 
     aclTensor* t_sw1 = bag.Tensor({kMoeIntermediate, kHiddenSize}, kAclFloat8E4m3Fn, shared_w1.weight, "shared.w1");
     aclTensor* t_sw1_s =
-        bag.Tensor({shared_w1.scale_rows, shared_w1.scale_cols}, kAclFloat8E8m0, shared_w1.scale, "shared.w1.scale");
+        bag.Tensor({shared_w1.scale_rows, shared_w1.scale_cols}, kAclFloat32, shared_w1.scale, "shared.w1.scale");
     aclTensor* t_sw3 = bag.Tensor({kMoeIntermediate, kHiddenSize}, kAclFloat8E4m3Fn, shared_w3.weight, "shared.w3");
     aclTensor* t_sw3_s =
-        bag.Tensor({shared_w3.scale_rows, shared_w3.scale_cols}, kAclFloat8E8m0, shared_w3.scale, "shared.w3.scale");
+        bag.Tensor({shared_w3.scale_rows, shared_w3.scale_cols}, kAclFloat32, shared_w3.scale, "shared.w3.scale");
     aclTensor* t_sw2 = bag.Tensor({kHiddenSize, kMoeIntermediate}, kAclFloat8E4m3Fn, shared_w2.weight, "shared.w2");
     aclTensor* t_sw2_s =
-        bag.Tensor({shared_w2.scale_rows, shared_w2.scale_cols}, kAclFloat8E8m0, shared_w2.scale, "shared.w2.scale");
+        bag.Tensor({shared_w2.scale_rows, shared_w2.scale_cols}, kAclFloat32, shared_w2.scale, "shared.w2.scale");
 
     PipelineStage& shared_gate = graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-        "shared expert: w1", OpId::kQuantMatmulV5, t_h_fp8, t_sw1, t_h_scale, t_sw1_s, nullptr, nullptr, nullptr,
+        "shared expert: w1", OpId::kQuantMatmulV5, t_h_fp8, t_sw1, t_h_scale_f32, t_sw1_s, nullptr, nullptr, nullptr,
         nullptr, nullptr, false, true, options.dense_group_size, t_s_gate_bf16);
     PipelineStage& shared_up = graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-        "shared expert: w3", OpId::kQuantMatmulV5, t_h_fp8, t_sw3, t_h_scale, t_sw3_s, nullptr, nullptr, nullptr,
+        "shared expert: w3", OpId::kQuantMatmulV5, t_h_fp8, t_sw3, t_h_scale_f32, t_sw3_s, nullptr, nullptr, nullptr,
         nullptr, nullptr, false, true, options.dense_group_size, t_s_up_bf16);
     PipelineStage& shared_gate_cast = graph.Plan<ascend_moe::CastPlanFn>(
         "shared expert: gate -> f32", OpId::kCast, t_s_gate_bf16, static_cast<aclDataType>(kAclFloat32),
@@ -1548,8 +1657,11 @@ int main(int argc, char** argv) {
         "shared expert: quantize hidden", OpId::kDynamicMxQuant, t_hidden, kSwigluAxisLast, kRoundModeRint,
         static_cast<std::int64_t>(kAclFloat8E4m3Fn), kRoutedScaleBlock, kSwigluScaleAlgOcp, t_s_hidden_fp8,
         t_s_hidden_scale);
+    PipelineStage& shared_hidden_scale_cast = graph.Plan<ascend_moe::CastPlanFn>(
+        "shared expert: hidden scale -> f32", OpId::kCast, t_s_hidden_scale,
+        static_cast<aclDataType>(kAclFloat32), t_s_hidden_scale_f32);
     PipelineStage& shared_down = graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
-        "shared expert: w2", OpId::kQuantMatmulV5, t_s_hidden_fp8, t_sw2, t_s_hidden_scale, t_sw2_s, nullptr,
+        "shared expert: w2", OpId::kQuantMatmulV5, t_s_hidden_fp8, t_sw2, t_s_hidden_scale_f32, t_sw2_s, nullptr,
         nullptr, nullptr, nullptr, nullptr, false, true, options.dense_group_size, t_s_out_bf16);
 
     // ffn_out = 1.5 * routed_sum + shared, in BF16 for the mHC fold-back. The
@@ -1722,6 +1834,7 @@ int main(int argc, char** argv) {
       const auto moe_start = Clock::now();
       graph.Launch(cast_h_norm, stream);
       graph.Launch(*layer2_attention.quant_h, stream);  // h_norm -> FP8 for the shared expert
+      graph.Launch(*layer2_attention.cast_h_scale, stream);
       graph.Launch(router_matmul, stream);
       graph.Launch(router_cast, stream);
       graph.Launch(router_softplus, stream);
@@ -1813,11 +1926,12 @@ int main(int argc, char** argv) {
       graph.Launch(clamp_up, stream);
       graph.Launch(expert_swiglu, stream);
       graph.Launch(shared_quant, stream);
+      graph.Launch(shared_hidden_scale_cast, stream);
       graph.Launch(shared_down, stream);
       graph.Launch(routed_to_bf16, stream);
       graph.Launch(add_shared, stream);
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
-      timeline.Add("shared expert + combine (aclnn)", MicrosecondsSince(shared_start), 11, false);
+      timeline.Add("shared expert + combine (aclnn)", MicrosecondsSince(shared_start), 12, false);
 
       mhc_epilogue(x_ping, x_pong);
     }
