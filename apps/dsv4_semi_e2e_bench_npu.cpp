@@ -200,7 +200,7 @@ using ascend_moe::kFiaNextTokensCausal;
 using ascend_moe::kFiaPreTokensAll;
 using ascend_moe::kFiaPseTypeNone;
 using ascend_moe::kFiaQueryQuantModeNone;
-using ascend_moe::kFiaSparseModeBand;
+using ascend_moe::kFiaSparseModeDefault;
 using ascend_moe::kGatingEps;
 using ascend_moe::kGatingGroupCount;
 using ascend_moe::kGatingGroupSelectMode;
@@ -222,7 +222,22 @@ double MicrosecondsSince(Clock::time_point start) {
 
 // aclnn takes these as `char*`, so they cannot be string literals.
 char kRotaryModeHalf[] = "half";
-char kFiaLayout[] = "TND";
+// BNSD, not TND. This was "TND" while every descriptor below was built 4-D and
+// named _bsnd, which is what made the device reject the call with
+// "[GetQkHeadDim] The shape dim of query must be equal to the axes size of
+// layout(TND): 3" (561002). TND is not reachable by squeezing the query to 3-D
+// either: it caps the head dimension at 256 ("When input layout is TND, headDim
+// shall not exceed 256", and separately "when input_layout is TND, only
+// query|key|value headDim = 64/128/192 are supported"), while kAttnHeadDim is
+// 512. BSND is excluded because this call passes a blockTable over a 4-D KV
+// cache, i.e. Page Attention, and "When Page Attention is enabled, and KV cache
+// dimensions are 4-dimensional, inputLayout must be BNSD or TND". BNSD is what
+// is left, and it carries no head-dimension ceiling.
+//
+// All quotations are from
+// opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/x86_64/libophost_transformer.so
+// in CANN 9.2.0-beta.2, read on 2026-10-14. UNVERIFIED on hardware.
+char kFiaLayout[] = "BNSD";
 
 // ---------------------------------------------------------------------------
 // Geometry. Mirrors include/moe/emu/dsv4_layers.h, restated because that
@@ -513,6 +528,26 @@ class DescriptorBag {
     return tensor;
   }
 
+  // A view with CALLER-SUPPLIED strides.
+  //
+  // Tensor() above derives contiguous strides from the dims it is handed, which
+  // is correct only when the window itself is contiguous -- true for the
+  // o-projection groups and the SwiGLU halves. A window that SKIPS, such as
+  // every head's trailing 64 rotary lanes inside a 512-wide row, has to state
+  // its real strides or it silently addresses a packed block instead.
+  aclTensor* StridedTensor(const std::vector<std::int64_t>& dims, const std::vector<std::int64_t>& strides,
+                           int32_t dtype, void* address, const char* label, std::int64_t storage_elements) {
+    DSV4_REQUIRE(dims.size() == strides.size(),
+                 label << ": " << dims.size() << " dims but " << strides.size() << " strides");
+    std::int64_t storage = storage_elements;
+    aclTensor* tensor =
+        aclCreateTensor(dims.data(), static_cast<std::uint64_t>(dims.size()), static_cast<aclDataType>(dtype),
+                        strides.data(), 0, static_cast<aclFormat>(ascend_moe::kAclFormatNd), &storage, 1, address);
+    DSV4_REQUIRE(tensor != nullptr, label << ": aclCreateTensor (strided) returned null");
+    tensors_.push_back(tensor);
+    return tensor;
+  }
+
   // A transposed 2-D view: same bytes, swapped extents and strides. The router
   // GEMM needs gate.weight as [K, N] while the checkpoint stores [N, K].
   aclTensor* Transposed2d(std::int64_t rows, std::int64_t cols, int32_t dtype, void* address, const char* label) {
@@ -613,6 +648,41 @@ class Checkpoint {
     return device;
   }
 
+  // Restage an F32 checkpoint tensor as BF16.
+  //
+  // aclnnFusedInferAttentionScoreV5 requires learnable_sink to carry the
+  // query's dtype: "The dtype of learnable_sink must be the same as the dtype
+  // of query", and, unconditionally, "When learnable_sink enable, sink dtype
+  // must be BFLOAT16!" (libophost_transformer.so, CANN 9.2.0-beta.2). The
+  // checkpoint stores attn_sink as F32, so it cannot be handed over as-is.
+  //
+  // The conversion loses mantissa: a sink logit keeps 8 bits here against 24 in
+  // the checkpoint, which perturbs the softmax denominator only -- the sink has
+  // no value vector -- and is the dtype the operator demands, not a choice.
+  std::uint16_t* StageAsBf16(const std::string& name, const std::vector<std::int64_t>& shape) {
+    const auto cached = staged_bf16_.find(name);
+    if (cached != staged_bf16_.end()) return cached->second;
+    RequireDtype(name, "F32");
+    RequireShape(name, shape);
+    std::size_t elements = 1;
+    for (std::int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
+    const std::size_t bytes = source_.NamedByteSize(name);
+    DSV4_REQUIRE(bytes == elements * 4, name << ": F32 payload is " << bytes << " B, expected " << elements * 4);
+    std::vector<std::uint8_t> host(bytes);
+    source_.ReadNamed(name, host.data(), host.size(), 0, bytes);
+    std::vector<std::uint16_t> narrowed(elements);
+    for (std::size_t i = 0; i < elements; ++i) {
+      float value = 0.0F;
+      std::memcpy(&value, host.data() + i * 4, 4);
+      narrowed[i] = FloatToBf16(value);
+    }
+    auto* device =
+        static_cast<std::uint16_t*>(arena_.Stage(narrowed.data(), narrowed.size() * sizeof(std::uint16_t), name.c_str()));
+    staged_bf16_.emplace(name, device);
+    bytes_ += bytes;
+    return device;
+  }
+
   // Read a tensor to the host without staging it. Used for tid2eid, whose
   // route row the host must know to decide which expert weights to stage.
   std::vector<std::uint8_t> ReadHost(const std::string& name) {
@@ -634,7 +704,7 @@ class Checkpoint {
   std::string Dtype(const std::string& name) const { return source_.NamedDtype(name); }
   std::vector<std::int64_t> Shape(const std::string& name) const { return source_.NamedShape(name); }
   std::size_t bytes() const { return bytes_; }
-  std::size_t count() const { return staged_.size() + staged_float_.size(); }
+  std::size_t count() const { return staged_.size() + staged_float_.size() + staged_bf16_.size(); }
 
  private:
   void RequireDtype(const std::string& name, const char* expect) {
@@ -660,6 +730,7 @@ class Checkpoint {
   DeviceArena& arena_;
   std::map<std::string, void*> staged_;
   std::map<std::string, float*> staged_float_;
+  std::map<std::string, std::uint16_t*> staged_bf16_;
   std::size_t bytes_ = 0;
 };
 
@@ -1230,8 +1301,16 @@ int main(int argc, char** argv) {
     // which QuantMatmulV5 is told about through `groupSize` (see the file
     // header). `transposeX2` is true because the checkpoint stores [N, K].
     // FIA V5 runs over one shared KV head with the per-head attn_sink as
-    // `learnableSink`. Each of these is the documented contract; none has
-    // been executed.
+    // `learnableSink`, in BNSD over a paged 4-D cache. Each of these is the
+    // documented contract; none has been executed.
+    //
+    // The FIA descriptors were reworked on 2026-10-14 after the device
+    // rejected the call with 561002. The layout attr said TND while the
+    // tensors were 4-D, and three further attributes/dtypes were illegal for
+    // this geometry on the same call: see the kFiaLayout comment at the top of
+    // this file for the layout, the sparseMode note at the call site, and
+    // Checkpoint::StageAsBf16 for learnable_sink. Each change is pinned to a
+    // constraint string in libophost_transformer.so, none to a device run.
     // =======================================================================
     struct AttentionPlan {
       PipelineStage* q_a = nullptr;
@@ -1287,9 +1366,15 @@ int main(int argc, char** argv) {
     aclTensor* t_q_scale_f32 =
         bag.Tensor({1, kQLoraRank / kFp8BlockSize}, kAclFloat32, a_q_scale_f32, "attn.q_scale_f32");
     aclTensor* t_q_flat = bag.Tensor({1, kAttnQkvWidth}, kAclBf16, a_q_heads, "attn.q_flat");
-    aclTensor* t_q_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_q_heads, "attn.q_bsnd");
+    // BNSD: [B = 1, N = 64 query heads, S = 1 decode token, D = 512]. a_q_heads
+    // holds the wq_b output as 64 contiguous 512-wide rows, so the contiguous
+    // strides Tensor() derives -- [32768, 512, 512, 1] -- are the real ones.
+    aclTensor* t_q_bnsd = bag.Tensor({1, kAttnHeads, 1, kAttnHeadDim}, kAclBf16, a_q_heads, "attn.q_bnsd");
     aclTensor* t_kv = bag.Tensor({1, kAttnHeadDim}, kAclBf16, a_kv, "attn.kv");
-    aclTensor* t_attn_bsnd = bag.Tensor({1, 1, kAttnHeads, kAttnHeadDim}, kAclBf16, a_attn_out, "attn.out_bsnd");
+    // attention_out shares the query's layout, and its rank is additionally
+    // pinned to the KV cache's: "The shape dim of value must be equal to that
+    // of attention_out".
+    aclTensor* t_attn_bnsd = bag.Tensor({1, kAttnHeads, 1, kAttnHeadDim}, kAclBf16, a_attn_out, "attn.out_bnsd");
     // No whole-tensor views of attn_fp8 / attn_scale_f32: the eight wo_a
     // groups build their own offset sub-views from the arena pointers, and
     // the block quantizer takes raw pointers rather than aclTensors, so a
@@ -1304,9 +1389,19 @@ int main(int argc, char** argv) {
     aclTensor* t_softmax_lse = bag.Tensor({1, kAttnHeads, 1}, kAclFloat32, a_softmax_lse, "attn.softmax_lse");
 
     // RoPE rides the final 64 lanes of each 512-wide row, in place.
-    aclTensor* t_q_rope = bag.Tensor({1, 1, kAttnHeads, kAttnRopeHeadDim}, kAclBf16,
-                                     static_cast<std::uint16_t*>(a_q_heads) + (kAttnHeadDim - kAttnRopeHeadDim),
-                                     "attn.q_rope", kAttnQkvWidth);
+    //
+    // This view SKIPS: head h's rotary slice starts at h * 512 + 448, not at
+    // h * 64. Tensor() would derive [4096, 4096, 64, 1] from these dims and
+    // address a packed [64, 64] block, so only head 0 would land on its own
+    // lanes and heads 1..63 would rotate the wrong memory. The head stride is
+    // kAttnQkvWidth / kAttnHeads == kAttnHeadDim, stated explicitly.
+    //
+    // (ApplyRotaryPosEmbV2 keeps its own BSND layout here -- kRotaryLayoutBsnd
+    // -- independently of the BNSD the attention core now uses.)
+    aclTensor* t_q_rope = bag.StridedTensor({1, 1, kAttnHeads, kAttnRopeHeadDim},
+                                            {kAttnQkvWidth, kAttnQkvWidth, kAttnHeadDim, 1}, kAclBf16,
+                                            static_cast<std::uint16_t*>(a_q_heads) + (kAttnHeadDim - kAttnRopeHeadDim),
+                                            "attn.q_rope", kAttnQkvWidth);
     aclTensor* t_k_rope = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16,
                                      static_cast<std::uint16_t*>(a_kv) + (kAttnHeadDim - kAttnRopeHeadDim),
                                      "attn.k_rope", kAttnHeadDim);
@@ -1320,7 +1415,9 @@ int main(int argc, char** argv) {
       const Fp8Matrix wo_b = StageFp8(checkpoint, arena, prefix + ".wo_b", kHiddenSize, kWoAOutput);
       void* q_norm_w = checkpoint.Stage(prefix + ".q_norm.weight", "BF16", {kQLoraRank});
       void* kv_norm_w = checkpoint.Stage(prefix + ".kv_norm.weight", "BF16", {kAttnHeadDim});
-      void* attn_sink = checkpoint.Stage(prefix + ".attn_sink", "F32", {kAttnHeads});
+      // F32 in the checkpoint, BF16 on device: see Checkpoint::StageAsBf16 for
+      // the operator constraint that forces the narrowing.
+      std::uint16_t* attn_sink = checkpoint.StageAsBf16(prefix + ".attn_sink", {kAttnHeads});
 
       // The 128-row shared-KV ring, one per layer: layer 0's window must not
       // be clobbered by layer 2's.
@@ -1341,9 +1438,14 @@ int main(int argc, char** argv) {
           bag.Tensor({wo_b.scale_rows, wo_b.scale_cols}, kAclFloat32, wo_b.scale, "wo_b.scale");
       aclTensor* t_q_norm_w = bag.Tensor({kQLoraRank}, kAclBf16, q_norm_w, "q_norm.weight");
       aclTensor* t_kv_norm_w = bag.Tensor({kAttnHeadDim}, kAclBf16, kv_norm_w, "kv_norm.weight");
-      aclTensor* t_sink = bag.Tensor({kAttnHeads}, kAclFloat32, attn_sink, "attn_sink");
+      aclTensor* t_sink = bag.Tensor({kAttnHeads}, kAclBf16, attn_sink, "attn_sink");
+      // Paged KV under BNSD: [blockNum = 1, N = 1 shared KV head,
+      // blockSize = 128, D = 512]. The bytes are unchanged -- with N = 1 this
+      // is the same 128 rows of 512 the previous [1, 128, 1, 512] described --
+      // only the axis order is now the one the layout attr claims, so the ring
+      // append below still writes row (position % 128) at the same offset.
       aclTensor* t_kv_cache =
-          bag.Tensor({1, kSlidingWindow, 1, kAttnHeadDim}, kAclBf16, plan->kv_cache, "attn.kv_cache");
+          bag.Tensor({1, 1, kSlidingWindow, kAttnHeadDim}, kAclBf16, plan->kv_cache, "attn.kv_cache");
       // Shared KV: all 64 query heads score the same 512-wide row, so key and
       // value are the same cache. num_key_value_heads = 1 is what makes that
       // legal rather than an aliasing bug.
@@ -1378,15 +1480,24 @@ int main(int argc, char** argv) {
       // the same term as an extra sinkless column.
       const double scale = 1.0 / std::sqrt(static_cast<double>(kAttnHeadDim));
       plan->attention = &graph.Plan<ascend_moe::FusedInferAttentionScoreV5PlanFn>(
-          "attn: FusedInferAttentionScoreV5", OpId::kFusedInferAttentionScoreV5, t_q_bsnd, kv_list, kv_list,
+          "attn: FusedInferAttentionScoreV5", OpId::kFusedInferAttentionScoreV5, t_q_bnsd, kv_list, kv_list,
           nullptr, nullptr, bag.IntArray({1}, "actual_seq_q"), bag.IntArray({kSlidingWindow}, "actual_seq_kv"),
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, t_block_table, nullptr, nullptr, nullptr,
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, t_sink,
           nullptr, nullptr, static_cast<std::int64_t>(kAttnHeads), scale, kFiaPreTokensAll, kFiaNextTokensCausal,
-          kFiaLayout, /*num_key_value_heads=*/1, kFiaSparseModeBand, kFiaInnerPreciseHighPrecision,
+          kFiaLayout, /*num_key_value_heads=*/1, kFiaSparseModeDefault, kFiaInnerPreciseHighPrecision,
           static_cast<std::int64_t>(kSlidingWindow), kFiaAntiquantModeNone, /*softmax_lse_flag=*/false,
-          kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone, kFiaPseTypeNone, t_attn_bsnd,
+          kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone, kFiaPseTypeNone, t_attn_bnsd,
           t_softmax_lse);
+      // sparseMode was 3 (BAND), which this call cannot legally pass: it hands
+      // attenMask as null and the query's S is 1, and each of those alone pins
+      // the attribute -- "When attnMask is not provided, sparseMode must be 0"
+      // and "When S of query equal to 1, sparseMode only supports
+      // 0(defaultMask)". Nothing is lost: the band was describing a window the
+      // geometry already enforces, since the cache holds exactly
+      // kSlidingWindow rows and actual_seq_kv bounds the scan to them. The
+      // preTokens/nextTokens pair is inert under sparseMode 0 with no mask and
+      // is left at its documented default rather than removed.
 
       // wo_a is block-diagonal: 8 groups of 4096 attention lanes each produce
       // 1024 of the 8192-wide intermediate. One QuantMatmulV5 per group over

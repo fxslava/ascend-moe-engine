@@ -367,7 +367,18 @@ inline constexpr double kSwigluMaxDtypeValue = 448.0;  // FP8 E4M3FN maximum
 
 // aclnnFusedInferAttentionScoreV5
 inline constexpr const char* kFiaLayoutTnd = "TND";
+// Page Attention with a 4-D KV cache accepts only BNSD or TND
+// ("When Page Attention is enabled, and KV cache dimensions are 4-dimensional,
+// inputLayout must be BNSD or TND", libophost_transformer.so, CANN
+// 9.2.0-beta.2), and TND additionally caps the head dimension at 256. A
+// 512-wide head on a paged cache therefore has to use BNSD.
+inline constexpr const char* kFiaLayoutBnsd = "BNSD";
 inline constexpr int64_t kFiaSparseModeBand = 3;
+// sparseMode 0 (defaultMask) is not a preference but the only legal value for
+// a maskless one-token decode: "When attnMask is not provided, sparseMode must
+// be 0" and "When S of query equal to 1, sparseMode only supports
+// 0(defaultMask)" (same source).
+inline constexpr int64_t kFiaSparseModeDefault = 0;
 inline constexpr int64_t kFiaInnerPreciseHighPrecision = 0;
 inline constexpr int64_t kFiaAntiquantModeNone = 0;
 inline constexpr int64_t kFiaQueryQuantModeNone = 0;
