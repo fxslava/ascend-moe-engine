@@ -190,13 +190,29 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   if(DSV4_WERROR)
     target_compile_options(test_dsv4_moe_block_sim PRIVATE -Werror)
   endif()
-  # TIMEOUT is 3600, not the 1800 the single-expert suite uses: these kernels
-  # are monolithic, so one core runs a whole expert and the total simulated
-  # work is top_k (or token count) times a full expert.
+  # TIMEOUT is 6 hours, and the reason is structural rather than a guess.
+  #
+  # CAModel cost tracks PER-CORE instruction count, not total work. The
+  # retired two-phase kernel spread one expert over 32 cores, so a 512x512
+  # case was ~24.6 K MACs per core and finished in ~260 s. These kernels are
+  # monolithic by design: one core runs a whole expert, which at the SMALLEST
+  # admissible width is 3 * 512 * 512 = 786 K MACs on a single core -- ~32x
+  # the per-core work for ~32x the simulator time, per launch, and this suite
+  # issues two launches.
+  #
+  # It cannot be tuned down. Shrinking top_k or the token count only idles
+  # cores; per-core work is one whole expert either way. And the width cannot
+  # go below 512, the reduction quantum (kMoeBlockReductionQuantum), because
+  # below it a row's group count no longer divides across the 16 lanes.
+  #
+  # So this is a SOAK gate, not something to run in a tight loop. The fast
+  # gates for these kernels are tests/emu (host, seconds) and the BiSheng
+  # compile gate; this one answers "does it execute and compute the right
+  # answer", which nothing else on a workstation without an NPU can.
   add_test(NAME Dsv4MoeBlockSim COMMAND test_dsv4_moe_block_sim)
   set_tests_properties(Dsv4MoeBlockSim PROPERTIES
-    LABELS "sim;arch35;camodel;functional"
-    TIMEOUT 3600
+    LABELS "sim;arch35;camodel;functional;soak"
+    TIMEOUT 21600
     ENVIRONMENT
       "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
   )

@@ -1320,6 +1320,302 @@ void DeviceDsv4MoeExpert(Report& rep, aclrtStream stream) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// dsv4_moe_decode_topk + dsv4_moe_prefill_batched -- the whole MoE block
+// ---------------------------------------------------------------------------
+// These are the entry points that supersede dsv4_moe_expert above: each core
+// runs ONE expert for ONE token end to end, so `activated` stays in UB and
+// never reaches GM. Decode parallelises over the top_k routed experts (one
+// AIV per slot, block_dim == top_k); prefill over the token batch.
+//
+// NOTHING HERE HAS EVER RUN ON HARDWARE. This case exists so it can
+// (CLAUDE.md §5.7). Past the suite's entry guard there IS a device, so every
+// ACL error and every non-success Status is a hard FAIL carrying its code,
+// LastLaunchFailure() and aclGetRecentErrMsg() (§4.4) -- never a skip.
+//
+// WHAT THIS CASE ADDS over DeviceDsv4MoeExpert, which already covers the
+// expert body (the lane map, the uint4 group load, the butterfly, the
+// asymmetric clamp):
+//
+//   1. EXPERT-STRIDE ADDRESSING. All experts live in one buffer per role,
+//      expert e at e * <role>_expert_stride. A wrong stride reads a
+//      DIFFERENT expert and produces finite, plausible numbers with no shape
+//      to catch it. The fixture makes experts distinguishable on purpose (the
+//      expert id participates in the scale band) and the golden is built
+//      through the same stride arithmetic.
+//   2. THE ATOMIC COMBINE. Decode accumulates top_k slots into y with an
+//      atomic-add store, so y is ZEROED HERE before the launch -- the
+//      wrapper does not touch operand data (§3.4). If the zeroing or the
+//      atomic mode were wrong, y would carry allocator garbage or only the
+//      last slot.
+//   3. THE ROUTER WEIGHTING, folded into the down store.
+//   4. PER-TOKEN EXPERT SELECTION on the prefill path.
+//
+// GEOMETRY is the production 4096/2048, which is what the unoverridden host
+// gate admits -- unlike the CAModel suite, hardware has no reason to run a
+// scaled-down width.
+//
+// TOLERANCE, same reasoning as the single-expert case above: both sides
+// decode the same MXFP4 lattice and an E2M1 nibble times a power-of-two E8M0
+// scale is exact in FP32, so there is no quantization term and the only
+// difference is reduction ORDER. FP32 carries a 24-bit mantissa, so a
+// 4096-term reorder is bounded in the random-walk model by
+// ~sqrt(4096) * 2^-24 ~= 4e-6 relative, and the down GEMV's 2048 terms add
+// the same order again.
+//
+// Decode carries ONE MORE reordering term than the single-expert case: the
+// top_k slots are summed by atomic adds in whatever order the cores retire,
+// so the slot order is not reproducible run to run. That is top_k = 6 terms
+// of comparable magnitude, ~sqrt(6) * 2^-24 ~= 1.5e-7 relative -- negligible
+// against the per-row reorder, so the same 1e-4 relative-L2 ceiling holds.
+// Cosine stays tight: reordering moves magnitude, a wrong expert or a
+// dropped router weight moves direction.
+void DeviceDsv4MoeBlock(Report& rep, aclrtStream stream) {
+  constexpr std::uint32_t kHidden = 4096;
+  constexpr std::uint32_t kInter = 2048;
+  constexpr std::uint32_t kGroup = 32;
+  constexpr std::uint32_t kExperts = 6;  // a decode step's routed set
+  constexpr std::uint32_t kTopK = 6;
+  constexpr std::uint32_t kTokens = 4;
+  constexpr float kLimit = moe::emu::kSwigluLimit;
+
+  if (kLimit != 10.0F) {
+    rep.fail("device dsv4_moe_block",
+             "moe::emu::kSwigluLimit is not the model's 10.0, so the fixture's "
+             "scale band is no longer calibrated to the clamp");
+    return;
+  }
+
+  // Per-expert strides, exactly as MakeDsv4Moe*Tiling computes them.
+  const std::size_t w13_packed_stride =
+      static_cast<std::size_t>(kInter) * (kHidden / 2);
+  const std::size_t w13_scale_stride =
+      static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  const std::size_t w2_packed_stride =
+      static_cast<std::size_t>(kHidden) * (kInter / 2);
+  const std::size_t w2_scale_stride =
+      static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  Rng rng(0xD5B10C4ULL);
+  // ONE contiguous buffer per role, all experts -- the device layout.
+  const std::vector<std::uint8_t> w1p = rng.bytes(w13_packed_stride * kExperts);
+  const std::vector<std::uint8_t> w3p = rng.bytes(w13_packed_stride * kExperts);
+  const std::vector<std::uint8_t> w2p = rng.bytes(w2_packed_stride * kExperts);
+  // The scale band is the same one the single-expert case calibrated against
+  // the clamp at hidden=4096. Per-expert offsetting would move the band and
+  // decalibrate it, so experts are made distinguishable by their PACKED bytes
+  // (independently drawn above) rather than by shifting the exponent.
+  const std::vector<std::uint8_t> w1s =
+      rng.bytes(w13_scale_stride * kExperts, 121, 123);
+  const std::vector<std::uint8_t> w3s =
+      rng.bytes(w13_scale_stride * kExperts, 121, 123);
+  const std::vector<std::uint8_t> w2s =
+      rng.bytes(w2_scale_stride * kExperts, 121, 123);
+
+  // Views built through the SAME stride arithmetic the kernel performs.
+  std::vector<moe::emu::Mxfp4Matrix> v1(kExperts);
+  std::vector<moe::emu::Mxfp4Matrix> v3(kExperts);
+  std::vector<moe::emu::Mxfp4Matrix> v2(kExperts);
+  for (std::uint32_t e = 0; e < kExperts; ++e) {
+    v1[e] = {w1p.data() + static_cast<std::size_t>(e) * w13_packed_stride,
+             w1s.data() + static_cast<std::size_t>(e) * w13_scale_stride,
+             static_cast<int>(kInter), static_cast<int>(kHidden)};
+    v3[e] = {w3p.data() + static_cast<std::size_t>(e) * w13_packed_stride,
+             w3s.data() + static_cast<std::size_t>(e) * w13_scale_stride,
+             static_cast<int>(kInter), static_cast<int>(kHidden)};
+    v2[e] = {w2p.data() + static_cast<std::size_t>(e) * w2_packed_stride,
+             w2s.data() + static_cast<std::size_t>(e) * w2_scale_stride,
+             static_cast<int>(kHidden), static_cast<int>(kInter)};
+  }
+
+  // Routed slots: neither sorted nor the identity, so a kernel that used the
+  // SLOT index instead of topk_expert_ids[slot] fails. Weights are distinct
+  // and non-unit so a dropped weighting is visible.
+  const std::vector<std::int32_t> topk_ids = {4, 0, 5, 2, 1, 3};
+  const std::vector<float> routing_weights = {0.30F, 0.25F, 0.18F,
+                                              0.12F, 0.09F, 0.06F};
+  const std::vector<float> x = rng.normal(kHidden);
+
+  // Tokens routed to different experts, including a repeat, so a kernel that
+  // applied one expert to the whole batch fails.
+  const std::vector<std::int32_t> token_to_expert = {1, 1, 4, 0};
+  const std::vector<float> x_tokens =
+      rng.normal(static_cast<std::size_t>(kTokens) * kHidden);
+
+  // --- goldens, in memory, this run (§4.5) -------------------------------
+  std::vector<float> scratch;
+  std::vector<float> want_decode(kHidden, 0.0F);
+  moe::emu::moe_decode_topk_mxfp4_cpu(
+      v1.data(), v3.data(), v2.data(), x.data(), topk_ids.data(),
+      routing_weights.data(), static_cast<int>(kTopK),
+      static_cast<int>(kExperts), want_decode.data(), kLimit, &scratch);
+
+  std::vector<float> want_prefill(static_cast<std::size_t>(kTokens) * kHidden,
+                                  0.0F);
+  moe::emu::moe_prefill_batched_mxfp4_cpu(
+      v1.data(), v3.data(), v2.data(), x_tokens.data(), token_to_expert.data(),
+      static_cast<int>(kTokens), static_cast<int>(kExperts),
+      want_prefill.data(), kLimit, &scratch);
+
+  // --- device ------------------------------------------------------------
+  DeviceBuffer d_w1p, d_w1s, d_w3p, d_w3s, d_w2p, d_w2s;
+  DeviceBuffer d_x, d_ids, d_rw, d_y, d_xt, d_t2e, d_yt;
+  aclError rc = d_w1p.Alloc(w1p.size());
+  if (rc == ACL_SUCCESS) rc = d_w1s.Alloc(w1s.size());
+  if (rc == ACL_SUCCESS) rc = d_w3p.Alloc(w3p.size());
+  if (rc == ACL_SUCCESS) rc = d_w3s.Alloc(w3s.size());
+  if (rc == ACL_SUCCESS) rc = d_w2p.Alloc(w2p.size());
+  if (rc == ACL_SUCCESS) rc = d_w2s.Alloc(w2s.size());
+  if (rc == ACL_SUCCESS) rc = d_x.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_ids.Alloc(topk_ids.size() * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS) rc = d_rw.Alloc(routing_weights.size() * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_xt.Alloc(x_tokens.size() * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_t2e.Alloc(token_to_expert.size() * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS) rc = d_yt.Alloc(want_prefill.size() * sizeof(float));
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_block", AclFail("aclrtMalloc", rc));
+    return;
+  }
+
+  rc = d_w1p.Upload(w1p.data(), w1p.size());
+  if (rc == ACL_SUCCESS) rc = d_w1s.Upload(w1s.data(), w1s.size());
+  if (rc == ACL_SUCCESS) rc = d_w3p.Upload(w3p.data(), w3p.size());
+  if (rc == ACL_SUCCESS) rc = d_w3s.Upload(w3s.data(), w3s.size());
+  if (rc == ACL_SUCCESS) rc = d_w2p.Upload(w2p.data(), w2p.size());
+  if (rc == ACL_SUCCESS) rc = d_w2s.Upload(w2s.data(), w2s.size());
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_ids.Upload(topk_ids.data(), topk_ids.size() * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS)
+    rc = d_rw.Upload(routing_weights.data(),
+                     routing_weights.size() * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_xt.Upload(x_tokens.data(), x_tokens.size() * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_t2e.Upload(token_to_expert.data(),
+                      token_to_expert.size() * sizeof(std::int32_t));
+  // DECODE ACCUMULATES INTO y, so the caller zeroes it (§3.4). This is not
+  // defensive tidying: without it y carries allocator garbage and the atomic
+  // adds land on top of it.
+  if (rc == ACL_SUCCESS) rc = d_y.Zero();
+  // Prefill OVERWRITES, so zeroing y_tokens is not required -- it is zeroed
+  // anyway so that a token the kernel never writes reads as 0 rather than as
+  // whatever the allocator returned.
+  if (rc == ACL_SUCCESS) rc = d_yt.Zero();
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_block", AclFail("aclrtMemcpy(H2D)", rc));
+    return;
+  }
+
+  const Status decode_st = LaunchDsv4MoeDecodeTopk(
+      d_x.as<float>(), d_w1p.as<Mxfp4Pair>(), d_w1s.as<E8M0>(),
+      d_w3p.as<Mxfp4Pair>(), d_w3s.as<E8M0>(), d_w2p.as<Mxfp4Pair>(),
+      d_w2s.as<E8M0>(), d_ids.as<std::int32_t>(), d_rw.as<float>(), kHidden,
+      kInter, kExperts, kTopK, d_y.as<float>(), stream);
+  if (decode_st != Status::success) {
+    rep.fail("device dsv4_moe_decode_topk",
+             LaunchFail("LaunchDsv4MoeDecodeTopk", decode_st));
+    return;
+  }
+
+  const Status prefill_st = LaunchDsv4MoePrefillBatched(
+      d_xt.as<float>(), d_w1p.as<Mxfp4Pair>(), d_w1s.as<E8M0>(),
+      d_w3p.as<Mxfp4Pair>(), d_w3s.as<E8M0>(), d_w2p.as<Mxfp4Pair>(),
+      d_w2s.as<E8M0>(), d_t2e.as<std::int32_t>(), kHidden, kInter, kExperts,
+      kTokens, d_yt.as<float>(), stream);
+  if (prefill_st != Status::success) {
+    rep.fail("device dsv4_moe_prefill_batched",
+             LaunchFail("LaunchDsv4MoePrefillBatched", prefill_st));
+    return;
+  }
+
+  // Both wrappers synchronize the stream before returning (§3.7).
+  std::vector<float> got_decode(kHidden, 0.0F);
+  std::vector<float> got_prefill(want_prefill.size(), 0.0F);
+  rc = d_y.Download(got_decode.data(), kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_yt.Download(got_prefill.data(), got_prefill.size() * sizeof(float));
+  if (rc != ACL_SUCCESS) {
+    rep.fail("device dsv4_moe_block", AclFail("aclrtMemcpy(D2H)", rc));
+    return;
+  }
+
+  // --- stage 1: decode, the router-weighted sum over top_k slots ---------
+  {
+    const double cos = CosineSimilarity(got_decode.data(), want_decode.data(),
+                                        kHidden);
+    const double l2 = RelativeL2(got_decode.data(), want_decode.data(), kHidden);
+    const Spread ref = MeasureSpread(want_decode.data(), kHidden);
+    const bool finite = AllFinite(got_decode.data(), kHidden);
+    char detail[480];
+    std::snprintf(detail, sizeof(detail),
+                  "y[%u] = sum over %u slots of w*Expert(id): cos %.9f (floor "
+                  "0.9999), relL2 %.3e (ceil 1e-4), finite=%d, golden rms "
+                  "%.3e stddev %.3e range [%.3f, %.3f] non-degenerate=%d, "
+                  "slots={4,0,5,2,1,3}, seed 0x%llx",
+                  kHidden, kTopK, cos, l2, static_cast<int>(finite), ref.rms,
+                  ref.stddev, ref.min, ref.max,
+                  static_cast<int>(ref.NonDegenerate()),
+                  static_cast<unsigned long long>(rng.seed()));
+    rep.check(finite && ref.NonDegenerate() && cos >= 0.9999 && l2 <= 1e-4,
+              "device dsv4_moe_decode_topk matches moe_decode_topk_mxfp4_cpu",
+              detail);
+  }
+
+  // --- stage 2: prefill, one expert per token ---------------------------
+  {
+    const std::size_t n = got_prefill.size();
+    const double cos =
+        CosineSimilarity(got_prefill.data(), want_prefill.data(), n);
+    const double l2 = RelativeL2(got_prefill.data(), want_prefill.data(), n);
+    const Spread ref = MeasureSpread(want_prefill.data(), n);
+    const bool finite = AllFinite(got_prefill.data(), n);
+    char detail[480];
+    std::snprintf(detail, sizeof(detail),
+                  "y[%u tokens x %u]: cos %.9f (floor 0.9999), relL2 %.3e "
+                  "(ceil 1e-4), finite=%d, golden rms %.3e stddev %.3e range "
+                  "[%.3f, %.3f] non-degenerate=%d, routing={1,1,4,0}, "
+                  "seed 0x%llx",
+                  kTokens, kHidden, cos, l2, static_cast<int>(finite),
+                  ref.rms, ref.stddev, ref.min, ref.max,
+                  static_cast<int>(ref.NonDegenerate()),
+                  static_cast<unsigned long long>(rng.seed()));
+    rep.check(finite && ref.NonDegenerate() && cos >= 0.9999 && l2 <= 1e-4,
+              "device dsv4_moe_prefill_batched matches "
+              "moe_prefill_batched_mxfp4_cpu",
+              detail);
+  }
+
+  // --- per-token independence -------------------------------------------
+  // Tokens 0 and 1 share expert 1 but have DIFFERENT x, so their outputs must
+  // differ. If the kernel reused one token's `activated` across its bucket --
+  // the obvious bug in a design where `activated` is a core-resident UB
+  // buffer reused per token -- these two rows would be identical, and both
+  // the cosine and the relative-L2 above would still look fine because the
+  // golden's own rows are similar in magnitude.
+  {
+    double row_diff = 0.0;
+    double row_mag = 0.0;
+    for (std::uint32_t c = 0; c < kHidden; ++c) {
+      const double a = got_prefill[c];
+      const double b = got_prefill[static_cast<std::size_t>(kHidden) + c];
+      row_diff += std::fabs(a - b);
+      row_mag += std::fabs(a);
+    }
+    char detail[320];
+    std::snprintf(detail, sizeof(detail),
+                  "tokens 0 and 1 both route to expert 1 with different x: "
+                  "sum|row0-row1| %.6e against sum|row0| %.6e; equal rows "
+                  "would mean `activated` leaked between tokens in UB",
+                  row_diff, row_mag);
+    rep.check(row_mag > 0.0 && row_diff > 1e-3 * row_mag,
+              "prefill does not reuse one token's activated across its bucket",
+              detail);
+  }
+}
+
 }  // namespace
 
 void RunDeviceCases(Report& rep) {
@@ -1329,6 +1625,7 @@ void RunDeviceCases(Report& rep) {
   DeviceMhcPreNormSinkhorn(rep, g_stream);
   DevicePagedCompressorRope(rep, g_stream);
   DeviceDsv4MoeExpert(rep, g_stream);
+  DeviceDsv4MoeBlock(rep, g_stream);
 }
 
 }  // namespace moe::kerntest
