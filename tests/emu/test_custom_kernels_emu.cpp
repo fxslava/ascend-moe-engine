@@ -1132,6 +1132,236 @@ void VerifyDsv4MoeExpertSimt(Report& rep) {
   }
 }
 
+// ===========================================================================
+// dsv4_moe_decode_topk / dsv4_moe_prefill_batched -- whole-block oracles and
+// the one piece of NEW device index arithmetic: expert-stride addressing.
+// ===========================================================================
+// The expert BODY is already covered above (group-to-lane map, uint4 word
+// unpacking, butterfly, clamp). What these two entry points add is:
+//
+//   1. expert-stride addressing -- expert e's w1 lives at
+//      e * (inter * hidden/2) inside one contiguous buffer. Get the stride
+//      wrong and the kernel reads a DIFFERENT EXPERT's weights, which is a
+//      silent wrong answer with no shape to catch it. This needs no hardware
+//      (CLAUDE.md §5.5), so it is checked here.
+//   2. the slot -> expert indirection and the router weighting.
+//   3. per-token expert selection on the prefill path.
+void VerifyDsv4MoeBlockOracles(Report& rep) {
+  section("dsv4_moe_block: expert-stride addressing, routing, prefill");
+
+  constexpr int kGroup = moe::emu::kMxfp4GroupSize;
+  // Smallest widths meeting the reduction quantum with groups_per_lane = 2,
+  // the same discriminating choice made for the single-expert suites.
+  constexpr int kHidden = 1024;
+  constexpr int kInter = 1024;
+  constexpr int kExperts = 5;   // deliberately not a power of two
+  constexpr int kTopK = 3;
+  constexpr float kLimit = moe::emu::kSwigluLimit;
+
+  // Per-expert strides, exactly as MakeDsv4Moe*Tiling computes them.
+  const std::size_t w13_packed_stride =
+      static_cast<std::size_t>(kInter) * (kHidden / 2);
+  const std::size_t w13_scale_stride =
+      static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  const std::size_t w2_packed_stride =
+      static_cast<std::size_t>(kHidden) * (kInter / 2);
+  const std::size_t w2_scale_stride =
+      static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  Rng rng(0xD5040B10ULL);
+  // ONE contiguous buffer per role, all experts, which is the device layout.
+  const std::vector<std::uint8_t> w1p = rng.bytes(w13_packed_stride * kExperts);
+  const std::vector<std::uint8_t> w3p = rng.bytes(w13_packed_stride * kExperts);
+  const std::vector<std::uint8_t> w2p = rng.bytes(w2_packed_stride * kExperts);
+  const std::vector<std::uint8_t> w1s =
+      rng.bytes(w13_scale_stride * kExperts, 125, 129);
+  const std::vector<std::uint8_t> w3s =
+      rng.bytes(w13_scale_stride * kExperts, 125, 129);
+  const std::vector<std::uint8_t> w2s =
+      rng.bytes(w2_scale_stride * kExperts, 125, 129);
+
+  // Views onto each expert's slice, addressed by the SAME stride arithmetic
+  // the kernel performs. If the formula is wrong, every check below that
+  // depends on expert identity fails.
+  std::vector<moe::emu::Mxfp4Matrix> w1(kExperts);
+  std::vector<moe::emu::Mxfp4Matrix> w3(kExperts);
+  std::vector<moe::emu::Mxfp4Matrix> w2(kExperts);
+  for (int e = 0; e < kExperts; ++e) {
+    const std::size_t ue = static_cast<std::size_t>(e);
+    w1[ue] = {w1p.data() + ue * w13_packed_stride,
+              w1s.data() + ue * w13_scale_stride, kInter, kHidden};
+    w3[ue] = {w3p.data() + ue * w13_packed_stride,
+              w3s.data() + ue * w13_scale_stride, kInter, kHidden};
+    w2[ue] = {w2p.data() + ue * w2_packed_stride,
+              w2s.data() + ue * w2_scale_stride, kHidden, kInter};
+  }
+
+  const std::vector<float> x = rng.normal(kHidden, 0.0F, 1.0F);
+
+  // --- check A: the expert strides tile the buffers exactly --------------
+  // Both properties matter. Coverage: expert kExperts-1's slice must end at
+  // the buffer end, or the stride is wrong and some expert reads past it.
+  // Disjointness follows from stride == slice size, stated as its own
+  // equality so a stride that merely fits cannot pass.
+  {
+    const bool w13_exact =
+        w13_packed_stride * kExperts == w1p.size() &&
+        w13_scale_stride * kExperts == w1s.size();
+    const bool w2_exact = w2_packed_stride * kExperts == w2p.size() &&
+                          w2_scale_stride * kExperts == w2s.size();
+    rep.check(w13_exact && w2_exact,
+              "expert strides tile the weight buffers with no gap or overlap",
+              "an expert slice would run past its buffer or leave a hole");
+    // The strides must also be expressible in the uint32 POD fields.
+    constexpr std::size_t kU32Max = 0xFFFFFFFFull;
+    rep.check(w13_packed_stride <= kU32Max && w2_packed_stride <= kU32Max,
+              "expert strides fit the uint32 tiling fields",
+              "a stride would truncate in the tiling POD");
+  }
+
+  // --- check B: expert identity is load-bearing -------------------------
+  // The whole risk of stride addressing is reading the wrong expert, and a
+  // wrong-expert read still produces finite, plausible numbers. So assert
+  // the experts are actually DISTINGUISHABLE: if expert 0 and expert 1 gave
+  // the same output, every routing check below would be vacuous.
+  {
+    std::vector<float> y0(kHidden);
+    std::vector<float> y1(kHidden);
+    std::vector<float> scratch;
+    moe::emu::moe_expert_swiglu_mxfp4_cpu(w1[0], w3[0], w2[0], x.data(),
+                                          y0.data(), kLimit, &scratch);
+    moe::emu::moe_expert_swiglu_mxfp4_cpu(w1[1], w3[1], w2[1], x.data(),
+                                          y1.data(), kLimit, &scratch);
+    double diff = 0.0;
+    double mag = 0.0;
+    for (int c = 0; c < kHidden; ++c) {
+      diff += std::fabs(static_cast<double>(y0[static_cast<std::size_t>(c)]) -
+                        y1[static_cast<std::size_t>(c)]);
+      mag += std::fabs(static_cast<double>(y0[static_cast<std::size_t>(c)]));
+    }
+    rep.check(mag > 0.0 && diff > 0.01 * mag,
+              "distinct experts produce distinguishable outputs",
+              "two experts agree, so the routing checks would be vacuous");
+  }
+
+  // --- check C: decode == weighted sum over slots -----------------------
+  {
+    const std::vector<std::int32_t> ids = {3, 0, 4};  // not sorted, not identity
+    const std::vector<float> weights = {0.5F, 0.25F, 0.125F};
+    std::vector<float> got(kHidden);
+    std::vector<float> scratch;
+    moe::emu::moe_decode_topk_mxfp4_cpu(w1.data(), w3.data(), w2.data(),
+                                        x.data(), ids.data(), weights.data(),
+                                        kTopK, kExperts, got.data(), kLimit,
+                                        &scratch);
+
+    // Independent reconstruction: run each routed expert on its own and
+    // combine by hand. This is what makes the check a check and not a
+    // restatement -- it never calls moe_decode_topk_mxfp4_cpu.
+    std::vector<float> want(kHidden, 0.0F);
+    for (int s = 0; s < kTopK; ++s) {
+      const std::size_t e = static_cast<std::size_t>(ids[static_cast<std::size_t>(s)]);
+      std::vector<float> partial(kHidden);
+      moe::emu::moe_expert_swiglu_mxfp4_cpu(w1[e], w3[e], w2[e], x.data(),
+                                            partial.data(), kLimit, &scratch);
+      for (int c = 0; c < kHidden; ++c) {
+        want[static_cast<std::size_t>(c)] +=
+            weights[static_cast<std::size_t>(s)] *
+            partial[static_cast<std::size_t>(c)];
+      }
+    }
+    bool match = true;
+    for (int c = 0; c < kHidden; ++c) {
+      const double a = got[static_cast<std::size_t>(c)];
+      const double b = want[static_cast<std::size_t>(c)];
+      if (std::fabs(a - b) > 1e-4 * std::max(1.0, std::fabs(b))) match = false;
+    }
+    rep.check(match, "decode is the router-weighted sum of its routed experts",
+              "decode disagreed with an independent per-expert combination");
+
+    // The router weights must actually be APPLIED. Halving every weight must
+    // halve the output -- a kernel that dropped the weighting would be
+    // unchanged, and check C above would still pass if the weights happened
+    // to be 1.0.
+    const std::vector<float> halved = {0.25F, 0.125F, 0.0625F};
+    std::vector<float> got_half(kHidden);
+    moe::emu::moe_decode_topk_mxfp4_cpu(w1.data(), w3.data(), w2.data(),
+                                        x.data(), ids.data(), halved.data(),
+                                        kTopK, kExperts, got_half.data(),
+                                        kLimit, &scratch);
+    bool scales = true;
+    for (int c = 0; c < kHidden; ++c) {
+      const double full = got[static_cast<std::size_t>(c)];
+      const double half = got_half[static_cast<std::size_t>(c)];
+      if (std::fabs(2.0 * half - full) > 1e-4 * std::max(1.0, std::fabs(full))) {
+        scales = false;
+      }
+    }
+    rep.check(scales, "decode output is linear in the router weights",
+              "halving the router weights did not halve the output");
+  }
+
+  // --- check D: prefill applies each token's own expert ------------------
+  {
+    constexpr int kTokens = 7;  // not a multiple of the 32-core grid stride
+    // Grouped by expert, as the dispatch delivers them, with one singleton
+    // segment so a bucket of length 1 is exercised.
+    const std::vector<std::int32_t> token_to_expert = {0, 0, 0, 2, 2, 4, 4};
+    std::vector<float> x_tokens(static_cast<std::size_t>(kTokens) * kHidden);
+    for (int t = 0; t < kTokens; ++t) {
+      const std::vector<float> row = rng.normal(kHidden, 0.0F, 1.0F);
+      std::copy(row.begin(), row.end(),
+                x_tokens.begin() + static_cast<std::size_t>(t) * kHidden);
+    }
+    std::vector<float> got(static_cast<std::size_t>(kTokens) * kHidden);
+    std::vector<float> scratch;
+    moe::emu::moe_prefill_batched_mxfp4_cpu(
+        w1.data(), w3.data(), w2.data(), x_tokens.data(),
+        token_to_expert.data(), kTokens, kExperts, got.data(), kLimit,
+        &scratch);
+
+    bool match = true;
+    for (int t = 0; t < kTokens; ++t) {
+      const std::size_t e =
+          static_cast<std::size_t>(token_to_expert[static_cast<std::size_t>(t)]);
+      const std::size_t row = static_cast<std::size_t>(t) * kHidden;
+      std::vector<float> want(kHidden);
+      moe::emu::moe_expert_swiglu_mxfp4_cpu(w1[e], w3[e], w2[e],
+                                            x_tokens.data() + row, want.data(),
+                                            kLimit, &scratch);
+      for (int c = 0; c < kHidden; ++c) {
+        const double a = got[row + static_cast<std::size_t>(c)];
+        const double b = want[static_cast<std::size_t>(c)];
+        if (std::fabs(a - b) > 1e-4 * std::max(1.0, std::fabs(b))) match = false;
+      }
+    }
+    rep.check(match, "prefill routes every token through its own expert",
+              "a token's output did not match its assigned expert");
+
+    // A token routed elsewhere must CHANGE, or the per-token selection is
+    // not being read at all.
+    std::vector<std::int32_t> moved = token_to_expert;
+    moved[0] = 1;
+    std::vector<float> got_moved(static_cast<std::size_t>(kTokens) * kHidden);
+    moe::emu::moe_prefill_batched_mxfp4_cpu(
+        w1.data(), w3.data(), w2.data(), x_tokens.data(), moved.data(),
+        kTokens, kExperts, got_moved.data(), kLimit, &scratch);
+    double moved_diff = 0.0;
+    double tail_diff = 0.0;
+    for (int c = 0; c < kHidden; ++c) {
+      moved_diff += std::fabs(static_cast<double>(got[static_cast<std::size_t>(c)]) -
+                              got_moved[static_cast<std::size_t>(c)]);
+      // Token 1 kept expert 0, so its row must be untouched.
+      const std::size_t r1 = static_cast<std::size_t>(kHidden);
+      tail_diff += std::fabs(static_cast<double>(got[r1 + static_cast<std::size_t>(c)]) -
+                             got_moved[r1 + static_cast<std::size_t>(c)]);
+    }
+    rep.check(moved_diff > 0.0 && tail_diff == 0.0,
+              "rerouting one token changes only that token's row",
+              "the per-token expert id is ignored, or it leaks across rows");
+  }
+}
+
 void VerifyMetrics(Report& rep) {
   section("harness: metric self-test");
 
@@ -1194,6 +1424,7 @@ int main() {
   VerifyMxfp4Gemv(rep);
   VerifyIndexerSelectionNetwork(rep);
   VerifyDsv4MoeExpertSimt(rep);
+  VerifyDsv4MoeBlockOracles(rep);
 
   std::printf("\n---------------------------------------------------------\n");
   std::printf("checks: %d   failures: %d\n", rep.checks, rep.failures);

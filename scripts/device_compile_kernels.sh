@@ -148,6 +148,7 @@ done
 EXTRA_KERNELS="
 fast_fp8_indexer_topk:fast_fp8_indexer_score_kernel
 fast_fp8_indexer_topk:fast_fp8_indexer_select_kernel
+dsv4_moe_expert:dsv4_moe_block_kernel
 "
 
 for e in $EXTRA_KERNELS; do
@@ -156,6 +157,25 @@ for e in $EXTRA_KERNELS; do
   d="src/ops/$k"
   inc="-I$d/op_kernel -I$d/op_host"
   compile_one "$k/op_kernel/${stem}.cpp" "$d/op_kernel/${stem}.cpp" "$inc"
+done
+
+# Extra op_host TUs: launch wrappers and tiling builders the ${k}.cpp /
+# ${k}_tiling.cpp derivation does not reach, because they belong to an
+# additional ENTRY POINT of an operator above rather than to a new operator.
+# They are chevron-dispatch and tiling TUs, so BiSheng must compile them
+# (CLAUDE.md section 3.3) and this gate must cover them.
+# Format: "<owning operator>:<file stem under op_host/>".
+EXTRA_HOST="
+dsv4_moe_expert:dsv4_moe_block
+dsv4_moe_expert:dsv4_moe_block_tiling
+"
+
+for e in $EXTRA_HOST; do
+  k="${e%%:*}"
+  stem="${e##*:}"
+  d="src/ops/$k"
+  inc="-I$d/op_kernel -I$d/op_host"
+  compile_one "$k/op_host/${stem}.cpp" "$d/op_host/${stem}.cpp" "$inc"
 done
 
 # The shared launch-layer TU: the failure record and Status::ToString.

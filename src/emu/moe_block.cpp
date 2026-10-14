@@ -56,6 +56,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -272,6 +273,88 @@ void moe_expert_swiglu_fp8_cpu(const Fp8BlockMatrix& w1, const Fp8BlockMatrix& w
     fp8_block_gemv_cpu(w2, in, dst);
   };
   ExpertSwiglu(gate, up, down, w1.rows, w2.rows, x, out, limit, scratch);
+}
+
+// ---------------------------------------------------------------------------
+// Whole-block oracles
+// ---------------------------------------------------------------------------
+
+void moe_decode_topk_mxfp4_cpu(const Mxfp4Matrix* w1, const Mxfp4Matrix* w3,
+                               const Mxfp4Matrix* w2, const float* x,
+                               const std::int32_t* topk_expert_ids,
+                               const float* routing_weights, int top_k,
+                               int num_experts, float* out, float limit,
+                               std::vector<float>* scratch) {
+  Require(w1 != nullptr && w3 != nullptr && w2 != nullptr,
+          "decode expert weight array is null");
+  Require(x != nullptr && out != nullptr, "decode operand is null");
+  Require(topk_expert_ids != nullptr && routing_weights != nullptr,
+          "decode routing operand is null");
+  Require(scratch != nullptr, "decode scratch is null");
+  Require(top_k > 0 && num_experts > 0, "decode has an empty extent");
+
+  const int hidden = w2[0].rows;
+  const int inter = w1[0].rows;
+  // Every expert must share one geometry: the device kernel addresses expert
+  // e at a FIXED stride, so a ragged expert set would not merely be slow, it
+  // would read the wrong bytes.
+  for (int e = 0; e < num_experts; ++e) {
+    Require(w1[e].rows == inter && w3[e].rows == inter,
+            "every expert must share the intermediate size");
+    Require(w2[e].rows == hidden, "every expert must share the hidden size");
+    Require(w1[e].cols == hidden && w3[e].cols == hidden,
+            "w1/w3 must reduce over the hidden size");
+    Require(w2[e].cols == inter, "w2 must reduce over the intermediate size");
+  }
+
+  std::fill(out, out + hidden, 0.0F);
+  // One expert's unweighted output, reused across slots.
+  std::vector<float> partial(static_cast<std::size_t>(hidden));
+  for (int s = 0; s < top_k; ++s) {
+    const std::int32_t e = topk_expert_ids[s];
+    Require(e >= 0 && e < num_experts, "routed expert id is out of range");
+    moe_expert_swiglu_mxfp4_cpu(w1[e], w3[e], w2[e], x, partial.data(), limit,
+                                scratch);
+    const float weight = routing_weights[s];
+    // Ascending slot order -- see the contract note on the declaration.
+    for (int c = 0; c < hidden; ++c) {
+      out[c] += weight * partial[static_cast<std::size_t>(c)];
+    }
+  }
+}
+
+void moe_prefill_batched_mxfp4_cpu(const Mxfp4Matrix* w1, const Mxfp4Matrix* w3,
+                                   const Mxfp4Matrix* w2, const float* x_tokens,
+                                   const std::int32_t* token_to_expert,
+                                   int total_tokens, int num_experts,
+                                   float* y_tokens, float limit,
+                                   std::vector<float>* scratch) {
+  Require(w1 != nullptr && w3 != nullptr && w2 != nullptr,
+          "prefill expert weight array is null");
+  Require(x_tokens != nullptr && y_tokens != nullptr, "prefill operand is null");
+  Require(token_to_expert != nullptr, "prefill routing operand is null");
+  Require(scratch != nullptr, "prefill scratch is null");
+  Require(total_tokens > 0 && num_experts > 0, "prefill has an empty extent");
+
+  const int hidden = w2[0].rows;
+  const int inter = w1[0].rows;
+  for (int e = 0; e < num_experts; ++e) {
+    Require(w1[e].rows == inter && w3[e].rows == inter,
+            "every expert must share the intermediate size");
+    Require(w2[e].rows == hidden, "every expert must share the hidden size");
+    Require(w1[e].cols == hidden && w3[e].cols == hidden,
+            "w1/w3 must reduce over the hidden size");
+    Require(w2[e].cols == inter, "w2 must reduce over the intermediate size");
+  }
+
+  for (int t = 0; t < total_tokens; ++t) {
+    const std::int32_t e = token_to_expert[t];
+    Require(e >= 0 && e < num_experts, "token's expert id is out of range");
+    const std::size_t row = static_cast<std::size_t>(t) *
+                            static_cast<std::size_t>(hidden);
+    moe_expert_swiglu_mxfp4_cpu(w1[e], w3[e], w2[e], x_tokens + row,
+                                y_tokens + row, limit, scratch);
+  }
 }
 
 }  // namespace moe::emu

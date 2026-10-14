@@ -309,6 +309,55 @@ void moe_expert_swiglu_fp8_cpu(const Fp8BlockMatrix& w1, const Fp8BlockMatrix& w
                                float limit, std::vector<float>* scratch);
 
 // ---------------------------------------------------------------------------
+// Whole-MoE-block oracles: decode (M = 1, top-k experts) and prefill (M >> 1)
+// ---------------------------------------------------------------------------
+// These are the goldens for the two dsv4_moe_expert entry points. Both are
+// thin compositions over moe_expert_swiglu_mxfp4_cpu above, deliberately:
+// that function is already the authority for the asymmetric clamp and the
+// per-group scale order, and a second transcription of the expert body here
+// would be a second thing to keep in agreement with it.
+//
+// `w1`, `w3`, `w2` are ARRAYS of `num_experts` matrices, indexed by expert
+// id. On device the same thing is one contiguous GM buffer per role with a
+// fixed per-expert stride; see the tiling header.
+
+// Decode: one token, `top_k` routed experts, router-weighted sum.
+//
+//   out = sum over slot s of  routing_weights[s] * Expert(topk_expert_ids[s])(x)
+//
+// The sum here runs over slots in ascending order, but that order is NOT part
+// of the contract: the device kernel gives each slot its own AIV and
+// accumulates with an atomic-add DataCopy, so the hardware order is whatever
+// the cores finish in and varies run to run. Six partials of comparable
+// magnitude reassociate within ~1e-7 relative, far inside the 1e-2 the suites
+// allow, so this is a real but irrelevant difference -- stated because a
+// comment claiming a fixed order would be false.
+//
+// The caller must zero `out` before an atomic accumulation on device; this
+// oracle fills it, so the two agree without the caller doing anything.
+void moe_decode_topk_mxfp4_cpu(const Mxfp4Matrix* w1, const Mxfp4Matrix* w3,
+                               const Mxfp4Matrix* w2, const float* x,
+                               const std::int32_t* topk_expert_ids,
+                               const float* routing_weights, int top_k,
+                               int num_experts, float* out, float limit,
+                               std::vector<float>* scratch);
+
+// Prefill: `total_tokens` tokens, each routed to exactly one expert.
+//
+//   y_tokens[t] = Expert(token_to_expert[t])(x_tokens[t])
+//
+// No router weighting: in the prefill path the dispatch has already grouped
+// tokens by expert and the combine stage applies the weights, so a token here
+// carries exactly one expert and an unweighted output. Rows are independent,
+// so this is a per-token loop with no cross-token order to preserve.
+void moe_prefill_batched_mxfp4_cpu(const Mxfp4Matrix* w1, const Mxfp4Matrix* w3,
+                                   const Mxfp4Matrix* w2, const float* x_tokens,
+                                   const std::int32_t* token_to_expert,
+                                   int total_tokens, int num_experts,
+                                   float* y_tokens, float limit,
+                                   std::vector<float>* scratch);
+
+// ---------------------------------------------------------------------------
 // Activation block quantizer (oracle for the bf16_block_quant_fp8 operator)
 // ---------------------------------------------------------------------------
 // BF16/FP32 -> FP8 E4M3 with one FP32 scale per 128 elements:

@@ -84,11 +84,16 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_expert_kernel.cpp"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_expert.cpp"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_expert_tiling.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_block_kernel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
     "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
   )
   set(_dsv4_asc_headers
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_expert_arch35.h"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_expert_tiling.h"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_block_arch35.h"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.h"
     "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.hpp"
     "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/arch35_common.hpp"
     "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/launch.hpp"
@@ -153,6 +158,49 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   if(DSV4_WERROR)
     target_compile_options(test_dsv4_moe_expert_sim PRIVATE -Werror)
   endif()
+  # The whole-block entry points. Reuses the SAME ASC objects -- both suites
+  # link one arch35 device object set, so the two kernels are compiled once.
+  add_executable(test_dsv4_moe_block_sim
+    test_dsv4_moe_block_sim.cpp
+    ${_dsv4_asc_objects}
+  )
+  add_dependencies(test_dsv4_moe_block_sim dsv4_moe_expert_camodel_objects)
+  target_include_directories(test_dsv4_moe_block_sim PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_block_sim PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_dsv4_moe_block_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_block_sim PRIVATE
+    moe_emu
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_block_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_block_sim PRIVATE -Werror)
+  endif()
+  # TIMEOUT is 3600, not the 1800 the single-expert suite uses: these kernels
+  # are monolithic, so one core runs a whole expert and the total simulated
+  # work is top_k (or token count) times a full expert.
+  add_test(NAME Dsv4MoeBlockSim COMMAND test_dsv4_moe_block_sim)
+  set_tests_properties(Dsv4MoeBlockSim PROPERTIES
+    LABELS "sim;arch35;camodel;functional"
+    TIMEOUT 3600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
   add_test(NAME Dsv4MoeExpertSim COMMAND test_dsv4_moe_expert_sim)
   set_tests_properties(Dsv4MoeExpertSim PROPERTIES
     LABELS "sim;arch35;camodel;functional"

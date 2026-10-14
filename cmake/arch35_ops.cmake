@@ -65,15 +65,46 @@ endforeach()
 #
 # Adding one: put it in the owning operator's op_kernel/ and list it here, and
 # add it to scripts/device_compile_kernels.sh (CLAUDE.md §5.1).
-# dsv4_moe_expert likewise has two entry points, but both live in its single
-# op_kernel/<op>_kernel.cpp, so the derivation above already covers it and it
-# needs no entry here: the gate_up/down split exists because the down leg
-# reduces over the whole `activated` vector while the gate/up legs are split
-# across cores by row tile, and the barrier between them is stream ordering.
+# dsv4_moe_expert now has FOUR entry points across two TUs. Its original pair
+# (gate_up/down) lives in op_kernel/<op>_kernel.cpp, which the derivation
+# above already covers; that split exists because the down leg reduces over
+# the whole `activated` vector while the gate/up legs are split across cores
+# by row tile, with stream ordering as the barrier. Its whole-block pair
+# (decode_topk/prefill_batched) lives in a second TU and IS listed below,
+# along with that pair's own op_host wrappers -- those are the first extra
+# entry points here to bring their own host TUs, which is why the
+# MOE_ARCH35_EXTRA_HOST_SOURCES list exists at all.
 set(MOE_ARCH35_EXTRA_KERNEL_SOURCES
   "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_score_kernel.cpp"
   "${CMAKE_SOURCE_DIR}/src/ops/fast_fp8_indexer_topk/op_kernel/fast_fp8_indexer_select_kernel.cpp"
+  # The whole-MoE-block entry points: dsv4_moe_decode_topk (M = 1, one AIV per
+  # routed expert slot) and dsv4_moe_prefill_batched (M >> 1, 32 AIVs over
+  # tokens). Both live in dsv4_moe_expert's op_kernel/ as additional entry
+  # points of that operator -- one directory, one host ABI, one tiling POD --
+  # so they are listed here rather than added to MOE_ARCH35_OPS.
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_block_kernel.cpp"
 )
+
+# Additional op_host TUs: the launch wrappers and tiling builders belonging to
+# those extra entry points. The three-TUs-per-operator derivation above cannot
+# reach them (it derives ${_op}.cpp / ${_op}_tiling.cpp from the operator
+# name), and without them arch35_device_launch would contain the new KERNELS
+# but none of the wrappers that dispatch them -- so every consumer would fail
+# to link LaunchDsv4MoeDecodeTopk.
+set(MOE_ARCH35_EXTRA_HOST_SOURCES
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
+)
+
+foreach(_src IN LISTS MOE_ARCH35_EXTRA_HOST_SOURCES)
+  if(NOT EXISTS "${_src}")
+    message(FATAL_ERROR
+      "arch35 extra host TU ${_src} is listed in "
+      "MOE_ARCH35_EXTRA_HOST_SOURCES but does not exist. Either add the "
+      "file or remove it from the list.")
+  endif()
+  list(APPEND MOE_ARCH35_OP_ASC_SOURCES "${_src}")
+endforeach()
 
 foreach(_src IN LISTS MOE_ARCH35_EXTRA_KERNEL_SOURCES)
   if(NOT EXISTS "${_src}")

@@ -190,6 +190,72 @@ Status LaunchDsv4MoeExpert(
     void* workspace, std::size_t workspace_bytes, aclrtStream stream);
 
 // ---------------------------------------------------------------------------
+// dsv4_moe_decode_topk / dsv4_moe_prefill_batched -- the whole MoE block
+// ---------------------------------------------------------------------------
+// These supersede LaunchDsv4MoeExpert above, which runs ONE expert in two
+// dispatches. The decode and prefill phases are separate entry points because
+// their parallel decompositions are irreconcilable:
+//
+//   decode  (M = 1)     Only one token, so the only intra-expert parallelism
+//                       is over output rows -- and `down` reduces over all of
+//                       `activated` while `gate_up` produces it tiled across
+//                       cores. Rather than pay that cross-core dependency,
+//                       decode takes its parallelism from the top_k EXPERTS:
+//                       block_dim == top_k, one AIV per routed slot, each
+//                       owning a whole expert so `activated` stays in UB.
+//                       With top_k = 6 that leaves 26 of 32 AIVs idle. That
+//                       is a deliberate trade -- the alternative multiplies
+//                       the w1/w3 weight stream by the cores per slot, on a
+//                       kernel measured at 3.76 FLOP/B -- and it has NOT been
+//                       measured on hardware (CLAUDE.md §5.7).
+//
+//   prefill (M >> 1)    32 AIVs grid-stride over tokens; a core owns whole
+//                       tokens, so the same monolithic body is sound per
+//                       token with no idle cores.
+//
+// Neither takes a workspace: `activated` never reaches GM.
+//
+// Weights for ALL experts live in one buffer per role, with expert e at
+// e * <role>_expert_stride. The strides are derived and validated by the
+// tiling builders from `hidden`/`inter`; the caller only guarantees the
+// layout. `num_experts` is how many experts the buffers hold, and
+// `topk_expert_ids` indexes into that -- so staging just the routed experts
+// contiguously and passing ids 0..top_k-1 is as valid as keeping all 256
+// resident.
+//
+// DECODE ACCUMULATES INTO `y`: the top_k slots are summed there by an
+// atomic-add store, so THE CALLER MUST ZERO `y` BEFORE THE LAUNCH. The
+// wrapper does not touch operand data (§3.4). The slot summation order is
+// whatever the cores finish in and varies run to run; partials of comparable
+// magnitude reassociate within ~1e-7 relative.
+//
+// `routing_weights[s]` is folded into slot s's down-leg store, so there is no
+// separate scaling pass and no broadcast tensor.
+//
+// PREFILL OVERWRITES `y_tokens`: one expert per token, one output row, no
+// accumulation and no zeroing needed. `x_tokens` is expected already grouped
+// by expert (the standard dispatch output) so a core's consecutive tokens
+// share a weight stream; correctness does not depend on it, only reuse.
+//
+// Neither y may alias x.
+// ---------------------------------------------------------------------------
+Status LaunchDsv4MoeDecodeTopk(
+    const float* x_gm, const Mxfp4Pair* w1_packed_gm, const E8M0* w1_scale_gm,
+    const Mxfp4Pair* w3_packed_gm, const E8M0* w3_scale_gm,
+    const Mxfp4Pair* w2_packed_gm, const E8M0* w2_scale_gm,
+    const std::int32_t* topk_expert_ids_gm, const float* routing_weights_gm,
+    std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
+    std::uint32_t top_k, float* y_gm, aclrtStream stream);
+
+Status LaunchDsv4MoePrefillBatched(
+    const float* x_tokens_gm, const Mxfp4Pair* w1_packed_gm,
+    const E8M0* w1_scale_gm, const Mxfp4Pair* w3_packed_gm,
+    const E8M0* w3_scale_gm, const Mxfp4Pair* w2_packed_gm,
+    const E8M0* w2_scale_gm, const std::int32_t* token_to_expert_gm,
+    std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
+    std::uint32_t total_tokens, float* y_tokens_gm, aclrtStream stream);
+
+// ---------------------------------------------------------------------------
 // bf16_block_quant_fp8
 //
 // BF16/FP32 -> FP8 E4M3 with one FP32 scale per 128 elements, for the activation
