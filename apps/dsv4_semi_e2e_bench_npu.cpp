@@ -164,6 +164,7 @@
 #include <aclnn/acl_meta.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -222,17 +223,12 @@ double MicrosecondsSince(Clock::time_point start) {
 
 // aclnn takes these as `char*`, so they cannot be string literals.
 char kRotaryModeHalf[] = "half";
-// BNSD, not TND. This was "TND" while every descriptor below was built 4-D and
-// named _bsnd, which is what made the device reject the call with
-// "[GetQkHeadDim] The shape dim of query must be equal to the axes size of
-// layout(TND): 3" (561002). TND is not reachable by squeezing the query to 3-D
-// either: it caps the head dimension at 256 ("When input layout is TND, headDim
-// shall not exceed 256", and separately "when input_layout is TND, only
-// query|key|value headDim = 64/128/192 are supported"), while kAttnHeadDim is
-// 512. BSND is excluded because this call passes a blockTable over a 4-D KV
-// cache, i.e. Page Attention, and "When Page Attention is enabled, and KV cache
-// dimensions are 4-dimensional, inputLayout must be BNSD or TND". BNSD is what
-// is left, and it carries no head-dimension ceiling.
+// BNSD matches the 4-D paged KV cache and the checkpoint's 64 x 512 query.
+// TND requires a 3-D query and caps headDim at 256; relabeling the 512 lanes
+// as 128-wide heads would change both the dot products and the output order.
+// The 950PR tiler also rejects D=512 when learnableSink is present. Run FIA
+// without that optional input, request its per-head log-sum-exp, then apply
+// the learned sink's denominator to each 512-wide output row below.
 //
 // All quotations are from
 // opp/built-in/op_impl/ai_core/tbe/op_host/lib/linux/x86_64/libophost_transformer.so
@@ -383,6 +379,9 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.decode_steps < 1 || options.indexer_seq_len < 1) {
     throw std::runtime_error("--decode-steps and --indexer-seq-len must be >= 1");
+  }
+  if (options.warmup_window_tokens < 0 || options.warmup_window_tokens >= kSlidingWindow) {
+    throw std::runtime_error("--warmup-window-tokens must be in [0, 127]");
   }
   // Set after the loop so the two flags commute: --skip-attn-norms disables
   // the parity gate whichever order they are given in. Comparing a run with
@@ -648,41 +647,6 @@ class Checkpoint {
     return device;
   }
 
-  // Restage an F32 checkpoint tensor as BF16.
-  //
-  // aclnnFusedInferAttentionScoreV5 requires learnable_sink to carry the
-  // query's dtype: "The dtype of learnable_sink must be the same as the dtype
-  // of query", and, unconditionally, "When learnable_sink enable, sink dtype
-  // must be BFLOAT16!" (libophost_transformer.so, CANN 9.2.0-beta.2). The
-  // checkpoint stores attn_sink as F32, so it cannot be handed over as-is.
-  //
-  // The conversion loses mantissa: a sink logit keeps 8 bits here against 24 in
-  // the checkpoint, which perturbs the softmax denominator only -- the sink has
-  // no value vector -- and is the dtype the operator demands, not a choice.
-  std::uint16_t* StageAsBf16(const std::string& name, const std::vector<std::int64_t>& shape) {
-    const auto cached = staged_bf16_.find(name);
-    if (cached != staged_bf16_.end()) return cached->second;
-    RequireDtype(name, "F32");
-    RequireShape(name, shape);
-    std::size_t elements = 1;
-    for (std::int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
-    const std::size_t bytes = source_.NamedByteSize(name);
-    DSV4_REQUIRE(bytes == elements * 4, name << ": F32 payload is " << bytes << " B, expected " << elements * 4);
-    std::vector<std::uint8_t> host(bytes);
-    source_.ReadNamed(name, host.data(), host.size(), 0, bytes);
-    std::vector<std::uint16_t> narrowed(elements);
-    for (std::size_t i = 0; i < elements; ++i) {
-      float value = 0.0F;
-      std::memcpy(&value, host.data() + i * 4, 4);
-      narrowed[i] = FloatToBf16(value);
-    }
-    auto* device =
-        static_cast<std::uint16_t*>(arena_.Stage(narrowed.data(), narrowed.size() * sizeof(std::uint16_t), name.c_str()));
-    staged_bf16_.emplace(name, device);
-    bytes_ += bytes;
-    return device;
-  }
-
   // Read a tensor to the host without staging it. Used for tid2eid, whose
   // route row the host must know to decide which expert weights to stage.
   std::vector<std::uint8_t> ReadHost(const std::string& name) {
@@ -704,7 +668,7 @@ class Checkpoint {
   std::string Dtype(const std::string& name) const { return source_.NamedDtype(name); }
   std::vector<std::int64_t> Shape(const std::string& name) const { return source_.NamedShape(name); }
   std::size_t bytes() const { return bytes_; }
-  std::size_t count() const { return staged_.size() + staged_float_.size() + staged_bf16_.size(); }
+  std::size_t count() const { return staged_.size() + staged_float_.size(); }
 
  private:
   void RequireDtype(const std::string& name, const char* expect) {
@@ -730,7 +694,6 @@ class Checkpoint {
   DeviceArena& arena_;
   std::map<std::string, void*> staged_;
   std::map<std::string, float*> staged_float_;
-  std::map<std::string, std::uint16_t*> staged_bf16_;
   std::size_t bytes_ = 0;
 };
 
@@ -1300,17 +1263,15 @@ int main(int argc, char** argv) {
     // activation-quantized FP8 against the checkpoint's 128x128 E8M0 grid,
     // which QuantMatmulV5 is told about through `groupSize` (see the file
     // header). `transposeX2` is true because the checkpoint stores [N, K].
-    // FIA V5 runs over one shared KV head with the per-head attn_sink as
-    // `learnableSink`, in BNSD over a paged 4-D cache. Each of these is the
-    // documented contract; none has been executed.
+    // FIA V5 runs over one shared KV head in BNSD over a paged 4-D cache.
+    // Its D=512 path cannot take learnableSink on 950PR, so the sink is applied
+    // after FIA from its returned log-sum-exp.
     //
     // The FIA descriptors were reworked on 2026-10-14 after the device
     // rejected the call with 561002. The layout attr said TND while the
-    // tensors were 4-D, and three further attributes/dtypes were illegal for
-    // this geometry on the same call: see the kFiaLayout comment at the top of
-    // this file for the layout, the sparseMode note at the call site, and
-    // Checkpoint::StageAsBf16 for learnable_sink. Each change is pinned to a
-    // constraint string in libophost_transformer.so, none to a device run.
+    // tensors were 4-D. See kFiaLayout and the sparseMode note at the call
+    // site for the other tiling constraints. The sink workaround below also
+    // follows a 950PR tiling rejection for D=512.
     // =======================================================================
     struct AttentionPlan {
       PipelineStage* q_a = nullptr;
@@ -1320,6 +1281,8 @@ int main(int argc, char** argv) {
       PipelineStage* kv_norm = nullptr;
       PipelineStage* rope = nullptr;
       PipelineStage* attention = nullptr;
+      PipelineStage* sink_scale = nullptr;
+      std::array<float, kAttnHeads> sink_logits{};
       PipelineStage* o_group[kOGroups] = {};
       PipelineStage* o_b = nullptr;
       // The four activation quantizers and their E8M0 -> FP32 casts are gone:
@@ -1339,6 +1302,8 @@ int main(int argc, char** argv) {
     void* a_q_heads = arena.Take(static_cast<std::size_t>(kAttnQkvWidth) * 2, "attn.q_heads");
     void* a_kv = arena.Take(static_cast<std::size_t>(kAttnHeadDim) * 2, "attn.kv");
     void* a_attn_out = arena.Take(static_cast<std::size_t>(kAttnQkvWidth) * 2, "attn.out");
+    void* a_attn_raw = arena.Take(static_cast<std::size_t>(kAttnQkvWidth) * 2, "attn.raw");
+    void* a_sink_scale = arena.Take(static_cast<std::size_t>(kAttnHeads) * 2, "attn.sink_scale");
     void* a_attn_fp8 = arena.Take(kAttnQkvWidth, "attn.out_fp8");
     void* a_o_mid = arena.Take(static_cast<std::size_t>(kWoAOutput) * 2, "attn.o_mid");
     void* a_o_fp8 = arena.Take(kWoAOutput, "attn.o_fp8");
@@ -1375,6 +1340,8 @@ int main(int argc, char** argv) {
     // pinned to the KV cache's: "The shape dim of value must be equal to that
     // of attention_out".
     aclTensor* t_attn_bnsd = bag.Tensor({1, kAttnHeads, 1, kAttnHeadDim}, kAclBf16, a_attn_out, "attn.out_bnsd");
+    aclTensor* t_attn_raw = bag.Tensor({1, kAttnHeads, 1, kAttnHeadDim}, kAclBf16, a_attn_raw, "attn.raw_bnsd");
+    aclTensor* t_sink_scale = bag.Tensor({1, kAttnHeads, 1, 1}, kAclBf16, a_sink_scale, "attn.sink_scale");
     // No whole-tensor views of attn_fp8 / attn_scale_f32: the eight wo_a
     // groups build their own offset sub-views from the arena pointers, and
     // the block quantizer takes raw pointers rather than aclTensors, so a
@@ -1386,7 +1353,7 @@ int main(int argc, char** argv) {
     aclTensor* t_rope_cos = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_cos, "attn.rope_cos");
     aclTensor* t_rope_sin = bag.Tensor({1, 1, 1, kAttnRopeHeadDim}, kAclBf16, a_rope_sin, "attn.rope_sin");
     aclTensor* t_block_table = bag.Tensor({1, 1}, kAclInt32, a_block_table, "attn.block_table");
-    aclTensor* t_softmax_lse = bag.Tensor({1, kAttnHeads, 1}, kAclFloat32, a_softmax_lse, "attn.softmax_lse");
+    aclTensor* t_softmax_lse = bag.Tensor({1, kAttnHeads, 1, 1}, kAclFloat32, a_softmax_lse, "attn.softmax_lse");
 
     // RoPE rides the final 64 lanes of each 512-wide row, in place.
     //
@@ -1415,9 +1382,10 @@ int main(int argc, char** argv) {
       const Fp8Matrix wo_b = StageFp8(checkpoint, arena, prefix + ".wo_b", kHiddenSize, kWoAOutput);
       void* q_norm_w = checkpoint.Stage(prefix + ".q_norm.weight", "BF16", {kQLoraRank});
       void* kv_norm_w = checkpoint.Stage(prefix + ".kv_norm.weight", "BF16", {kAttnHeadDim});
-      // F32 in the checkpoint, BF16 on device: see Checkpoint::StageAsBf16 for
-      // the operator constraint that forces the narrowing.
-      std::uint16_t* attn_sink = checkpoint.StageAsBf16(prefix + ".attn_sink", {kAttnHeads});
+      checkpoint.Require(prefix + ".attn_sink", "F32", {kAttnHeads});
+      const std::vector<std::uint8_t> sink_bytes = checkpoint.ReadHost(prefix + ".attn_sink");
+      DSV4_REQUIRE(sink_bytes.size() == sizeof(plan->sink_logits), prefix << ".attn_sink has wrong byte size");
+      std::memcpy(plan->sink_logits.data(), sink_bytes.data(), sink_bytes.size());
 
       // The 128-row shared-KV ring, one per layer: layer 0's window must not
       // be clobbered by layer 2's.
@@ -1438,7 +1406,6 @@ int main(int argc, char** argv) {
           bag.Tensor({wo_b.scale_rows, wo_b.scale_cols}, kAclFloat32, wo_b.scale, "wo_b.scale");
       aclTensor* t_q_norm_w = bag.Tensor({kQLoraRank}, kAclBf16, q_norm_w, "q_norm.weight");
       aclTensor* t_kv_norm_w = bag.Tensor({kAttnHeadDim}, kAclBf16, kv_norm_w, "kv_norm.weight");
-      aclTensor* t_sink = bag.Tensor({kAttnHeads}, kAclBf16, attn_sink, "attn_sink");
       // Paged KV under BNSD: [blockNum = 1, N = 1 shared KV head,
       // blockSize = 128, D = 512]. The bytes are unchanged -- with N = 1 this
       // is the same 128 rows of 512 the previous [1, 128, 1, 512] described --
@@ -1474,21 +1441,23 @@ int main(int argc, char** argv) {
           "attn: rope", OpId::kApplyRotaryPosEmbV2, t_q_rope, t_k_rope, t_rope_cos, t_rope_sin, kRotaryLayoutBsnd,
           kRotaryModeHalf);
 
-      // A learned per-head sink logit contributes to the softmax denominator
-      // but has no value vector, so real-token probabilities sum to at most
-      // one. That is what `learnableSink` is for; the host reference carries
-      // the same term as an extra sinkless column.
+      // With learnableSink=null, FIA returns y=sum(exp(logit)*value)/Z and
+      // LSE=log(Z). The checkpoint's sink has no value vector, so the desired
+      // output is y * Z/(Z+exp(sink)) = y * sigmoid(LSE-sink).
       const double scale = 1.0 / std::sqrt(static_cast<double>(kAttnHeadDim));
       plan->attention = &graph.Plan<ascend_moe::FusedInferAttentionScoreV5PlanFn>(
           "attn: FusedInferAttentionScoreV5", OpId::kFusedInferAttentionScoreV5, t_q_bnsd, kv_list, kv_list,
-          nullptr, nullptr, bag.IntArray({1}, "actual_seq_q"), bag.IntArray({kSlidingWindow}, "actual_seq_kv"),
+          nullptr, nullptr, nullptr,
+          bag.IntArray({options.warmup_window_tokens + 1}, "actual_seq_kv"),
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, t_block_table, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, t_sink,
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           nullptr, nullptr, static_cast<std::int64_t>(kAttnHeads), scale, kFiaPreTokensAll, kFiaNextTokensCausal,
           kFiaLayout, /*num_key_value_heads=*/1, kFiaSparseModeDefault, kFiaInnerPreciseHighPrecision,
-          static_cast<std::int64_t>(kSlidingWindow), kFiaAntiquantModeNone, /*softmax_lse_flag=*/false,
-          kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone, kFiaPseTypeNone, t_attn_bnsd,
+          static_cast<std::int64_t>(kSlidingWindow), kFiaAntiquantModeNone, /*softmax_lse_flag=*/true,
+          kFiaAntiquantModeNone, kFiaAntiquantModeNone, kFiaQueryQuantModeNone, kFiaPseTypeNone, t_attn_raw,
           t_softmax_lse);
+      plan->sink_scale = &graph.Plan<ascend_moe::BinaryPlanFn>(
+          "attn: apply learned sink", OpId::kMul, t_attn_raw, t_sink_scale, t_attn_bnsd);
       // sparseMode was 3 (BAND), which this call cannot legally pass: it hands
       // attenMask as null and the query's S is 1, and each of those alone pins
       // the attribute -- "When attnMask is not provided, sparseMode must be 0"
@@ -1604,6 +1573,25 @@ int main(int argc, char** argv) {
       if (!warm) {
         graph.Launch(*plan.attention, stream);
         ++aclnn_launches;
+        // FIA's 512-wide sinkless path leaves the sink denominator for us.
+        // Read only 64 FP32 LSE values; the 64 x 512 attention output stays on
+        // device and aclnnMul broadcasts one BF16 scale across each head.
+        DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
+        std::array<float, kAttnHeads> host_lse{};
+        std::array<std::uint16_t, kAttnHeads> host_scale{};
+        DSV4_ACL_CHECK(aclrtMemcpy(host_lse.data(), sizeof(host_lse), a_softmax_lse,
+                                  sizeof(host_lse), ACL_MEMCPY_DEVICE_TO_HOST));
+        for (int head = 0; head < kAttnHeads; ++head) {
+          const float delta = host_lse[static_cast<std::size_t>(head)] -
+                              plan.sink_logits[static_cast<std::size_t>(head)];
+          const float gate = delta >= 0.0F ? 1.0F / (1.0F + std::exp(-delta))
+                                           : std::exp(delta) / (1.0F + std::exp(delta));
+          host_scale[static_cast<std::size_t>(head)] = FloatToBf16(gate);
+        }
+        DSV4_ACL_CHECK(aclrtMemcpy(a_sink_scale, sizeof(host_scale), host_scale.data(),
+                                  sizeof(host_scale), ACL_MEMCPY_HOST_TO_DEVICE));
+        graph.Launch(*plan.sink_scale, stream);
+        ++aclnn_launches;
         block_quant("bf16_block_quant_fp8: attn_out", a_attn_out, kAttnQkvWidth, a_attn_fp8, a_attn_scale_f32);
         for (PipelineStage* group : plan.o_group) {
           graph.Launch(*group, stream);
@@ -1616,7 +1604,7 @@ int main(int argc, char** argv) {
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
       // aclnn enqueues only, counted as they happen rather than asserted as a
       // literal: a warm token runs kv_proj, kv_norm and rope, a full one adds
-      // q_a, q_norm, q_b, attention, kOGroups o-groups and o_b, and
+      // q_a, q_norm, q_b, attention, sink_scale, kOGroups o-groups and o_b, and
       // --skip-attn-norms removes kv_norm and q_norm from both. The four
       // quantizers that used to contribute 8 of these enqueues are now arch35
       // launches with their own rows. (The literal this replaces said
