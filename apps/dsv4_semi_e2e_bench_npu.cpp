@@ -105,7 +105,53 @@
 //   ./build/apps/dsv4_semi_e2e_bench_npu [--data-dir DIR] [--token-id N]
 //       [--decode-steps N] [--indexer-seq-len N] [--device N]
 //       [--dense-group-size N] [--memory-budget-mb N] [--time-budget-ms N]
-//       [--no-golden]
+//       [--no-golden] [--skip-attn-norms]
+//
+// ---------------------------------------------------------------------------
+// WHAT --skip-attn-norms IS FOR, AND WHAT IT IS NOT
+// ---------------------------------------------------------------------------
+// A bisection aid, not a fix. It drops the attention core's two standalone
+// aclnnRmsNorm stages so a run that dies inside one of them still exercises
+// everything downstream. It changes the math, so it forces --no-golden and
+// exits 7 under a BISECT verdict rather than 0/PASS.
+//
+// It exists because a 950PR run died with Config_Error(EZ1013) on
+// QuantBatchMatmulV3 and a RmsNorm kernel-init failure, and the two need to be
+// separated. What the toolkit says about those, audited against
+// CANN 9.2.0-beta.2 (/usr/local/Ascend/cann-9.2.0-beta.2) on 2026-10-14:
+//
+//   * EZ1013 is NOT a dynamic-vs-static dispatch choice this bench can make.
+//     Every one of the 10,902 ascend950 kernel binaries in
+//     opp/.../tbe/kernel/ascend950/ops_nn declares `"opMode": "dynamic"` with
+//     dynamic-rank (`shape: [-2]`) inputs, the named FP8 binary included.
+//     There is no static-shape variant to select, so "the dynamic shape
+//     scenario" is the only scenario on this SoC.
+//   * transposeX2 cannot change which binary is matched. In all 118
+//     QuantBatchMatmulV3 manifests `transpose_x1`, `transpose_x2` and
+//     `group_size` carry `"value": null`, i.e. they do not participate in
+//     binary selection. The key is dtype+format over four slots --
+//     `QuantBatchMatmulV3/d=?,p=?/36,2/36,2/3,2/27,2` (x1 and x2 fp8e4m3 ND,
+//     scale fp32 ND, y bf16 ND) -- which is exactly what the descriptors
+//     below already produce, and `d=`/`p=` enumerate both values in every
+//     binary so they discriminate nothing. Transposing the weights to [K, N]
+//     offline and passing transposeX2 = false yields the same key and the
+//     same binary. QuantBatchMatmulV4 is not an alternative lowering either:
+//     it ships 7 binaries for ascend950, none FP8.
+//   * aclnnRmsNorm is not an unregistered operator here. It is registered for
+//     ascend950 in tbe/config/ascend950/aic-ascend950-ops-info-nn.json with an
+//     all-BF16 (x bf16, gamma bf16) entry, and
+//     kernel/ascend950/ops_nn/rms_norm/RmsNorm_normal_all_bf16_high_performance
+//     is present. So it is not the aclnnDynamicMxQuant AddConfig defect.
+//
+// Both failures sit at the same layer -- libnnopbase's ParseDynamicKernels /
+// AclOpKernelInit, i.e. locating the per-op kernel config -- which is what
+// CANN's own cause list for EZ1013 attributes to the opp package or
+// ASCEND_OPP_PATH, not to tensor descriptors. UNVERIFIED on this workstation:
+// there is no driver here (no /usr/local/Ascend/driver, no /dev/davinci*), so
+// aclnnQuantMatmulV5GetWorkspaceSize cannot be called at all and none of the
+// above has been confirmed against a failing process. The audit also assumes
+// the NPU host runs 9.2.0-beta.2; the reported path was `cann-9.2.0`, and a
+// different 9.2.0 build could declare different manifests.
 
 #include "moe/core/acl_guard.hpp"
 #include "moe/core/config.hpp"
@@ -256,6 +302,24 @@ struct Options {
   double memory_budget_mb = 4096.0;
   double time_budget_ms = 1500.0;
   bool golden = true;
+  // HARDWARE BISECTION ONLY -- drops the two standalone aclnnRmsNorm stages
+  // in the attention core (q_norm, kv_norm) so a run that dies inside one of
+  // them can still exercise everything downstream.
+  //
+  // This CHANGES THE MATH: q_a reaches wq_b unnormalized and the KV row
+  // reaches RoPE and the cache unnormalized, so every activation past this
+  // point is wrong by construction. It therefore forces --no-golden (see
+  // ParseOptions) and the final verdict reports BISECT rather than PASS; a
+  // number printed under this flag is not a parity result.
+  //
+  // It is NOT a workaround for the RmsNorm launch failure seen on 950PR.
+  // aclnnRmsNorm is registered for ascend950 in
+  // opp/.../tbe/config/ascend950/aic-ascend950-ops-info-nn.json with an
+  // all-BF16 entry, and the matching binary
+  // kernel/ascend950/ops_nn/rms_norm/RmsNorm_normal_all_bf16_high_performance
+  // is present in CANN 9.2.0-beta.2 -- so the operator is configured for this
+  // SoC and the failure is in kernel-config lookup, not in registration.
+  bool skip_attn_norms = false;
 };
 
 Options ParseOptions(int argc, char** argv) {
@@ -284,12 +348,19 @@ Options ParseOptions(int argc, char** argv) {
       options.time_budget_ms = std::stod(next("--time-budget-ms"));
     } else if (argument == "--no-golden") {
       options.golden = false;
+    } else if (argument == "--skip-attn-norms") {
+      options.skip_attn_norms = true;
     } else if (argument == "-h" || argument == "--help") {
       std::printf(
           "usage: dsv4_semi_e2e_bench_npu [--data-dir DIR] [--token-id N]\n"
           "       [--decode-steps N] [--indexer-seq-len N] [--device N]\n"
           "       [--dense-group-size N] [--memory-budget-mb N]\n"
-          "       [--time-budget-ms N] [--no-golden]\n");
+          "       [--time-budget-ms N] [--no-golden] [--skip-attn-norms]\n"
+          "\n"
+          "  --skip-attn-norms  Bisection aid: drop the attention core's two\n"
+          "                     standalone aclnnRmsNorm stages. Changes the\n"
+          "                     math, forces --no-golden, and the verdict\n"
+          "                     becomes BISECT instead of PASS.\n");
       std::exit(0);
     } else {
       throw std::runtime_error("unknown option: " + argument);
@@ -298,6 +369,11 @@ Options ParseOptions(int argc, char** argv) {
   if (options.decode_steps < 1 || options.indexer_seq_len < 1) {
     throw std::runtime_error("--decode-steps and --indexer-seq-len must be >= 1");
   }
+  // Set after the loop so the two flags commute: --skip-attn-norms disables
+  // the parity gate whichever order they are given in. Comparing a run with
+  // the norms removed against the golden would gate on a number that is wrong
+  // by construction.
+  if (options.skip_attn_norms) options.golden = false;
   return options;
 }
 
@@ -1028,9 +1104,14 @@ int main(int argc, char** argv) {
     DSV4_REQUIRE(ops.runtime_reachable(),
                  "the aclnn runtime is not on this process's loader path; the operator entry points "
                  "are resolved out of the already-linked CANN libraries");
-    ops.RequireAll({OpId::kQuantMatmulV5, OpId::kRmsNorm, OpId::kApplyRotaryPosEmbV2,
-                    OpId::kFusedInferAttentionScoreV5, OpId::kMoeGatingTopKV2, OpId::kSwiGlu, OpId::kClamp,
-                    OpId::kCast, OpId::kMatmul, OpId::kMul, OpId::kInplaceAdd, OpId::kSoftplus, OpId::kSqrt});
+    std::vector<OpId> required{OpId::kQuantMatmulV5, OpId::kApplyRotaryPosEmbV2, OpId::kFusedInferAttentionScoreV5,
+                               OpId::kMoeGatingTopKV2, OpId::kSwiGlu, OpId::kClamp, OpId::kCast, OpId::kMatmul,
+                               OpId::kMul, OpId::kInplaceAdd, OpId::kSoftplus, OpId::kSqrt};
+    // kRmsNorm is required exactly when a stage will plan it. Under
+    // --skip-attn-norms no stage does, and demanding the symbol anyway would
+    // make the inventory fail for an operator the run never reaches.
+    if (!options.skip_attn_norms) required.push_back(OpId::kRmsNorm);
+    ops.RequireAll(required);
 
     AclnnGraph graph(ops);
     DescriptorBag bag;
@@ -1273,16 +1354,20 @@ int main(int argc, char** argv) {
       plan->q_a = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wq_a", OpId::kQuantMatmulV5, t_h_fp8, t_wq_a, t_h_scale_f32, t_wq_a_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_a);
-      plan->q_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: q_norm", OpId::kRmsNorm, t_q_a, t_q_norm_w,
-                                                            kRmsEpsilon, t_q_normed, t_rstd);
+      if (!options.skip_attn_norms) {
+        plan->q_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: q_norm", OpId::kRmsNorm, t_q_a, t_q_norm_w,
+                                                              kRmsEpsilon, t_q_normed, t_rstd);
+      }
       plan->q_b = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wq_b", OpId::kQuantMatmulV5, t_q_fp8, t_wq_b, t_q_scale_f32, t_wq_b_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_q_flat);
       plan->kv_proj = &graph.Plan<ascend_moe::QuantMatmulV5PlanFn>(
           "attn: wkv", OpId::kQuantMatmulV5, t_h_fp8, t_wkv, t_h_scale_f32, t_wkv_s, nullptr, nullptr, nullptr,
           nullptr, nullptr, false, true, options.dense_group_size, t_kv);
-      plan->kv_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: kv_norm", OpId::kRmsNorm, t_kv, t_kv_norm_w,
-                                                             kRmsEpsilon, t_kv, t_rstd);
+      if (!options.skip_attn_norms) {
+        plan->kv_norm = &graph.Plan<ascend_moe::RmsNormPlanFn>("attn: kv_norm", OpId::kRmsNorm, t_kv, t_kv_norm_w,
+                                                               kRmsEpsilon, t_kv, t_rstd);
+      }
       plan->rope = &graph.Plan<ascend_moe::ApplyRotaryPosEmbV2PlanFn>(
           "attn: rope", OpId::kApplyRotaryPosEmbV2, t_q_rope, t_k_rope, t_rope_cos, t_rope_sin, kRotaryLayoutBsnd,
           kRotaryModeHalf);
@@ -1365,16 +1450,36 @@ int main(int argc, char** argv) {
       // timeline.Add() drop accordingly -- two fewer enqueues per site, since
       // each quantizer replaced two aclnn stages.
       const auto start = Clock::now();
+      int aclnn_launches = 0;
       block_quant("bf16_block_quant_fp8: h_norm", h_norm, kHiddenSize, a_h_fp8, a_h_scale_f32);
       graph.Launch(*plan.kv_proj, stream);
-      graph.Launch(*plan.kv_norm, stream);
+      ++aclnn_launches;
+      // kv_norm normalizes a_kv in place, so skipping it simply leaves the
+      // raw projection in the buffer that RoPE and the ring append read.
+      if (plan.kv_norm != nullptr) {
+        graph.Launch(*plan.kv_norm, stream);
+        ++aclnn_launches;
+      }
       if (!warm) {
         graph.Launch(*plan.q_a, stream);
-        graph.Launch(*plan.q_norm, stream);
-        block_quant("bf16_block_quant_fp8: q_normed", a_q_normed, kQLoraRank, a_q_fp8, a_q_scale_f32);
+        ++aclnn_launches;
+        // q_norm is the only writer of a_q_normed. With it skipped that
+        // buffer is never initialized, so the quantizer must read q_a
+        // directly rather than quantize whatever the arena happens to hold.
+        const void* q_source = a_q_a;
+        if (plan.q_norm != nullptr) {
+          graph.Launch(*plan.q_norm, stream);
+          ++aclnn_launches;
+          q_source = a_q_normed;
+        }
+        block_quant(plan.q_norm != nullptr ? "bf16_block_quant_fp8: q_normed"
+                                           : "bf16_block_quant_fp8: q_a (norm skipped)",
+                    q_source, kQLoraRank, a_q_fp8, a_q_scale_f32);
         graph.Launch(*plan.q_b, stream);
+        ++aclnn_launches;
       }
       graph.Launch(*plan.rope, stream);
+      ++aclnn_launches;
 
       // The ring append: position p overwrites row p mod 128. A straight D2D
       // copy of the normed, rotated KV row -- no aclnnScatterPaKvCache,
@@ -1387,24 +1492,44 @@ int main(int argc, char** argv) {
 
       if (!warm) {
         graph.Launch(*plan.attention, stream);
+        ++aclnn_launches;
         block_quant("bf16_block_quant_fp8: attn_out", a_attn_out, kAttnQkvWidth, a_attn_fp8, a_attn_scale_f32);
-        for (PipelineStage* group : plan.o_group) graph.Launch(*group, stream);
+        for (PipelineStage* group : plan.o_group) {
+          graph.Launch(*group, stream);
+          ++aclnn_launches;
+        }
         block_quant("bf16_block_quant_fp8: o_mid", a_o_mid, kWoAOutput, a_o_fp8, a_o_scale_f32);
         graph.Launch(*plan.o_b, stream);
+        ++aclnn_launches;
       }
       DSV4_ACL_CHECK(aclrtSynchronizeStream(stream));
-      // aclnn enqueues only: 3 on a warm token (kv_proj, kv_norm, rope) and
-      // 7 + kOGroups on a full one (+ q_a, q_norm, q_b, attention, o_b). The
-      // four quantizers that used to contribute 8 of these enqueues are now
-      // arch35 launches with their own rows.
+      // aclnn enqueues only, counted as they happen rather than asserted as a
+      // literal: a warm token runs kv_proj, kv_norm and rope, a full one adds
+      // q_a, q_norm, q_b, attention, kOGroups o-groups and o_b, and
+      // --skip-attn-norms removes kv_norm and q_norm from both. The four
+      // quantizers that used to contribute 8 of these enqueues are now arch35
+      // launches with their own rows. (The literal this replaces said
+      // 7 + kOGroups for a full token and was one short of the eight
+      // graph.Launch calls on that path.)
       timeline.Add(warm ? "attention: KV warmup (aclnn)" : "attention: shared-KV SWA (aclnn)",
-                   MicrosecondsSince(start), warm ? 3 : 7 + kOGroups, false);
+                   MicrosecondsSince(start), aclnn_launches, false);
     };
 
     // =======================================================================
     // [2] run
     // =======================================================================
     std::printf("\n[2] running the pipeline on NPU (device %d)\n", options.device_id);
+    if (options.skip_attn_norms) {
+      std::printf(
+          "\n"
+          "    *** --skip-attn-norms: THIS RUN DOES NOT COMPUTE THE MODEL ***\n"
+          "    The attention core's q_norm and kv_norm aclnnRmsNorm stages are\n"
+          "    not planned and not launched. q_a reaches wq_b unnormalized and\n"
+          "    the KV row reaches RoPE and the cache unnormalized, so every\n"
+          "    activation printed below is wrong by construction. Golden parity\n"
+          "    is disabled and the verdict is BISECT, never PASS. Use this only\n"
+          "    to find out what fails downstream of the norms.\n\n");
+    }
 
     AttentionPlan layer0_attention;
     AttentionPlan layer2_attention;
@@ -1968,6 +2093,11 @@ int main(int argc, char** argv) {
     std::printf("    all values finite       %s\n", all_finite ? "yes" : "NO");
 
     bool parity_ok = true;
+    if (options.skip_attn_norms) {
+      std::printf(
+          "    golden parity NOT EVALUATED: --skip-attn-norms removed q_norm and\n"
+          "    kv_norm, so the activations above are not the model's output.\n");
+    }
     if (options.golden) {
       const Golden golden = ReadGolden(golden_path);
       if (!golden.present) {
@@ -2029,6 +2159,16 @@ int main(int argc, char** argv) {
     graph.Reset();
 
     const bool ok = all_finite && parity_ok && time_ok;
+    if (options.skip_attn_norms) {
+      // Deliberately not PASS and deliberately not 0. A bisection run that
+      // reached the end proved only that nothing downstream of the norms
+      // faulted; exiting 0 would let it satisfy a gate it has not met.
+      std::printf(
+          "\n  semi-end-to-end multi-layer decode on NPU: BISECT"
+          " (--skip-attn-norms; stages downstream of q_norm/kv_norm %s)\n",
+          ok ? "completed" : "did not complete");
+      return 7;
+    }
     std::printf("\n  semi-end-to-end multi-layer decode on NPU: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 6;
   });
