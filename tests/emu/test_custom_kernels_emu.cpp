@@ -769,10 +769,10 @@ void VerifyIndexerSelectionNetwork(Report& rep) {
 //     bounded on BOTH sides. The two are not interchangeable, and the
 //     prototype this operator descends from had both halves inverted.
 //
-// The simulation below transcribes the kernel's indexing -- same lane split,
-// same per-group scale fetch, same in-register butterfly order -- and
-// compares against moe_expert_swiglu_mxfp4_cpu, the oracle the kernel's own
-// header names.
+// The simulation below transcribes the kernel's indexing -- same
+// group-to-lane map, same uint4 word unpacking, same per-group scale fetch,
+// same in-register butterfly order -- and compares against
+// moe_expert_swiglu_mxfp4_cpu, the oracle the kernel's own header names.
 // ===========================================================================
 void VerifyDsv4MoeExpertSimt(Report& rep) {
   section("dsv4_moe_expert: lane indexing and asymmetric clamp (host simulation)");
@@ -781,15 +781,24 @@ void VerifyDsv4MoeExpertSimt(Report& rep) {
   constexpr std::uint32_t kLanesPerRow = 16;
   constexpr int kGroup = moe::emu::kMxfp4GroupSize;
   // A reduced geometry, but NOT an arbitrary one. The lane decomposition
-  // needs pairs_per_lane = cols/32 to be a multiple of 16, i.e.
-  // cols % 512 == 0; below that, pairs_per_lane/16 is zero, every lane's
-  // group loop body never runs and the GEMV silently returns zero. 256/128
-  // fails that and produced exactly that all-zero result when this test was
-  // first written. MakeDsv4MoeExpertTiling admits only 4096/2048, so the
-  // kernel cannot be reached with a bad width -- this is the smallest pair
-  // that exercises the same decomposition.
+  // needs the row's group count to be a whole multiple of the 16 lanes, i.e.
+  // cols % 512 == 0 (kDsv4ExpertReductionQuantum); below that
+  // groups_per_lane floors to zero, every lane's step loop body never runs
+  // and the GEMV silently returns zero. 256/128 fails that and produced
+  // exactly that all-zero result when this test was first written.
+  // Dsv4ExpertGeometryAdmissible() is what keeps a bad width away from the
+  // kernel -- this is the smallest pair that exercises the decomposition.
+  //
+  // Both widths are 1024, not 1024/512, and that is load-bearing: the
+  // group-to-lane map is  g = step * 16 + lane  with
+  // groups_per_lane = (cols/32)/16, so at cols = 512 groups_per_lane is 1 and
+  // the map degenerates to g = lane -- which is EXACTLY what the old
+  // contiguous-block map g = lane * groups_per_lane + step also reduces to.
+  // A 512-wide reduction therefore cannot tell the two geometries apart. 1024
+  // gives groups_per_lane = 2, the smallest width at which they differ, on
+  // BOTH the gate/up legs (cols = hidden) and the down leg (cols = inter).
   constexpr int kHidden = 1024;
-  constexpr int kInter = 512;
+  constexpr int kInter = 1024;
   constexpr float kLimit = moe::emu::kSwigluLimit;
 
   Rng rng(0xD5040001ULL);
@@ -828,29 +837,104 @@ void VerifyDsv4MoeExpertSimt(Report& rep) {
                                         &scratch);
 
   // --- the kernel's own decomposition -----------------------------------
-  // LaneRowPartial, transcribed. `cols` is logical; the lane walks pairs.
+  // The coalesced geometry, transcribed. Two things are being simulated here
+  // and neither needs hardware (CLAUDE.md §5.5):
+  //
+  //   1. the group-to-lane map  g = step * 16 + lane, replacing the old
+  //      contiguous-block map  g = lane * groups_per_lane + step;
+  //   2. the uint4 word unpacking -- the device issues ONE 16 B asc_ldca per
+  //      group and then slices four 32-bit words, so the nibble order now
+  //      runs through a word shift rather than straight off a byte pointer.
+  //
+  // (2) is the part most likely to be wrong the first time: a swapped word
+  // order or a wrong shift still compiles for dav-3510 and still produces
+  // plausible-looking numbers.
+  constexpr std::uint32_t kGroupCols = 32u;   // logical columns per scale group
+  constexpr std::uint32_t kGroupBytes = 16u;  // = one uint4
+
+  // GroupDot, transcribed. The four 32-bit words of the uint4 are
+  // little-endian, so word w is packed_group[4w..4w+3], low byte first.
+  const auto group_dot = [](const std::uint8_t* packed_group,
+                            const float* x_group) {
+    float acc = 0.0F;
+    for (std::uint32_t w = 0; w < 4u; ++w) {
+      std::uint32_t word = 0;
+      for (std::uint32_t b = 0; b < 4u; ++b) {
+        word |= static_cast<std::uint32_t>(packed_group[4u * w + b]) << (8u * b);
+      }
+      const float* xp = x_group + 8u * w;  // word w holds 8 logical columns
+      for (std::uint32_t j = 0; j < 4u; ++j) {
+        const std::uint32_t by = (word >> (8u * j)) & 0xFFu;
+        acc += moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>(by & 0xFu)) *
+                   xp[2u * j] +
+               moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>((by >> 4u) & 0xFu)) *
+                   xp[2u * j + 1u];
+      }
+    }
+    return acc;
+  };
+
+  // LaneRowPartial, transcribed.
   const auto lane_partial = [&](const std::uint8_t* packed_row,
                                 const std::uint8_t* scale_row, std::uint32_t lane,
                                 std::uint32_t cols, const float* in) {
-    const std::uint32_t pairs_per_lane = (cols / 2u) / kLanesPerRow;
-    const std::uint32_t lane_group_base = (lane * pairs_per_lane) / 16u;
+    const std::uint32_t groups_per_lane = (cols / kGroupCols) / kLanesPerRow;
     float total = 0.0F;
-    for (std::uint32_t g = 0; g < pairs_per_lane / 16u; ++g) {
-      const float scale = std::ldexp(
-          1.0F, static_cast<int>(scale_row[lane_group_base + g]) - 127);
-      float partial = 0.0F;
-      const std::uint32_t p0 = lane * pairs_per_lane + g * 16u;
-      for (std::uint32_t q = 0; q < 16u; ++q) {
-        const std::uint32_t p = p0 + q;
-        const std::uint8_t byte = packed_row[p];
-        partial +=
-            moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>(byte & 0xFu)) * in[2u * p] +
-            moe::emu::DecodeFp4E2M1(static_cast<std::uint8_t>(byte >> 4u)) * in[2u * p + 1u];
-      }
-      total += partial * scale;
+    for (std::uint32_t step = 0; step < groups_per_lane; ++step) {
+      const std::uint32_t g = step * kLanesPerRow + lane;
+      const float scale =
+          std::ldexp(1.0F, static_cast<int>(scale_row[g]) - 127);
+      const float partial =
+          group_dot(packed_row + g * kGroupBytes, in + g * kGroupCols);
+      total += partial * scale;  // scale once per group, after the subtotal
     }
     return total;
   };
+
+  // --- check 0: the group-to-lane map is a bijection ---------------------
+  // The optimization's whole premise is an address pattern, so the address
+  // pattern is asserted directly rather than inferred from the fact that the
+  // numbers came out close. Two properties:
+  //
+  //   coverage: every group of the row is visited exactly once across the 16
+  //   lanes -- a dropped group is a silently wrong answer, and a group
+  //   visited twice is double-counted;
+  //
+  //   coalescing: within one warp step the 16 lanes' packed addresses are
+  //   16 B apart and ascending, i.e. the load quantum equals the lane
+  //   stride, which is what makes a warp step span one contiguous 256 B run.
+  {
+    bool coverage_ok = true;
+    bool coalesced_ok = true;
+    for (const std::uint32_t cols : {static_cast<std::uint32_t>(kHidden),
+                                     static_cast<std::uint32_t>(kInter)}) {
+      const std::uint32_t groups = cols / kGroupCols;
+      const std::uint32_t groups_per_lane = groups / kLanesPerRow;
+      std::vector<int> visits(groups, 0);
+      for (std::uint32_t step = 0; step < groups_per_lane; ++step) {
+        for (std::uint32_t lane = 0; lane < kLanesPerRow; ++lane) {
+          const std::uint32_t g = step * kLanesPerRow + lane;
+          if (g >= groups) {
+            coverage_ok = false;
+            continue;
+          }
+          ++visits[g];
+          // Lane l's byte offset against lane 0's, same step.
+          const std::uint32_t base = step * kLanesPerRow * kGroupBytes;
+          if (g * kGroupBytes != base + lane * kGroupBytes) coalesced_ok = false;
+        }
+      }
+      for (const int v : visits) {
+        if (v != 1) coverage_ok = false;
+      }
+    }
+    rep.check(coverage_ok,
+              "every scale group is owned by exactly one lane, exactly once",
+              "the group-to-lane map drops or double-counts a group");
+    rep.check(coalesced_ok,
+              "a warp step's 16 lanes read 16 B apart (contiguous 256 B run)",
+              "lane stride does not equal the uint4 load quantum");
+  }
   // The in-register butterfly: xor masks 1, 2, 4, 8 over the row's 16 lanes.
   const auto reduce_row = [](std::vector<float> lanes) {
     for (std::uint32_t mask : {1u, 2u, 4u, 8u}) {
@@ -896,29 +980,38 @@ void VerifyDsv4MoeExpertSimt(Report& rep) {
     const std::uint32_t groups = static_cast<std::uint32_t>(kHidden) / kGroup;
     for (int r = 0; r < kInter; ++r) {
       // Re-walk the row to accumulate sum|group subtotal|, the addends both
-      // summations share.
+      // summations share. Walked in plain group order, not lane order: this
+      // quantity sums over the row's groups, and the group-to-lane map is a
+      // bijection (check 0), so which lane owns which group cannot change it.
+      // Carried in double because it is bounding the FP32 result's error.
       double abs_groups = 0.0;
-      for (std::uint32_t l = 0; l < kLanesPerRow; ++l) {
-        const std::uint32_t pairs_per_lane =
-            (static_cast<std::uint32_t>(kHidden) / 2u) / kLanesPerRow;
-        const std::uint32_t lane_group_base = (l * pairs_per_lane) / 16u;
-        for (std::uint32_t g = 0; g < pairs_per_lane / 16u; ++g) {
-          const std::uint8_t* prow =
-              w1.packed + static_cast<std::size_t>(r) * (kHidden / 2);
-          const std::uint8_t* srow =
-              w1.scale + static_cast<std::size_t>(r) * (kHidden / kGroup);
+      {
+        const std::uint8_t* prow =
+            w1.packed + static_cast<std::size_t>(r) * (kHidden / 2);
+        const std::uint8_t* srow =
+            w1.scale + static_cast<std::size_t>(r) * (kHidden / kGroup);
+        for (std::uint32_t g = 0; g < groups; ++g) {
           const double scale =
-              std::ldexp(1.0, static_cast<int>(srow[lane_group_base + g]) - 127);
+              std::ldexp(1.0, static_cast<int>(srow[g]) - 127);
+          // Same word/nibble order as group_dot, in double.
           double partial = 0.0;
-          const std::uint32_t p0 = l * pairs_per_lane + g * 16u;
-          for (std::uint32_t q = 0; q < 16u; ++q) {
-            const std::uint8_t byte = prow[p0 + q];
-            partial += static_cast<double>(moe::emu::DecodeFp4E2M1(
-                           static_cast<std::uint8_t>(byte & 0xFu))) *
-                           x[static_cast<std::size_t>(2u * (p0 + q))] +
-                       static_cast<double>(moe::emu::DecodeFp4E2M1(
-                           static_cast<std::uint8_t>(byte >> 4u))) *
-                           x[static_cast<std::size_t>(2u * (p0 + q) + 1u)];
+          const std::uint8_t* pg = prow + g * 16u;
+          for (std::uint32_t w = 0; w < 4u; ++w) {
+            std::uint32_t word = 0;
+            for (std::uint32_t b = 0; b < 4u; ++b) {
+              word |= static_cast<std::uint32_t>(pg[4u * w + b]) << (8u * b);
+            }
+            const std::size_t xb =
+                static_cast<std::size_t>(g) * 32u + static_cast<std::size_t>(w) * 8u;
+            for (std::uint32_t j = 0; j < 4u; ++j) {
+              const std::uint32_t by = (word >> (8u * j)) & 0xFFu;
+              partial += static_cast<double>(moe::emu::DecodeFp4E2M1(
+                             static_cast<std::uint8_t>(by & 0xFu))) *
+                             x[xb + 2u * j] +
+                         static_cast<double>(moe::emu::DecodeFp4E2M1(
+                             static_cast<std::uint8_t>((by >> 4u) & 0xFu))) *
+                             x[xb + 2u * j + 1u];
+            }
           }
           abs_groups += std::fabs(partial * scale);
         }
@@ -1003,17 +1096,30 @@ void VerifyDsv4MoeExpertSimt(Report& rep) {
               "cosine " + std::to_string(cosine));
   }
 
-  // The lane/group alignment the kernel assumes, stated as its own check: a
-  // lane's pair range must start on a 16-pair group boundary, or its single
-  // scale fetch per group would apply the wrong exponent to part of the range.
+  // The two width properties the coalesced geometry assumes, stated as their
+  // own checks over both the simulated widths and the production pair.
+  //
+  //   (a) the row's group count divides evenly across the 16 lanes, so every
+  //       warp step is full and no group is dropped;
+  //   (b) every row base is 16 B aligned, which the uint4 asc_ldca requires.
+  //       The row base is row * (cols/2), so this is a property of the WIDTH:
+  //       cols % 512 == 0 makes cols/2 a multiple of 256. Nothing else in the
+  //       kernel enforces it, and a misaligned 16 B load is not a wrong
+  //       answer but a fault.
   bool aligned = true;
+  bool row_base_aligned = true;
   for (int cols : {kHidden, kInter, 4096, 2048}) {
-    const std::uint32_t pairs_per_lane =
-        (static_cast<std::uint32_t>(cols) / 2u) / kLanesPerRow;
-    aligned = aligned && (pairs_per_lane % 16u == 0u);
+    const std::uint32_t groups = static_cast<std::uint32_t>(cols) / 32u;
+    aligned = aligned && (groups % kLanesPerRow == 0u);
+    const std::uint32_t packed_row_stride = static_cast<std::uint32_t>(cols) / 2u;
+    row_base_aligned = row_base_aligned && (packed_row_stride % 16u == 0u);
   }
-  rep.check(aligned, "every lane's pair range starts on a 16-pair scale group",
-            "a lane straddles two E8M0 groups but fetches only one scale");
+  rep.check(row_base_aligned,
+            "every packed row base is 16 B aligned for the uint4 group load",
+            "a row stride is not a multiple of 16, so asc_ldca(uint4*) would "
+            "be misaligned");
+  rep.check(aligned, "the row's group count divides evenly across the 16 lanes",
+            "a warp step would be partial, so some group is never summed");
 
   // The clamp is asymmetric, and the two halves are not interchangeable.
   {

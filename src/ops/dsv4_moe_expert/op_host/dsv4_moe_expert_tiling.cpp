@@ -11,20 +11,13 @@ Status MakeDsv4MoeExpertTiling(std::uint32_t hidden, std::uint32_t inter,
   if (out == nullptr) {
     return Status::invalid_argument;
   }
-  // v1 geometry: the DeepSeek-V4-Flash routed expert, hidden_size = 4096 and
-  // moe_intermediate_size = 2048. w1/w3 are [inter, hidden], w2 is
-  // [hidden, inter]. Anything else is a geometry v1 does not implement, not a
-  // caller mistake (§2.6).
-  //
-  // This guard is load-bearing beyond "v1 scope". The kernel's lane
-  // decomposition gives each of a row's 16 lanes pairs_per_lane = cols/32
-  // pairs and fetches one E8M0 scale per 16 pairs, so it requires
-  // cols % 512 == 0 on BOTH reduction widths. Below that, pairs_per_lane/16
-  // is zero, every lane's group loop never runs, and the GEMV returns zero
-  // with no error -- the silent-wrong-answer case §2.5 describes. Both 4096
-  // and 2048 satisfy it; the host simulation in tests/emu checks the same
-  // property directly.
-  if (hidden != 4096u || inter != 2048u) {
+  // w1/w3 are [inter, hidden], w2 is [hidden, inter]. The admissible set and
+  // the reason the reduction quantum is load-bearing both live on
+  // Dsv4ExpertGeometryAdmissible() in the header, which the kernel's
+  // TilingRejected() backstop consumes verbatim. This is the GATE (§2.5):
+  // the kernel can only reject by returning early, which produces a zeroed
+  // output rather than an error.
+  if (!Dsv4ExpertGeometryAdmissible(hidden, inter)) {
     return Status::unsupported_shape;
   }
   // Exact strides. Never infer a shared FP8-style 128x128 scale grid: these

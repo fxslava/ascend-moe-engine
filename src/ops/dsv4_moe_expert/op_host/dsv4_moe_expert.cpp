@@ -83,9 +83,12 @@ Status LaunchDsv4MoeExpert(
   const std::uint64_t down_ub = Dsv4ExpertDownDynUbBytes(tiling.inter);
   if (gate_up_ub > kDsv4ExpertDynUbCeilingBytes ||
       down_ub > kDsv4ExpertDynUbCeilingBytes) {
-    // Unreachable for the one geometry MakeDsv4MoeExpertTiling admits, but
-    // the ceiling is part of the launch contract, so it is checked rather
-    // than assumed.
+    // Unreachable for the single production geometry, but live under
+    // DSV4_TILING_TEST_OVERRIDE, where MakeDsv4MoeExpertTiling admits any
+    // width meeting the reduction quantum and therefore no longer bounds
+    // xF32. This is the only place the UB ceiling is enforced -- the shared
+    // shape predicate deliberately leaves it out, because the byte-count
+    // helpers are host-space and the device backstop cannot call them.
     return Status::unsupported_shape;
   }
 

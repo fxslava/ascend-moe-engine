@@ -77,6 +77,86 @@ inline constexpr std::uint64_t Dsv4ExpertWorkspaceBytes(
 }
 
 // ---------------------------------------------------------------------------
+// Admissible geometry -- ONE predicate, both sides
+// ---------------------------------------------------------------------------
+// The kernel's lane decomposition hands each of a row's 16 lanes
+// cols/(16*2) pairs and fetches one E8M0 scale per 16 pairs, so it requires
+//
+//     cols % (kLanesPerRow * kDsv4ExpertGroupSize) == 0   i.e. cols % 512 == 0
+//
+// on BOTH reduction widths. Below that the per-lane group count floors to
+// zero, every lane's group loop never runs, and the GEMV returns zero with no
+// error -- the silent-wrong-answer case §2.5 describes.
+//
+// This predicate is the single definition of "admissible", consumed by
+// MakeDsv4MoeExpertTiling() (the gate, §2.5) and by the kernel's
+// TilingRejected() (the backstop). Keeping it in one place is the point:
+// expressed twice, the host gate and the device backstop drift, and a
+// geometry the host admits but the device rejects is exactly a zeroed output
+// with no error reported.
+//
+// 16 lanes per row is the kernel's private thread geometry
+// (op_kernel/dsv4_moe_expert_arch35.h, §1.2), so it is not imported here; the
+// quantum it implies is restated as a contract constant with its derivation.
+inline constexpr std::uint32_t kDsv4ExpertReductionQuantum = 512u;
+
+// The admissibility TEST, written once as a macro.
+//
+// It has to be a macro, not a function, because BiSheng partitions functions
+// by execution space and will not let one definition serve both: a plain
+// function is __host__ and the kernel's call to it fails with "call to
+// __host__ function from __aicore__ function", while an __aicore__ function is
+// equally invisible to MakeDsv4MoeExpertTiling(), which is host code in the
+// same ASC translation unit. Writing the condition twice is what this header
+// exists to prevent, so the condition lives in the macro and the two typed
+// wrappers below -- one per execution space, same name, same body -- are what
+// call sites actually use.
+//
+// This is the SHAPE contract only. The UB ceiling is deliberately not part of
+// it: the only path that allocates is LaunchDsv4MoeExpert(), which checks
+// kDsv4ExpertDynUbCeilingBytes against both entry points' footprints itself,
+// and the byte-count helpers above are host-space functions that an
+// __aicore__ wrapper cannot call (they would link as undefined symbols on the
+// device side).
+//
+// DSV4_TILING_TEST_OVERRIDE selects the SCALED-SIMULATION geometry: any width
+// satisfying the reduction quantum, so the dav-3510 CAModel suite can execute
+// the real kernel at a size the simulator finishes in seconds. No production
+// configuration defines it; only tests/sim/CMakeLists.txt does, and it defines
+// it for the BiSheng device TU and the host TUs alike so both sides agree.
+// Everything the quantum protects is still enforced -- only the fixed
+// 4096/2048 pin is relaxed.
+#if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
+#define MOE_DSV4_GEOMETRY_ADMISSIBLE(hidden, inter)                          \
+  ((hidden) >= ::moe::kernels::arch35::kDsv4ExpertReductionQuantum &&        \
+   (inter) >= ::moe::kernels::arch35::kDsv4ExpertReductionQuantum &&         \
+   (hidden) % ::moe::kernels::arch35::kDsv4ExpertReductionQuantum == 0u &&   \
+   (inter) % ::moe::kernels::arch35::kDsv4ExpertReductionQuantum == 0u)
+#else
+// v1 production geometry: DeepSeek-V4-Flash, hidden_size = 4096,
+// moe_intermediate_size = 2048. Anything else is a geometry v1 does not
+// implement, not a caller mistake (§2.6).
+#define MOE_DSV4_GEOMETRY_ADMISSIBLE(hidden, inter)                          \
+  ((hidden) == 4096u && (inter) == 2048u)
+#endif
+
+// Host wrapper. constexpr so the production pin folds at compile time.
+inline constexpr bool Dsv4ExpertGeometryAdmissible(
+    std::uint32_t hidden, std::uint32_t inter) noexcept {
+  return MOE_DSV4_GEOMETRY_ADMISSIBLE(hidden, inter);
+}
+
+#if defined(__CCE__)
+// Device wrapper -- same name, so the kernel's call site is identical and
+// BiSheng picks this one by execution space. Not constexpr: the inputs are
+// read from the tiling POD in GM at run time.
+__aicore__ inline bool Dsv4ExpertGeometryAdmissible(std::uint32_t hidden,
+                                                    std::uint32_t inter) {
+  return MOE_DSV4_GEOMETRY_ADMISSIBLE(hidden, inter);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // sizeof == 56
 // ---------------------------------------------------------------------------
 struct Dsv4MoeExpertTilingData {

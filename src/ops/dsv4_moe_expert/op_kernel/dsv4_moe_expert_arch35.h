@@ -65,6 +65,22 @@ inline constexpr std::uint32_t kRowsPerTile = 32;  // one tile per SIMT launch
 inline constexpr std::uint32_t kLanesPerRow = 16;  // 512 threads / 32 rows
 inline constexpr std::uint32_t kGroupSize = 32;
 
+// One scale group is 32 logical columns = 16 MXFP4 pairs = 16 packed bytes,
+// which is exactly one `uint4` -- so a group's weights are ONE asc_ldca, and
+// a lane's load quantum equals its stride between lanes. That identity is
+// what makes the warp's 16 group loads cover 256 contiguous bytes; see the
+// coalescing note in the kernel.
+inline constexpr std::uint32_t kGroupBytes = kGroupSize / 2;  // 16
+static_assert(kGroupBytes == 16,
+              "a scale group must be exactly one uint4 of packed nibbles");
+
+// Groups consumed per warp step: lane l takes group s*16 + l, so one step of
+// the 16 lanes spans 16 consecutive groups.
+inline constexpr std::uint32_t kGroupsPerWarpStep = kLanesPerRow;
+inline constexpr std::uint32_t kWarpStepBytes = kGroupsPerWarpStep * kGroupBytes;
+static_assert(kWarpStepBytes == 256,
+              "one warp step must span 256 contiguous packed bytes");
+
 inline constexpr std::uint32_t kHiddenMax = 4096;
 inline constexpr std::uint32_t kInterMax = 2048;
 

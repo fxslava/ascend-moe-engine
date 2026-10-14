@@ -45,6 +45,110 @@ namespace moe::kernels::arch35::dsv4_moe_expert {
 
 using namespace AscendC;
 
+// ---------------------------------------------------------------------------
+// Lane geometry: one scale group per lane per step, groups interleaved
+// ---------------------------------------------------------------------------
+// Lane l takes group  g = s * 16 + l  on step s, so the 16 lanes of a row
+// cover 16 CONSECUTIVE groups per step. Because a group is exactly 16 packed
+// bytes (kGroupBytes) and is fetched by a single uint4 asc_ldca, the stride
+// between lanes equals the load quantum:
+//
+//   lane l address = row_base + s*256 + l*16        (16 B apart, 16 B wide)
+//   warp step shift = 16 * 16 B = 256 B             (kWarpStepBytes)
+//
+// so one warp-wide load instruction touches 256 contiguous bytes = two
+// 128 B DataCache lines, with every fetched byte consumed. The scale bytes
+// are read at `scale_row + g`, i.e. 16 CONSECUTIVE bytes across the warp,
+// one line.
+//
+// The previous geometry gave each lane a contiguous BLOCK of groups
+// (p0 = lane * pairs_per_lane + g * 16): at hidden = 4096 that put adjacent
+// lanes 128 B apart, so a single warp-wide byte load straddled 16 distinct
+// cache lines and used 1 of every 128 fetched bytes. See the transaction
+// accounting in docs/.
+//
+// WHAT DID NOT CHANGE, and must not: a group is still owned END TO END by
+// ONE lane, its 16 pairs are still summed in ascending column order into a
+// register partial, and the E8M0 scale is still applied ONCE to that
+// subtotal before it joins the lane total. So each group's partial is bit
+// identical to the previous geometry's; only WHICH lane holds which group
+// changes, which permutes the leaves of the butterfly below. Had the group
+// been split across lanes instead, the scale could no longer be applied
+// after the subtotal without extra in-loop shuffles, and the oracle's
+// grouping would be gone.
+//
+// The host gate guarantees cols % 512 == 0 (kDsv4ExpertReductionQuantum), so
+// num_groups is always a whole multiple of the 16 lanes and there is no
+// partial warp step to handle. It also makes every row base 16 B aligned --
+// cols/2 is a multiple of 256 -- which the uint4 loads require.
+
+// Eight logical columns (one 32-bit packed word = 4 pairs) of BOTH legs,
+// sharing the two x reads. This is where the W1/W3 fusion actually pays:
+// x_even and x_odd are read from UB once and feed both accumulators, instead
+// of each leg sweeping x on its own.
+//
+// Accumulation shape is deliberately `acc += D(lo)*x_even + D(hi)*x_odd` per
+// pair, pair by pair -- the same expression and the same order as the
+// one-byte-at-a-time loop it replaces, so the group subtotal is bit
+// identical rather than merely close.
+__simt_callee__ __aicore__ inline void WordDotGateUp(
+    std::uint32_t w1_word, std::uint32_t w3_word, __ubuf__ const float* xp,
+    float& gate_partial, float& up_partial) {
+  for (std::uint32_t j = 0; j < 4u; ++j) {
+    const std::uint32_t shift = 8u * j;
+    const std::uint32_t b1 = (w1_word >> shift) & 0xFFu;
+    const std::uint32_t b3 = (w3_word >> shift) & 0xFFu;
+    const float x_even = xp[2u * j];
+    const float x_odd = xp[2u * j + 1u];
+    // kMxfp4LowNibbleFirst: even logical column in bits 0..3.
+    gate_partial +=
+        DecodeFp4E2M1(b1 & 0xFu) * x_even + DecodeFp4E2M1(b1 >> 4u) * x_odd;
+    up_partial +=
+        DecodeFp4E2M1(b3 & 0xFu) * x_even + DecodeFp4E2M1(b3 >> 4u) * x_odd;
+  }
+}
+
+// Single-leg form, for the down pass.
+__simt_callee__ __aicore__ inline void WordDot(std::uint32_t word,
+                                               __ubuf__ const float* xp,
+                                               float& partial) {
+  for (std::uint32_t j = 0; j < 4u; ++j) {
+    const std::uint32_t b = (word >> (8u * j)) & 0xFFu;
+    partial += DecodeFp4E2M1(b & 0xFu) * xp[2u * j] +
+               DecodeFp4E2M1(b >> 4u) * xp[2u * j + 1u];
+  }
+}
+
+// One 32-column scale group of both legs: two uint4 loads (one per leg), 16
+// pairs each, oracle order. Returns the UNSCALED subtotals; the caller
+// applies the group scales.
+__simt_callee__ __aicore__ inline void GroupDotGateUp(
+    __gm__ std::uint8_t* w1_group, __gm__ std::uint8_t* w3_group,
+    __ubuf__ const float* x_group, float& gate_partial, float& up_partial) {
+  const ::uint4 v1 = asc_ldca(reinterpret_cast<__gm__ ::uint4*>(w1_group));
+  const ::uint4 v3 = asc_ldca(reinterpret_cast<__gm__ ::uint4*>(w3_group));
+  float gate_acc = 0.0f;
+  float up_acc = 0.0f;
+  WordDotGateUp(v1.x, v3.x, x_group + 0u, gate_acc, up_acc);
+  WordDotGateUp(v1.y, v3.y, x_group + 8u, gate_acc, up_acc);
+  WordDotGateUp(v1.z, v3.z, x_group + 16u, gate_acc, up_acc);
+  WordDotGateUp(v1.w, v3.w, x_group + 24u, gate_acc, up_acc);
+  gate_partial = gate_acc;
+  up_partial = up_acc;
+}
+
+// One 32-column scale group, single leg. Unscaled subtotal.
+__simt_callee__ __aicore__ inline float GroupDot(
+    __gm__ std::uint8_t* packed_group, __ubuf__ const float* x_group) {
+  const ::uint4 v = asc_ldca(reinterpret_cast<__gm__ ::uint4*>(packed_group));
+  float acc = 0.0f;
+  WordDot(v.x, x_group + 0u, acc);
+  WordDot(v.y, x_group + 8u, acc);
+  WordDot(v.z, x_group + 16u, acc);
+  WordDot(v.w, x_group + 24u, acc);
+  return acc;
+}
+
 // One lane's share of a single MXFP4 GEMV row, scaled per 32-column group
 // exactly as the oracle groups it. Returns this lane's partial; the caller
 // reduces across the row's 16 lanes.
@@ -60,30 +164,55 @@ using namespace AscendC;
 //
 // The other four operators inline their intrinsics directly into the VF entry
 // and so never needed this; this operator runs the same GEMV row three times
-// (w1, w3, w2) across two entry points, which is worth one shared helper.
+// (w1, w3, w2) across two entry points, which is worth a shared helper.
+//
+// Since the gate/up legs were fused, THIS form serves only the down leg (w2);
+// w1 and w3 go through LaneRowPartialGateUp below, which is the same walk with
+// two accumulators. Both are kept rather than expressing the down leg as a
+// fused call against itself, which would double its weight traffic.
 __simt_callee__ __aicore__ inline float LaneRowPartial(
     __gm__ std::uint8_t* packed_row, __gm__ std::uint8_t* scale_row,
     __ubuf__ const float* x_ub, std::uint32_t lane, std::uint32_t cols) {
-  // The lane's contiguous block of pairs aligns exactly to 16-pair groups
-  // (32 logical columns, one E8M0 scale), so per group the lane touches
-  // exactly one scale byte.
-  const std::uint32_t pairs_per_lane = (cols / 2u) / kLanesPerRow;
-  const std::uint32_t lane_group_base = (lane * pairs_per_lane) / 16u;
+  const std::uint32_t groups_per_lane = (cols / kGroupSize) / kLanesPerRow;
   float total = 0.0f;
-  for (std::uint32_t g = 0; g < pairs_per_lane / 16u; ++g) {
-    const float scale = DecodeE8M0(asc_ldca(scale_row + lane_group_base + g));
-    float partial = 0.0f;
-    const std::uint32_t p0 = lane * pairs_per_lane + g * 16u;
-    for (std::uint32_t q = 0; q < 16u; ++q) {
-      const std::uint32_t p = p0 + q;
-      const std::uint32_t byte = asc_ldca(packed_row + p);
-      // kMxfp4LowNibbleFirst: even logical column in bits 0..3.
-      partial += DecodeFp4E2M1(byte & 0xFu) * x_ub[2u * p] +
-                 DecodeFp4E2M1(byte >> 4u) * x_ub[2u * p + 1u];
-    }
+  for (std::uint32_t step = 0; step < groups_per_lane; ++step) {
+    const std::uint32_t g = step * kGroupsPerWarpStep + lane;
+    const float scale = DecodeE8M0(asc_ldca(scale_row + g));
+    const float partial =
+        GroupDot(packed_row + g * kGroupBytes, x_ub + g * kGroupSize);
     total += partial * scale;  // scale once per 32-column group, as the oracle
   }
   return total;
+}
+
+// Both legs of the gate/up row in ONE sweep. The two decoupled
+// LaneRowPartial() calls this replaces issued two independent weight streams
+// and re-generated the same x addresses twice; here each x chunk is visited
+// once and feeds both accumulators, and gate_total / up_total stay in
+// registers across the whole reduction.
+__simt_callee__ __aicore__ inline void LaneRowPartialGateUp(
+    __gm__ std::uint8_t* w1_packed_row, __gm__ std::uint8_t* w1_scale_row,
+    __gm__ std::uint8_t* w3_packed_row, __gm__ std::uint8_t* w3_scale_row,
+    __ubuf__ const float* x_ub, std::uint32_t lane, std::uint32_t cols,
+    float& gate_total, float& up_total) {
+  const std::uint32_t groups_per_lane = (cols / kGroupSize) / kLanesPerRow;
+  float gate_acc = 0.0f;
+  float up_acc = 0.0f;
+  for (std::uint32_t step = 0; step < groups_per_lane; ++step) {
+    const std::uint32_t g = step * kGroupsPerWarpStep + lane;
+    const std::uint32_t byte_off = g * kGroupBytes;
+    // w1 and w3 share the group index, so they share the scale index too.
+    const float s1 = DecodeE8M0(asc_ldca(w1_scale_row + g));
+    const float s3 = DecodeE8M0(asc_ldca(w3_scale_row + g));
+    float gate_partial = 0.0f;
+    float up_partial = 0.0f;
+    GroupDotGateUp(w1_packed_row + byte_off, w3_packed_row + byte_off,
+                   x_ub + g * kGroupSize, gate_partial, up_partial);
+    gate_acc += gate_partial * s1;  // scale once per group, per leg
+    up_acc += up_partial * s3;
+  }
+  gate_total = gate_acc;
+  up_total = up_acc;
 }
 
 // Reduce a row's 16 lane partials in registers. The aligned 16-lane groups of
@@ -116,10 +245,16 @@ Dsv4ExpertGateUpTileSimt(__gm__ std::uint8_t* w1_packed, __gm__ std::uint8_t* w1
   if (global_row < inter) {
     const std::uint32_t packed_off = global_row * packed_row_stride;
     const std::uint32_t scale_off = global_row * scale_row_stride;
-    const float gate = ReduceRow(LaneRowPartial(
-        w1_packed + packed_off, w1_scale + scale_off, x_ub, lane, hidden));
-    const float up = ReduceRow(LaneRowPartial(
-        w3_packed + packed_off, w3_scale + scale_off, x_ub, lane, hidden));
+    float gate_lane = 0.0f;
+    float up_lane = 0.0f;
+    LaneRowPartialGateUp(w1_packed + packed_off, w1_scale + scale_off,
+                         w3_packed + packed_off, w3_scale + scale_off, x_ub,
+                         lane, hidden, gate_lane, up_lane);
+    // The butterfly is unchanged, and still runs once per leg: the fusion
+    // shares the SWEEP, not the reduction -- the two legs are independent
+    // sums and each needs its own 16-lane reduction.
+    const float gate = ReduceRow(gate_lane);
+    const float up = ReduceRow(up_lane);
     if (lane == 0u) {
       // ASYMMETRIC, per the file header: gate above only, up both ways.
       const float g = gate < limit ? gate : limit;
@@ -191,16 +326,22 @@ __aicore__ inline Geometry LoadGeometry(
 // (CLAUDE.md §2.5), which is why MakeDsv4MoeExpertTiling validates host-side
 // too -- this is the backstop, not the gate.
 __aicore__ inline bool TilingRejected(const __gm__ Dsv4MoeExpertTilingData* td) {
+  // Loaded into locals before the predicate call: a __gm__-qualified scalar
+  // lvalue does not take part in overload resolution against a plain
+  // std::uint32_t parameter ("no matching function"), the same address-space
+  // rule that forces LoadGeometry() to copy field by field.
+  const std::uint32_t hidden = td->hidden;
+  const std::uint32_t inter = td->inter;
   return td->abi_version != kTilingAbiVersion ||
          td->block_dim != kDsv4ExpertBlockDim ||
          td->rows_per_block != kRowsPerTile || td->group_size != kGroupSize ||
          td->low_nibble_first != 1u || td->reserved0 != 0u ||
-         td->reserved1 != 0u || td->hidden != kHiddenMax ||
-         td->inter != kInterMax ||
-         td->w13_packed_row_stride != td->hidden / 2u ||
-         td->w13_scale_row_stride != td->hidden / kGroupSize ||
-         td->w2_packed_row_stride != td->inter / 2u ||
-         td->w2_scale_row_stride != td->inter / kGroupSize;
+         td->reserved1 != 0u ||
+         !Dsv4ExpertGeometryAdmissible(hidden, inter) ||
+         td->w13_packed_row_stride != hidden / 2u ||
+         td->w13_scale_row_stride != hidden / kGroupSize ||
+         td->w2_packed_row_stride != inter / 2u ||
+         td->w2_scale_row_stride != inter / kGroupSize;
 }
 
 __aicore__ inline __gm__ std::uint8_t* Bytes(GM_ADDR p) {

@@ -16,7 +16,25 @@
 #include <vector>
 
 namespace {
-constexpr std::uint32_t kHidden = 512;
+// hidden is 1024, NOT 512, and that is load-bearing rather than arbitrary.
+//
+// The kernel's group-to-lane map is  g = step * 16 + lane  with
+// groups_per_lane = (cols/32)/16. At cols = 512 groups_per_lane is 1, so the
+// map degenerates to g = lane -- and the previous contiguous-block map,
+// g = lane * groups_per_lane + step, degenerates to exactly the same thing.
+// A 512-wide reduction therefore CANNOT distinguish the two geometries: run
+// both against this suite at 512 and the max-abs diffs agree bit for bit,
+// which looks like a pass and is really a blind spot.
+//
+// 1024 is the smallest admissible width (the quantum is 512) with
+// groups_per_lane = 2, where the maps genuinely differ, so the gate/up legs
+// -- which reduce over `hidden` and carry the fused W1/W3 sweep, the most
+// heavily rewritten path -- actually exercise the interleaving on device.
+//
+// `inter` stays 512 to hold the CAModel wall time near 2x rather than 4x;
+// the down leg's indexing is the same GroupDot walk, and the host simulation
+// in tests/emu covers both legs at groups_per_lane = 2 for free.
+constexpr std::uint32_t kHidden = 1024;
 constexpr std::uint32_t kInter = 512;
 constexpr std::uint32_t kGroup = 32;
 constexpr float kLimit = 10.0F;
