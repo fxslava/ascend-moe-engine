@@ -327,6 +327,113 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     BUILD_RPATH "${MOE_CANN_LIB_DIR}"
   )
 
+  # -------------------------------------------------------------------------
+  # Collapsed MULTI-CORE gate for the gang decode path
+  # -------------------------------------------------------------------------
+  # Same scaffolding as above, different kernel. It needs its own target
+  # because its sim TU also textually includes the production kernel, so the
+  # two sim objects define the same production __global__ entries and cannot
+  # be linked into one binary.
+  #
+  # This is the ONLY gate that executes the cross-core barrier: the prefill
+  # inductive gate above runs one core, where SyncAll is satisfied trivially.
+  set(_dsv4_decode_sim_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_block_decode_inductive_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_block_decode_inductive_launch.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
+    "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+  )
+  set(_dsv4_decode_sim_objects)
+  foreach(_source IN LISTS _dsv4_decode_sim_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_decode_sim_kernel/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_decode_sim_kernel"
+      COMMAND "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_decode_sim_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_decode_sim_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_block_decode_sim_kernel_objects
+                    DEPENDS ${_dsv4_decode_sim_objects})
+
+  add_executable(test_dsv4_moe_block_decode_inductive_sim
+    test_dsv4_moe_block_decode_inductive_sim.cpp
+    ${_dsv4_decode_sim_objects}
+  )
+  add_dependencies(test_dsv4_moe_block_decode_inductive_sim
+                   dsv4_moe_block_decode_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_block_decode_inductive_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_block_decode_inductive_sim
+                         PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_dsv4_moe_block_decode_inductive_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_block_decode_inductive_sim PRIVATE
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_block_decode_inductive_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+
+  # TIMEOUT 1800. MEASURED, 2026-10-15: this gate takes **426 s** at
+  # hidden = inter = 512, top_k = 2, aiv_count = 4 -> gang_size = 2,
+  # block_dim = 4, sampling 4 phase-1 and 5 phase-2 tiles per lane. The
+  # simulated task ran cycle 400 -> 88,883 and the run ended with all threads
+  # joined, zero excp_log*.dump files and the output guard band intact.
+  # 1800 s is ~4.2x headroom, in line with the sibling gates.
+  #
+  # IT IS FASTER THAN THE SINGLE-CORE PREFILL GATE (644 s) DESPITE RUNNING
+  # FOUR CORES, which is worth keeping because it is counter-intuitive and it
+  # is the third time a cost prediction for this simulator has been wrong.
+  # A pre-run estimate here reasoned "4 cores and ~213 K MACs per core against
+  # the prefill gate's 1 core and ~196 K, so it cannot be cheaper" and
+  # predicted >600 s. Observed 426 s. The error was the same one the note on
+  # Dsv4MoeBlockSim already records: extrapolating across suites. CAModel
+  # joins simulated threads in parallel, so added cores are close to free here
+  # and only the per-core trip count moved.
+  #
+  # Do NOT subtract the prefill gate's ~358 s fixed cost from this 426 s to
+  # infer a variable part: that figure was measured for a different suite and
+  # carrying it across is the very extrapolation that has now failed three
+  # times. If this gate's fixed cost is needed, measure it here by running at
+  # one sampled trip.
+  add_test(NAME Dsv4MoeBlockDecodeInductiveSim
+           COMMAND test_dsv4_moe_block_decode_inductive_sim)
+  set_tests_properties(Dsv4MoeBlockDecodeInductiveSim PROPERTIES
+    LABELS "sim;arch35;camodel;inductive;functional;gang"
+    TIMEOUT 1800
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
   # ISOLATION, ASSERTED rather than assumed: no production target may list a
   # tests/sim/kernel/ source. The whole point of the directory is that
   # verification scaffolding cannot reach a shipped artifact, and that holds
