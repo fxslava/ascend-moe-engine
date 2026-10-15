@@ -41,6 +41,29 @@ if(TARGET moe_emu)
     LABELS "sim;arch35;contract"
     TIMEOUT 30
   )
+
+  # The whole-block builders' SKU-aware grid derivation. Links the operator's
+  # own tiling source, as the expert tiler above does: these are host plumbing
+  # tests (section 4.3), and the tiling header is ACL-free by section 2.4 so
+  # neither needs a toolkit or a device.
+  add_executable(test_dsv4_moe_block_grid_sim
+    test_dsv4_moe_block_grid_sim.cpp
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
+  )
+  target_include_directories(test_dsv4_moe_block_grid_sim PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+  )
+  target_compile_options(test_dsv4_moe_block_grid_sim PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_block_grid_sim PRIVATE -Werror)
+  endif()
+  add_test(NAME Dsv4MoeBlockGridTiling
+           COMMAND test_dsv4_moe_block_grid_sim)
+  set_tests_properties(Dsv4MoeBlockGridTiling PROPERTIES
+    LABELS "sim;arch35;contract"
+    TIMEOUT 30
+  )
 endif()
 
 option(ENABLE_DSV4_CAMODEL_TEST

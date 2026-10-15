@@ -2,9 +2,9 @@
 // DeepSeek-V4 routed experts (Ascend 950PR, arch35 / dav-3510, hybrid
 // SIMD/SIMT).
 //
-//   dsv4_moe_decode_topk      M = 1,  one AIV per routed expert slot,
+//   dsv4_moe_decode_topk      M = 1,  a GANG of AIVs per routed expert slot,
 //                             router-weighted atomic accumulation into y
-//   dsv4_moe_prefill_batched  M >> 1, 32 AIVs grid-striding over tokens
+//   dsv4_moe_prefill_batched  M >> 1, every AIV grid-striding over tokens
 //
 // Oracle: src/emu/moe_block.cpp :: moe_decode_topk_mxfp4_cpu and
 // moe_prefill_batched_mxfp4_cpu, both of which compose
@@ -282,6 +282,7 @@ struct Geometry {
   std::uint32_t num_experts;
   std::uint32_t top_k;
   std::uint32_t total_tokens;
+  std::uint32_t gang_size;
   std::uint32_t w13_packed_row_stride;
   std::uint32_t w13_scale_row_stride;
   std::uint32_t w2_packed_row_stride;
@@ -302,6 +303,7 @@ __aicore__ inline Geometry LoadGeometry(
   g.num_experts = tiling->num_experts;
   g.top_k = tiling->top_k;
   g.total_tokens = tiling->total_tokens;
+  g.gang_size = tiling->gang_size;
   g.w13_packed_row_stride = tiling->w13_packed_row_stride;
   g.w13_scale_row_stride = tiling->w13_scale_row_stride;
   g.w2_packed_row_stride = tiling->w2_packed_row_stride;
@@ -334,6 +336,10 @@ __aicore__ inline bool TilingRejected(const __gm__ Dsv4MoeBlockTilingData* td,
          td->group_size != kGroupSize || td->low_nibble_first != 1u ||
          td->num_experts == 0u || td->top_k == 0u ||
          td->total_tokens == 0u ||
+         // The decode kernel DIVIDES GetBlockIdx() by this, so a zero is a
+         // fault rather than a wrong answer. Reject it here instead of
+         // trusting that the host filled it.
+         td->gang_size == 0u ||
          !Dsv4MoeBlockGeometryAdmissible(hidden, inter) ||
          td->w13_packed_row_stride != hidden / 2u ||
          td->w13_scale_row_stride != hidden / kGroupSize ||
@@ -360,23 +366,74 @@ __aicore__ inline void IssueDownTile(const Geometry& g,
       slot);
 }
 
-// One expert, one token, end to end, on this core.
+// ---------------------------------------------------------------------------
+// The two phases are separate functions so the DECODE path can put a
+// cross-core barrier between them. Prefill calls them back to back on one
+// core, which is the original fused body with `activated` never leaving UB.
 //
-// `act` and the tile ring are UB; `x_ub` holds the token. `activated` stays in
-// UB between the two phases -- the point of the whole design. The down tile is
-// written to `yGm` with whatever atomic mode the caller has set.
+// Both take a (tile_lo, tile_stride) pair naming which of the phase's row
+// tiles THIS core owns:
 //
-// `tiles` is the kTileSlots-slot output ring, allocated by the caller with
-// kTileSkewBytes between slots so the two are bank-disjoint.
-__aicore__ inline void RunExpertToken(
+//   prefill / one-core-per-slot   tile_lo = 0,    tile_stride = 1
+//   decode gang lane L of G       tile_lo = L,    tile_stride = G
+//
+// A core's i-th tile is therefore tile (tile_lo + i*tile_stride), and the
+// count below is the only place that arithmetic lives.
+// ---------------------------------------------------------------------------
+__aicore__ inline std::uint32_t TilesOwned(std::uint32_t total_tiles,
+                                           std::uint32_t tile_lo,
+                                           std::uint32_t tile_stride) {
+  if (tile_lo >= total_tiles) {
+    return 0u;  // a gang wider than the tile count: this lane has no work
+  }
+  return (total_tiles - tile_lo + tile_stride - 1u) / tile_stride;
+}
+
+// --- phase 1: gate + up + clamped SwiGLU, into actTensor -------------------
+// Writes each owned tile's 32 activations at their FINAL offset inside
+// actTensor, so there is no tile-to-vector copy. When `act_out` is non-null
+// the tile is also published to GM at the same offset, which is what lets the
+// gang's other lanes read it after the barrier.
+__aicore__ inline void RunGateUpPhase(
     const Geometry& g, __gm__ std::uint8_t* w1_packed,
     __gm__ std::uint8_t* w1_scale, __gm__ std::uint8_t* w3_packed,
-    __gm__ std::uint8_t* w3_scale, __gm__ std::uint8_t* w2_packed,
-    __gm__ std::uint8_t* w2_scale, const LocalTensor<float>& xTensor,
-    const LocalTensor<float>& actTensor,
+    __gm__ std::uint8_t* w3_scale, __ubuf__ float* x_ub,
+    const LocalTensor<float>& actTensor, std::uint32_t tile_lo,
+    std::uint32_t tile_stride, const GlobalTensor<float>* act_out,
+    std::uint64_t act_out_base) {
+  __ubuf__ float* act_ub =
+      reinterpret_cast<__ubuf__ float*>(actTensor.GetPhyAddr());
+  const std::uint32_t inter_tiles =
+      (g.inter + kRowsPerTile - 1u) / kRowsPerTile;
+  const std::uint32_t owned = TilesOwned(inter_tiles, tile_lo, tile_stride);
+
+  for (std::uint32_t i = 0; i < owned; ++i) {
+    const std::uint32_t tile_base = (tile_lo + i * tile_stride) * kRowsPerTile;
+    asc_vf_call<MoeBlockGateUpTileSimt>(
+        dim3(kSimtThreads), w1_packed, w1_scale, w3_packed, w3_scale, x_ub,
+        g.inter, g.hidden, g.w13_packed_row_stride, g.w13_scale_row_stride,
+        g.swiglu_limit, tile_base, act_ub + tile_base);
+    DataSyncBarrier<MemDsbT::ALL>();
+    if (act_out != nullptr) {
+      // 128 B per store, well above the 32 B MTE quantum. V->MTE3 first: the
+      // VF's UB writes must retire before DMA reads the same 32 floats.
+      SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
+      WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
+      DataCopy((*act_out)[act_out_base + tile_base],
+               actTensor[tile_base], kRowsPerTile);
+      SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
+      WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
+    }
+  }
+}
+
+// --- phase 2: the down GEMV over the completed `activated` ----------------
+__aicore__ inline void RunDownPhase(
+    const Geometry& g, __gm__ std::uint8_t* w2_packed,
+    __gm__ std::uint8_t* w2_scale, const LocalTensor<float>& actTensor,
     const LocalTensor<float> (&tiles)[kTileSlots],
-    const GlobalTensor<float>& yGm, std::uint64_t y_base, float route_weight) {
-  __ubuf__ float* x_ub = reinterpret_cast<__ubuf__ float*>(xTensor.GetPhyAddr());
+    const GlobalTensor<float>& yGm, std::uint64_t y_base, float route_weight,
+    std::uint32_t tile_lo, std::uint32_t tile_stride) {
   __ubuf__ float* act_ub =
       reinterpret_cast<__ubuf__ float*>(actTensor.GetPhyAddr());
   __ubuf__ float* tile_ub[kTileSlots];
@@ -384,22 +441,6 @@ __aicore__ inline void RunExpertToken(
     tile_ub[slot] =
         reinterpret_cast<__ubuf__ float*>(tiles[slot].GetPhyAddr());
   }
-
-  // --- phase 1: gate + up + clamped SwiGLU, straight into actTensor -------
-  const std::uint32_t inter_tiles =
-      (g.inter + kRowsPerTile - 1u) / kRowsPerTile;
-  for (std::uint32_t tile_idx = 0; tile_idx < inter_tiles; ++tile_idx) {
-    const std::uint32_t tile_base = tile_idx * kRowsPerTile;
-    // The VF writes this tile's 32 activations directly at their final
-    // offset inside actTensor, so there is no tile-to-vector copy at all.
-    asc_vf_call<MoeBlockGateUpTileSimt>(
-        dim3(kSimtThreads), w1_packed, w1_scale, w3_packed, w3_scale, x_ub,
-        g.inter, g.hidden, g.w13_packed_row_stride, g.w13_scale_row_stride,
-        g.swiglu_limit, tile_base, act_ub + tile_base);
-    DataSyncBarrier<MemDsbT::ALL>();
-  }
-
-  // --- phase 2: the down GEMV over the completed `activated` ---------------
   //
   // Double-buffered and unrolled by kTileSlots, so ONE DataSyncBarrier
   // publishes both slots' VFs per pipeline step instead of one per tile. The
@@ -416,60 +457,92 @@ __aicore__ inline void RunExpertToken(
   //
   // Set/Wait are balanced 1:1 per unrolled step, so no event token outlives
   // the loop and nothing leaks into the next launch.
+  //
+  // THE RING NOW WALKS THIS CORE'S OWN TILE SUBSEQUENCE, not a contiguous
+  // run: `i` indexes the core's tiles and (tile_lo + i*tile_stride) is the
+  // global tile. With tile_stride == 1 this reduces to the previous
+  // contiguous schedule exactly.
   const std::uint32_t hidden_tiles =
       (g.hidden + kRowsPerTile - 1u) / kRowsPerTile;
+  const std::uint32_t owned = TilesOwned(hidden_tiles, tile_lo, tile_stride);
+  if (owned == 0u) {
+    return;  // a gang wider than the tile count: this lane has no down work
+  }
 
-  // Prologue: prime both slots. Clamped, so a grid smaller than the ring does
-  // not prime a slot no iteration consumes.
-  const std::uint32_t primed =
-      hidden_tiles < kTileSlots ? hidden_tiles : kTileSlots;
+  // Prologue: prime both slots. Clamped, so a core owning fewer tiles than
+  // the ring has slots does not prime a slot no iteration consumes.
+  const std::uint32_t primed = owned < kTileSlots ? owned : kTileSlots;
   for (std::uint32_t slot = 0; slot < primed; ++slot) {
     IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
-                  slot * kRowsPerTile, tile_ub[slot]);
+                  (tile_lo + slot * tile_stride) * kRowsPerTile,
+                  tile_ub[slot]);
   }
 
   // Steady state: whole pairs only.
-  std::uint32_t tile_idx = 0;
-  for (; tile_idx + kTileSlots <= hidden_tiles; tile_idx += kTileSlots) {
+  std::uint32_t i = 0;
+  for (; i + kTileSlots <= owned; i += kTileSlots) {
     DataSyncBarrier<MemDsbT::ALL>();  // publishes BOTH slots' VFs
     SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
 
     // Slot index is a compile-time constant in each unrolled body, so the
     // scalar dispatch path carries no modulo and no branch.
-    DataCopy(yGm[y_base + (tile_idx + 0u) * kRowsPerTile], tiles[0],
-             kRowsPerTile);
-    DataCopy(yGm[y_base + (tile_idx + 1u) * kRowsPerTile], tiles[1],
-             kRowsPerTile);
+    DataCopy(yGm[y_base + (tile_lo + (i + 0u) * tile_stride) * kRowsPerTile],
+             tiles[0], kRowsPerTile);
+    DataCopy(yGm[y_base + (tile_lo + (i + 1u) * tile_stride) * kRowsPerTile],
+             tiles[1], kRowsPerTile);
 
     SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
     WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
 
     // Both slots are free again: issue the next pair.
-    const std::uint32_t next = tile_idx + kTileSlots;
-    if (next < hidden_tiles) {
+    const std::uint32_t next = i + kTileSlots;
+    if (next < owned) {
       IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
-                    next * kRowsPerTile, tile_ub[0]);
+                    (tile_lo + next * tile_stride) * kRowsPerTile,
+                    tile_ub[0]);
     }
-    if (next + 1u < hidden_tiles) {
+    if (next + 1u < owned) {
       IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
-                    (next + 1u) * kRowsPerTile, tile_ub[1]);
+                    (tile_lo + (next + 1u) * tile_stride) * kRowsPerTile,
+                    tile_ub[1]);
     }
   }
 
-  // Epilogue: an odd final tile. UNREACHABLE at admissible geometry -- hidden
-  // is a multiple of 512 and 512/32 = 16, so hidden_tiles is always even.
-  // Kept because the admissibility rule, not this loop, is what guarantees
-  // that, and tests/emu/test_dsv4_moe_block_addressing_emu.cpp is what pins
-  // it. The host oracle fails if the rule is ever loosened.
-  if (tile_idx < hidden_tiles) {
+  // Epilogue: an odd final tile. This USED to be unreachable -- `hidden` is a
+  // multiple of 512 and 512/32 = 16, so hidden_tiles is always even -- and
+  // the old comment said so. The gang decode is what made it live: `owned` is
+  // ceil((hidden_tiles - lane)/gang_size), which is odd for many gang sizes
+  // (128 tiles over a gang of 10 gives lanes 0..7 thirteen tiles each). It is
+  // now an exercised path, not a defensive one.
+  if (i < owned) {
     DataSyncBarrier<MemDsbT::ALL>();
     SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
-    DataCopy(yGm[y_base + tile_idx * kRowsPerTile], tiles[0], kRowsPerTile);
+    DataCopy(yGm[y_base + (tile_lo + i * tile_stride) * kRowsPerTile],
+             tiles[0], kRowsPerTile);
     SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
     WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
   }
+}
+
+// One expert, one token, end to end, on ONE core: the fused body, which is
+// what prefill uses. `activated` stays in UB between the phases -- the point
+// of the original design, and still true wherever one core owns a whole
+// expert.
+__aicore__ inline void RunExpertToken(
+    const Geometry& g, __gm__ std::uint8_t* w1_packed,
+    __gm__ std::uint8_t* w1_scale, __gm__ std::uint8_t* w3_packed,
+    __gm__ std::uint8_t* w3_scale, __gm__ std::uint8_t* w2_packed,
+    __gm__ std::uint8_t* w2_scale, const LocalTensor<float>& xTensor,
+    const LocalTensor<float>& actTensor,
+    const LocalTensor<float> (&tiles)[kTileSlots],
+    const GlobalTensor<float>& yGm, std::uint64_t y_base, float route_weight) {
+  __ubuf__ float* x_ub = reinterpret_cast<__ubuf__ float*>(xTensor.GetPhyAddr());
+  RunGateUpPhase(g, w1_packed, w1_scale, w3_packed, w3_scale, x_ub, actTensor,
+                 0u, 1u, nullptr, 0u);
+  RunDownPhase(g, w2_packed, w2_scale, actTensor, tiles, yGm, y_base,
+               route_weight, 0u, 1u);
 }
 
 }  // namespace
@@ -477,9 +550,15 @@ __aicore__ inline void RunExpertToken(
 // ---------------------------------------------------------------------------
 // Entry point 1: decode. One token, top_k routed experts, one AIV per slot.
 // ---------------------------------------------------------------------------
-// GRID: block_dim == top_k. Core `slot` owns routed slot `slot` entirely, so
-// `activated` for that expert is private to it. Cores do not split an
-// expert's rows -- see the fork recorded in dsv4_moe_block_tiling.h.
+// GRID: block_dim == gang_size * top_k. Core c owns slot c/gang_size as lane
+// c%gang_size, and the gang's lanes SPLIT that expert's row tiles in both
+// phases. `activated` therefore crosses cores, which is why this entry point
+// takes an `activated_ws` GM plane and a cross-core barrier -- see the
+// reversal recorded in dsv4_moe_block_tiling.h.
+//
+// `activated_ws` is [top_k, inter] FP32, CALLER-OWNED, sized by
+// Dsv4MoeDecodeWorkspaceBytes(). It is written before it is read within the
+// launch, so it needs no initialization and nothing in it outlives the call.
 //
 // `y` is ACCUMULATED INTO with an atomic-add DataCopy, so:
 //   * THE CALLER MUST ZERO `y` BEFORE THE LAUNCH. The wrapper does not, by
@@ -492,7 +571,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
     GM_ADDR x, GM_ADDR w1_packed, GM_ADDR w1_scale, GM_ADDR w3_packed,
     GM_ADDR w3_scale, GM_ADDR w2_packed, GM_ADDR w2_scale,
     GM_ADDR topk_expert_ids, GM_ADDR routing_weights, GM_ADDR y,
-    GM_ADDR tiling) {
+    GM_ADDR activated_ws, GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
   if (unlikely(tiling == nullptr)) {
     return;
@@ -503,22 +582,40 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
     return;
   }
   const Geometry g = LoadGeometry(td);
-  const std::uint32_t slot = static_cast<std::uint32_t>(GetBlockIdx());
-  // block_dim is top_k, but a launch is not obliged to match it exactly; a
-  // core past the last slot has no work rather than an out-of-range read.
-  if (slot >= g.top_k) {
-    return;
-  }
 
-  // The routed expert for this slot, and its router gate.
-  const std::uint32_t expert =
-      static_cast<std::uint32_t>(
-          reinterpret_cast<const __gm__ std::int32_t*>(topk_expert_ids)[slot]);
-  if (unlikely(expert >= g.num_experts)) {
-    return;  // backstop; the host validates the ids it can see
+  // GANG MAPPING. Core c owns slot c/gang_size as lane c%gang_size, and the
+  // lane grid-strides over its slot's row tiles in both phases.
+  const std::uint32_t core = static_cast<std::uint32_t>(GetBlockIdx());
+  const std::uint32_t slot = core / g.gang_size;
+  const std::uint32_t lane = core % g.gang_size;
+
+  // ------------------------------------------------------------------------
+  // NO EARLY RETURN BEYOND THIS LINE. There is a cross-core barrier below,
+  // and SyncAll synchronizes every LAUNCHED core: a core that returns before
+  // reaching it hangs the ones that do. So a core with nothing to do -- past
+  // the last slot, or holding an out-of-range expert id -- is carried to the
+  // barrier with `active` false instead of returning.
+  //
+  // The tiling rejection above is exempt because it is UNIFORM: the tiling is
+  // identical for every core, so either all of them return or none do, and
+  // there is no barrier left for anyone to wait at.
+  // ------------------------------------------------------------------------
+  bool active = slot < g.top_k;
+
+  // The routed expert for this slot, and its router gate. Guarded, because an
+  // inactive core must not index these buffers at all.
+  std::uint32_t expert = 0u;
+  float route_weight = 0.0f;
+  if (active) {
+    expert = static_cast<std::uint32_t>(
+        reinterpret_cast<const __gm__ std::int32_t*>(topk_expert_ids)[slot]);
+    if (unlikely(expert >= g.num_experts)) {
+      active = false;  // backstop; the host validates the ids it can see
+    } else {
+      route_weight =
+          reinterpret_cast<const __gm__ float*>(routing_weights)[slot];
+    }
   }
-  const float route_weight =
-      reinterpret_cast<const __gm__ float*>(routing_weights)[slot];
 
   // Expert bases: widen BEFORE the multiply (§2.7). At 256 experts the w1
   // offset reaches ~1.07 GB, which fits uint32 only by one doubling.
@@ -556,22 +653,63 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
   (void)tileSkew;  // reserved spacer; never read or written
   const LocalTensor<float> tiles[kTileSlots] = {tile0, tile1};
 
-  DataCopy(xTensor, xGm, g.hidden);
-  SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
-  WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
-  DataSyncBarrier<MemDsbT::ALL>();
+  // `activated` for every slot, as one [top_k, inter] FP32 plane. This slot's
+  // row starts at slot*inter; the gang's lanes write disjoint tiles of it.
+  GlobalTensor<float> actGm;
+  actGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(activated_ws),
+                        static_cast<std::uint64_t>(g.top_k) * g.inter);
+  const std::uint64_t act_base = static_cast<std::uint64_t>(slot) * g.inter;
 
-  // Fold the router gate into the down store and accumulate across slots.
-  SetAtomicAdd<float>();
-  RunExpertToken(g, w1p, w1s, w3p, w3s, w2p, w2s, xTensor, actTensor, tiles,
-                 yGm, 0u, route_weight);
-  SetAtomicNone();
+  if (active) {
+    DataCopy(xTensor, xGm, g.hidden);
+    SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
+    WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
+    DataSyncBarrier<MemDsbT::ALL>();
+
+    // Phase 1, this lane's share of the gate/up rows, published to GM.
+    //
+    // ATOMIC MODE MUST BE NONE HERE. These stores are a plain handoff to the
+    // gang, not an accumulation: with atomic-add still set from a previous
+    // phase they would add into whatever the workspace held, which is exactly
+    // the kind of silent wrong answer the workspace has no way to reveal.
+    // The atomic window is opened around the DOWN phase only, below.
+    __ubuf__ float* x_ub =
+        reinterpret_cast<__ubuf__ float*>(xTensor.GetPhyAddr());
+    RunGateUpPhase(g, w1p, w1s, w3p, w3s, x_ub, actTensor, lane, g.gang_size,
+                   &actGm, act_base);
+  }
+
+  // Publish phase 1 to the rest of the gang. The DataSyncBarrier drains this
+  // core's own pipelines; SyncAll is the cross-core edge. Both are needed and
+  // in this order -- a barrier that lets a core past before its MTE3 stores
+  // have landed publishes nothing.
+  DataSyncBarrier<MemDsbT::ALL>();
+  SyncAll<true>();
+
+  if (active) {
+    // Re-read the WHOLE slot's `activated`: the down GEMV reduces over all of
+    // it, and only this lane's tiles were computed locally. 8 KiB at the
+    // production geometry, against a weight stream of ~12 MiB per expert.
+    DataCopy(actTensor, actGm[act_base], g.inter);
+    SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
+    WaitFlag<HardEvent::MTE2_V>(kEvMte2ToV);
+    DataSyncBarrier<MemDsbT::ALL>();
+
+    // Phase 2, this lane's share of the down rows. The router gate folds into
+    // the store and the slots accumulate into y, so the caller must have
+    // zeroed y (see the contract above).
+    SetAtomicAdd<float>();
+    RunDownPhase(g, w2p, w2s, actTensor, tiles, yGm, 0u, route_weight, lane,
+                 g.gang_size);
+    SetAtomicNone();
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Entry point 2: prefill. M tokens, one expert each, 32 AIVs over tokens.
 // ---------------------------------------------------------------------------
-// GRID: 32 AIVs grid-striding over `total_tokens`. A core owns whole tokens,
+// GRID: every AIV the device reports, grid-striding over `total_tokens` (and
+// never more cores than tokens). A core owns whole tokens,
 // so the monolithic body applies per token and `activated` is private to the
 // core for the duration of each one. `x_tokens` is expected ALREADY GROUPED
 // BY EXPERT (the standard MoE dispatch output), which is what makes a core's

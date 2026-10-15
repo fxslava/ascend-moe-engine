@@ -64,8 +64,18 @@ Status LaunchDsv4MoeBlockInductiveSim(
   }
 
   Dsv4MoeBlockTilingData tiling{};
+  // PASS THE OLD CONSTANT, NOT THE QUERIED COUNT. This is a CAModel gate, so
+  // its grid must not depend on which machine's SKU it runs on -- a simulated
+  // core count that changes under the test would make its cost and its
+  // coverage irreproducible. 32 is what this gate has always launched.
+  //
+  // The builder now returns min(32, total_tokens) rather than a flat 32, so a
+  // run with fewer tokens than cores stops launching cores that only idle.
+  // That cannot change the result: the grid-stride map covers every token
+  // exactly once for any block_dim, which tests/sim/test_gang_partition.cpp
+  // proves on the host.
   const Status shape = MakeDsv4MoePrefillTiling(hidden, inter, num_experts,
-                                                total_tokens, &tiling);
+                                                total_tokens, 32u, &tiling);
   if (shape != Status::success) {
     return shape;
   }

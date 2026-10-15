@@ -97,6 +97,9 @@ void RunTest() {
       DeviceBuffer d_x(x.size() * sizeof(float));
       DeviceBuffer d_ids(topk_ids.size() * sizeof(std::int32_t));
       DeviceBuffer d_rw(routing_weights.size() * sizeof(float));
+      // The decode gang's `activated` plane: [top_k, inter] FP32, caller-owned.
+      DeviceBuffer d_actws(static_cast<std::size_t>(
+          moe::kernels::arch35::Dsv4MoeDecodeWorkspaceBytes(kTopK, kInter)));
       auto d_y = MakeGuardedOutput(kHidden);
       DeviceBuffer d_xt(x_tokens.size() * sizeof(float));
       DeviceBuffer d_t2e(token_to_expert.size() * sizeof(std::int32_t));
@@ -133,7 +136,8 @@ void RunTest() {
           static_cast<const E8M0*>(d_w2s.get()),
           static_cast<const std::int32_t*>(d_ids.get()),
           static_cast<const float*>(d_rw.get()), kHidden, kInter, kExperts,
-          kTopK, static_cast<float*>(d_y->get()), runtime.stream());
+          kTopK, static_cast<float*>(d_y->get()),
+          static_cast<float*>(d_actws.get()), runtime.stream());
       if (decode_st != moe::kernels::arch35::Status::success) {
         Fail(LaunchFailure("LaunchDsv4MoeDecodeTopk", decode_st));
       }

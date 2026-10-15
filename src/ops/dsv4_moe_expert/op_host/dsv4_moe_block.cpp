@@ -27,7 +27,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
     GM_ADDR x, GM_ADDR w1_packed, GM_ADDR w1_scale, GM_ADDR w3_packed,
     GM_ADDR w3_scale, GM_ADDR w2_packed, GM_ADDR w2_scale,
     GM_ADDR topk_expert_ids, GM_ADDR routing_weights, GM_ADDR y,
-    GM_ADDR tiling);
+    GM_ADDR activated_ws, GM_ADDR tiling);
 
 extern "C" __global__ __aicore__ void dsv4_moe_prefill_batched(
     GM_ADDR x_tokens, GM_ADDR w1_packed, GM_ADDR w1_scale, GM_ADDR w3_packed,
@@ -54,12 +54,21 @@ Status LaunchDsv4MoeDecodeTopk(
     const Mxfp4Pair* w2_packed_gm, const E8M0* w2_scale_gm,
     const std::int32_t* topk_expert_ids_gm, const float* routing_weights_gm,
     std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
-    std::uint32_t top_k, float* y_gm, aclrtStream stream) {
+    std::uint32_t top_k, float* y_gm, float* activated_ws_gm,
+    aclrtStream stream) {
   if (x_gm == nullptr || w1_packed_gm == nullptr || w1_scale_gm == nullptr ||
       w3_packed_gm == nullptr || w3_scale_gm == nullptr ||
       w2_packed_gm == nullptr || w2_scale_gm == nullptr ||
       topk_expert_ids_gm == nullptr || routing_weights_gm == nullptr ||
-      y_gm == nullptr || stream == nullptr) {
+      y_gm == nullptr || activated_ws_gm == nullptr || stream == nullptr) {
+    return Status::invalid_argument;
+  }
+  // The gang writes `activated` here and reads it back after the barrier, so
+  // an overlap with x or y is a self-corrupting launch, not a slow one.
+  if (static_cast<const void*>(activated_ws_gm) ==
+          static_cast<const void*>(x_gm) ||
+      static_cast<const void*>(activated_ws_gm) ==
+          static_cast<const void*>(y_gm)) {
     return Status::invalid_argument;
   }
   // y is ACCUMULATED INTO, so it must not alias the token it reads.
@@ -68,8 +77,11 @@ Status LaunchDsv4MoeDecodeTopk(
   }
 
   Dsv4MoeBlockTilingData tiling{};
-  const Status shape = MakeDsv4MoeDecodeTopkTiling(hidden, inter, num_experts,
-                                                   top_k, &tiling);
+  // The grid comes from the device, not from a literal: see
+  // detail::QueryAivCoreCount(). A 0 means the query failed and the builder
+  // takes its conservative fallback.
+  const Status shape = MakeDsv4MoeDecodeTopkTiling(
+      hidden, inter, num_experts, top_k, detail::QueryAivCoreCount(), &tiling);
   if (shape != Status::success) {
     return shape;
   }
@@ -93,14 +105,16 @@ Status LaunchDsv4MoeDecodeTopk(
   const std::uint32_t dyn_ub =
       static_cast<std::uint32_t>(Dsv4MoeBlockDynUbBytes(hidden, inter));
 
-  // block_dim == top_k: one AIV per routed expert slot. See the fork recorded
-  // in dsv4_moe_block_tiling.h for why cores do not split an expert's rows.
+  // block_dim == gang_size * top_k: a gang of AIVs per routed slot, splitting
+  // that expert's row tiles. See dsv4_moe_block_tiling.h for why this
+  // reverses the earlier one-core-per-slot grid.
   dsv4_moe_decode_topk<<<tiling.block_dim, dyn_ub, stream>>>(
       detail::Gm(x_gm), detail::Gm(w1_packed_gm), detail::Gm(w1_scale_gm),
       detail::Gm(w3_packed_gm), detail::Gm(w3_scale_gm),
       detail::Gm(w2_packed_gm), detail::Gm(w2_scale_gm),
       detail::Gm(topk_expert_ids_gm), detail::Gm(routing_weights_gm),
-      detail::Gm(y_gm), detail::Gm(staging.get()));
+      detail::Gm(y_gm), detail::Gm(activated_ws_gm),
+      detail::Gm(staging.get()));
 
   return detail::FinishLaunch(kDecodeOp, stream);
 }
@@ -127,8 +141,9 @@ Status LaunchDsv4MoePrefillBatched(
   }
 
   Dsv4MoeBlockTilingData tiling{};
-  const Status shape = MakeDsv4MoePrefillTiling(hidden, inter, num_experts,
-                                                total_tokens, &tiling);
+  const Status shape = MakeDsv4MoePrefillTiling(
+      hidden, inter, num_experts, total_tokens, detail::QueryAivCoreCount(),
+      &tiling);
   if (shape != Status::success) {
     return shape;
   }

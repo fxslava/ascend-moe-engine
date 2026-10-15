@@ -13,6 +13,7 @@ set(MOE_EMU_TESTS
   test_kernel_addressing_emu
   test_bf16_block_quant_emu
   test_dsv4_moe_block_addressing_emu
+  test_dsv4_moe_block_gang_emu
 )
 
 # -----------------------------------------------------------------------------

@@ -28,6 +28,34 @@ void RecordAclFailure(const char* op, const char* call, int acl_error) noexcept 
 
 void ClearLaunchFailure() noexcept { g_last_failure = LaunchFailure{}; }
 
+std::uint32_t QueryAivCoreCount() noexcept {
+  // The capability is per device, so the current device must be known. In a
+  // process that has not called aclrtSetDevice there is nothing to ask about,
+  // which is a 0 rather than an error: the caller's fallback is correct.
+  std::int32_t device = 0;
+  aclError rc = aclrtGetDevice(&device);
+  if (rc != ACL_SUCCESS) {
+    RecordAclFailure("QueryAivCoreCount", "aclrtGetDevice", static_cast<int>(rc));
+    return 0u;
+  }
+  // ACL_DEVICE_INFO_VECTOR_CORE_NUM is the AIV count, as distinct from
+  // ACL_DEVICE_INFO_AI_CORE_NUM, which is the Cube count. Asking for the
+  // latter and using it as a pure-AIV grid is exactly the halving this
+  // function exists to stop.
+  std::int64_t value = 0;
+  rc = aclGetDeviceCapability(static_cast<std::uint32_t>(device),
+                              ACL_DEVICE_INFO_VECTOR_CORE_NUM, &value);
+  if (rc != ACL_SUCCESS) {
+    RecordAclFailure("QueryAivCoreCount", "aclGetDeviceCapability(VECTOR_CORE_NUM)",
+                     static_cast<int>(rc));
+    return 0u;
+  }
+  if (value <= 0 || value > 1024) {
+    return 0u;  // nonsense reading; let the caller take its fallback
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
 }  // namespace detail
 
 const LaunchFailure& LastLaunchFailure() noexcept { return g_last_failure; }

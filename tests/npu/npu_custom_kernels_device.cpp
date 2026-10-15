@@ -1459,7 +1459,7 @@ void DeviceDsv4MoeBlock(Report& rep, aclrtStream stream) {
 
   // --- device ------------------------------------------------------------
   DeviceBuffer d_w1p, d_w1s, d_w3p, d_w3s, d_w2p, d_w2s;
-  DeviceBuffer d_x, d_ids, d_rw, d_y, d_xt, d_t2e, d_yt;
+  DeviceBuffer d_x, d_ids, d_rw, d_y, d_xt, d_t2e, d_yt, d_actws;
   aclError rc = d_w1p.Alloc(w1p.size());
   if (rc == ACL_SUCCESS) rc = d_w1s.Alloc(w1s.size());
   if (rc == ACL_SUCCESS) rc = d_w3p.Alloc(w3p.size());
@@ -1474,6 +1474,11 @@ void DeviceDsv4MoeBlock(Report& rep, aclrtStream stream) {
   if (rc == ACL_SUCCESS)
     rc = d_t2e.Alloc(token_to_expert.size() * sizeof(std::int32_t));
   if (rc == ACL_SUCCESS) rc = d_yt.Alloc(want_prefill.size() * sizeof(float));
+  // The decode gang's `activated` plane, [top_k, inter] FP32. Caller-owned:
+  // the gang splits one expert across cores, so `activated` crosses cores.
+  if (rc == ACL_SUCCESS)
+    rc = d_actws.Alloc(static_cast<std::size_t>(
+        Dsv4MoeDecodeWorkspaceBytes(kTopK, kInter)));
   if (rc != ACL_SUCCESS) {
     rep.fail("device dsv4_moe_block", AclFail("aclrtMalloc", rc));
     return;
@@ -1513,7 +1518,8 @@ void DeviceDsv4MoeBlock(Report& rep, aclrtStream stream) {
       d_x.as<float>(), d_w1p.as<Mxfp4Pair>(), d_w1s.as<E8M0>(),
       d_w3p.as<Mxfp4Pair>(), d_w3s.as<E8M0>(), d_w2p.as<Mxfp4Pair>(),
       d_w2s.as<E8M0>(), d_ids.as<std::int32_t>(), d_rw.as<float>(), kHidden,
-      kInter, kExperts, kTopK, d_y.as<float>(), stream);
+      kInter, kExperts, kTopK, d_y.as<float>(), d_actws.as<float>(),
+      stream);
   if (decode_st != Status::success) {
     rep.fail("device dsv4_moe_decode_topk",
              LaunchFail("LaunchDsv4MoeDecodeTopk", decode_st));

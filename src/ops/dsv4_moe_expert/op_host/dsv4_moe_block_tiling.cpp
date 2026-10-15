@@ -76,11 +76,22 @@ Status FillCommon(std::uint32_t hidden, std::uint32_t inter,
   return Status::success;
 }
 
+// The AIV count to plan the grid against: the queried value when it is
+// usable, else the smallest production part's Vector count. Clamped so a
+// nonsense capability reading cannot become an absurd grid.
+std::uint32_t ResolveAivCount(std::uint32_t aiv_count) noexcept {
+  if (aiv_count == 0u || aiv_count > kMoeBlockAivMax) {
+    return kMoeBlockAivFallback;
+  }
+  return aiv_count;
+}
+
 }  // namespace
 
 Status MakeDsv4MoeDecodeTopkTiling(std::uint32_t hidden, std::uint32_t inter,
                                    std::uint32_t num_experts,
                                    std::uint32_t top_k,
+                                   std::uint32_t aiv_count,
                                    Dsv4MoeBlockTilingData* out) noexcept {
   const Status common = FillCommon(hidden, inter, num_experts, out);
   if (common != Status::success) {
@@ -91,22 +102,36 @@ Status MakeDsv4MoeDecodeTopkTiling(std::uint32_t hidden, std::uint32_t inter,
   if (top_k == 0u || top_k > num_experts) {
     return Status::invalid_argument;
   }
-  // block_dim = top_k is the decode grid (see the header). The ceiling exists
-  // because the grid is the slot count: a top_k above it would ask for more
-  // AIVs per launch than this version plans for.
+  // The ceiling is on the ROUTED SLOT COUNT, which is what the workspace and
+  // the slot-to-gang map are sized by. It is no longer the grid.
   if (top_k > kMoeBlockMaxTopK) {
     return Status::unsupported_shape;
   }
+
+  // GANG DERIVATION. gang_size = floor(aiv / top_k), at least 1, so the grid
+  // gang_size * top_k never exceeds the device. The aiv % top_k remainder is
+  // deliberately left unlaunched: every launched core must reach the
+  // cross-core barrier, so a core holding a partial slot would have to be
+  // carried through both phases to keep the barrier counts equal, and an
+  // unlaunched core costs nothing.
+  const std::uint32_t aiv = ResolveAivCount(aiv_count);
+  std::uint32_t gang_size = aiv / top_k;
+  if (gang_size < kMoeBlockMinGangSize) {
+    gang_size = kMoeBlockMinGangSize;  // top_k > aiv: fall back to 1 core/slot
+  }
+
   out->mode = kMoeBlockModeDecode;
   out->top_k = top_k;
   out->total_tokens = 1u;
-  out->block_dim = top_k;
+  out->gang_size = gang_size;
+  out->block_dim = gang_size * top_k;
   return Status::success;
 }
 
 Status MakeDsv4MoePrefillTiling(std::uint32_t hidden, std::uint32_t inter,
                                 std::uint32_t num_experts,
                                 std::uint32_t total_tokens,
+                                std::uint32_t aiv_count,
                                 Dsv4MoeBlockTilingData* out) noexcept {
   const Status common = FillCommon(hidden, inter, num_experts, out);
   if (common != Status::success) {
@@ -120,7 +145,13 @@ Status MakeDsv4MoePrefillTiling(std::uint32_t hidden, std::uint32_t inter,
   // weighting happens in the combine stage above this operator.
   out->top_k = 1u;
   out->total_tokens = total_tokens;
-  out->block_dim = kMoeBlockPrefillBlockDim;
+  // A core owns whole tokens here, so there is no gang and no slot sharing.
+  out->gang_size = 1u;
+  // Every AIV, but never more cores than there are tokens: the body is a
+  // grid-stride loop, so a core past the last token would do nothing except
+  // occupy a slot in the launch.
+  const std::uint32_t aiv = ResolveAivCount(aiv_count);
+  out->block_dim = total_tokens < aiv ? total_tokens : aiv;
   return Status::success;
 }
 

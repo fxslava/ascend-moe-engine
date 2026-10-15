@@ -239,13 +239,27 @@ Status LaunchDsv4MoeExpert(
 //
 // Neither y may alias x.
 // ---------------------------------------------------------------------------
+// `activated_ws_gm` is CALLER-OWNED scratch of at least
+// Dsv4MoeDecodeWorkspaceBytes(top_k, inter) bytes -- top_k * inter FP32. The
+// decode grid splits each expert across a gang of AIVs, so `activated` has to
+// cross cores; this is where it lands. It is written before it is read inside
+// the launch, so its incoming contents are irrelevant, and nothing in it
+// outlives the call.
+//
+// It is an operand rather than a per-launch allocation because decode is the
+// latency path: its size never changes between decode steps, so an
+// aclrtMalloc/aclrtFree pair on every step would be pure overhead.
+//
+// AS BEFORE: `y_gm` is ACCUMULATED INTO across the top_k slots, so THE CALLER
+// MUST ZERO IT before the launch.
 Status LaunchDsv4MoeDecodeTopk(
     const float* x_gm, const Mxfp4Pair* w1_packed_gm, const E8M0* w1_scale_gm,
     const Mxfp4Pair* w3_packed_gm, const E8M0* w3_scale_gm,
     const Mxfp4Pair* w2_packed_gm, const E8M0* w2_scale_gm,
     const std::int32_t* topk_expert_ids_gm, const float* routing_weights_gm,
     std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
-    std::uint32_t top_k, float* y_gm, aclrtStream stream);
+    std::uint32_t top_k, float* y_gm, float* activated_ws_gm,
+    aclrtStream stream);
 
 Status LaunchDsv4MoePrefillBatched(
     const float* x_tokens_gm, const Mxfp4Pair* w1_packed_gm,

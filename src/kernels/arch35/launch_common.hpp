@@ -51,6 +51,31 @@ void RecordAclFailure(const char* op, const char* call, int acl_error) noexcept;
 void ClearLaunchFailure() noexcept;
 
 // ---------------------------------------------------------------------------
+// AIV core count -- queried, never hardcoded
+// ---------------------------------------------------------------------------
+// THERE IS NO CORRECT LITERAL FOR THIS. Ascend 950PR ships as several parts,
+// and the toolkit's own platform configs
+// (x86_64-linux/data/platform_config/Ascend950PR_*.ini) enumerate them --
+// always 1 Cube : 2 Vector:
+//
+//     950z (dev)                     4 cube /  8 vector
+//     9579 / 957b / 957c / 957d     28 cube / 56 vector
+//     9589 / 958b                   32 cube / 64 vector
+//     9599                          36 cube / 72 vector
+//
+// So every hardcoded pure-AIV grid in this tree is wrong on some part, and a
+// grid of 32 is the CUBE count of the 9589 SKU rather than its Vector count
+// -- half occupancy on that part, 44% on a 9599.
+//
+// Returns 0 when the query fails or reports something unusable. Callers treat
+// that as "use the conservative fallback", NOT as a launch failure: a
+// suboptimal grid is a throughput bug, while refusing to launch because a
+// capability query failed would turn it into a correctness-visible one. The
+// failure is still recorded so LastLaunchFailure() can explain a surprising
+// grid (§3.5).
+std::uint32_t QueryAivCoreCount() noexcept;
+
+// ---------------------------------------------------------------------------
 // Tiling staging
 //
 // Allocates a device buffer, copies the POD in, and releases it in the

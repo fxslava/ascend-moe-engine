@@ -52,26 +52,70 @@ inline constexpr float kMoeBlockSwigluLimit = 10.0F;
 inline constexpr std::uint32_t kMoeBlockModeDecode = 0u;
 inline constexpr std::uint32_t kMoeBlockModePrefill = 1u;
 
-// DECODE GRID: one core per expert slot.
-//
-// This is the resolution of a real fork, recorded because the alternatives
-// are tempting and worse. Cores could instead SPLIT an expert's row tiles,
-// which engages all 32 AIVs -- but then `activated` for that expert is again
-// produced tiled across cores, and the down leg needs all of it. The ways out
-// are (a) every core in the slot recomputes the whole gate/up leg, which
-// multiplies the w1/w3 weight stream by the number of cores per slot, or
-// (b) a GM round trip plus a barrier, which is the two-dispatch design this
-// replaces. On a kernel measured at 3.76 FLOP/B -- weight-stream bound -- (a)
-// pays the one resource that is actually scarce to buy idle-core occupancy.
-//
-// So: block_dim = top_k. With top_k = 6 that leaves 26 of 32 AIVs idle on the
-// decode path, which is a real cost and is NOT claimed here to be the right
-// trade on hardware -- it has never been measured (CLAUDE.md §5.7). It is the
-// trade that keeps the weight stream at 1x and needs no barrier.
 inline constexpr std::uint32_t kMoeBlockMaxTopK = 8u;
 
-// PREFILL GRID: 32 AIVs, grid-stride over tokens.
-inline constexpr std::uint32_t kMoeBlockPrefillBlockDim = 32u;
+// ---------------------------------------------------------------------------
+// GRIDS ARE SKU-DERIVED, NEVER LITERAL
+// ---------------------------------------------------------------------------
+// Both grids are now a function of the AIV count the runtime reports, because
+// there is no literal that is right. Ascend 950PR ships as several parts and
+// the toolkit's own platform configs
+// (x86_64-linux/data/platform_config/Ascend950PR_*.ini) enumerate them --
+// always 1 Cube : 2 Vector:
+//
+//     950z (dev)                     4 cube /  8 vector
+//     9579 / 957b / 957c / 957d     28 cube / 56 vector
+//     9589 / 958b                   32 cube / 64 vector
+//     9599                          36 cube / 72 vector
+//
+// The previous constant here was 32, which is the CUBE count of the 9589
+// part, not its Vector count: a pure-AIV grid of 32 therefore ran at HALF
+// occupancy on a 64-vector part and 44% on a 72-vector one. See
+// detail::QueryAivCoreCount() in src/kernels/arch35/launch_common.hpp.
+//
+// The fallback is used only when the capability query fails. It is the
+// smallest production part's Vector count, so it never over-subscribes a real
+// device; a grid that is too small costs throughput, while one that is too
+// large is rejected at launch.
+inline constexpr std::uint32_t kMoeBlockAivFallback = 56u;
+
+// A sane upper bound for a queried core count, so a garbage capability value
+// cannot be turned into an absurd grid.
+inline constexpr std::uint32_t kMoeBlockAivMax = 256u;
+
+// DECODE GRID: a GANG OF CORES PER ROUTED SLOT.
+//
+// This REVERSES the earlier `block_dim = top_k` decision, and the reason the
+// old note gave for it does not survive contact with the hardware. It said
+// the alternative to one-core-per-slot was either (a) recomputing the gate/up
+// leg per core, multiplying the weight stream, or (b) "a GM round trip plus a
+// barrier, which is the two-dispatch design this replaces". (b) was dismissed
+// by conflating two very different costs:
+//
+//   * the BARRIER is a hardware primitive on this part, not a re-dispatch.
+//     `hardware_sync_betweencore=1` in every Ascend950PR ini, and
+//     AscendC::SyncAll<true>() has a workspace-free form gated on
+//     __NPU_ARCH__ == 3510. Verified: it compiles for dav-3510.
+//   * the GM ROUND TRIP is `inter` floats per slot -- 8 KiB at the production
+//     geometry -- against a weight stream of ~12 MiB per expert. Three orders
+//     of magnitude smaller than the thing it buys occupancy for.
+//
+// So the trade the old note refused is actually ~0.07% extra traffic to go
+// from top_k cores busy to the whole device busy. At top_k = 6 on a 64-vector
+// part the old grid left 58 of 64 AIVs idle.
+//
+// Gang layout: core c owns slot `c / gang_size`, lane `c % gang_size`, and
+// lanes grid-stride over their slot's row tiles in BOTH phases. gang_size is
+// floor(aiv / top_k), so the grid is gang_size * top_k and never exceeds the
+// device; the remainder cores (aiv % top_k) are left unlaunched rather than
+// given a partial slot, because an idle core costs nothing while a core that
+// must still reach the barrier costs everyone.
+//
+// NEVER MEASURED on hardware (CLAUDE.md §5.7): this is a traffic and
+// occupancy argument, not a benchmark result.
+inline constexpr std::uint32_t kMoeBlockMinGangSize = 1u;
+
+// PREFILL GRID: every AIV, grid-stride over tokens.
 
 // ---------------------------------------------------------------------------
 // UB footprint
@@ -157,7 +201,7 @@ __aicore__ inline bool Dsv4MoeBlockGeometryAdmissible(std::uint32_t hidden,
 struct Dsv4MoeBlockTilingData {
   std::uint32_t abi_version;                // 1
   std::uint32_t mode;                       // kMoeBlockMode{Decode,Prefill}
-  std::uint32_t block_dim;                  // decode: top_k; prefill: 32
+  std::uint32_t block_dim;                  // decode: gang_size*top_k; prefill: aiv
   std::uint32_t hidden;                     // 4096
   std::uint32_t inter;                      // 2048
   std::uint32_t num_experts;                // total experts in the buffers
@@ -166,6 +210,11 @@ struct Dsv4MoeBlockTilingData {
   std::uint32_t rows_per_block;             // 32
   std::uint32_t group_size;                 // 32
   std::uint32_t low_nibble_first;           // 1; reject 0
+  // Cores per routed slot. Decode: floor(aiv / top_k), >= 1. Prefill: 1,
+  // because there a core owns whole tokens and never shares an expert slot.
+  // The kernel divides GetBlockIdx() by it, so a zero here would fault --
+  // the device backstop rejects that rather than trusting the host.
+  std::uint32_t gang_size;
   std::uint32_t w13_packed_row_stride;      // hidden/2 bytes
   std::uint32_t w13_scale_row_stride;       // hidden/32 bytes
   std::uint32_t w2_packed_row_stride;       // inter/2 bytes
@@ -177,21 +226,57 @@ struct Dsv4MoeBlockTilingData {
   float swiglu_limit;                       // 10.0
 };
 
-MOE_ARCH35_ASSERT_TILING_POD(Dsv4MoeBlockTilingData, 80);
+// 84, not 80: `gang_size` is new. Growing this struct IS an ABI break and the
+// byte count is the wire format (§2.2) -- host and device are rebuilt
+// together from this header, so the break is caught here rather than as a
+// misparsed field on device.
+MOE_ARCH35_ASSERT_TILING_POD(Dsv4MoeBlockTilingData, 84);
+
+// ---------------------------------------------------------------------------
+// Decode `activated` workspace -- CALLER-OWNED
+// ---------------------------------------------------------------------------
+// The gang decode needs `activated` to cross cores, so it needs GM scratch.
+// The earlier ABI deliberately had no workspace, on the grounds that
+// `activated` never reaches GM; gang-splitting one expert across cores is
+// exactly what retires that premise, so the operand comes back -- but as a
+// CALLER-OWNED buffer, not a per-launch allocation.
+//
+// WHY THE CALLER OWNS IT. Decode is the latency path: one token, and the
+// legacy single-expert kernel it is measured against ran in ~281 us. An
+// aclrtMalloc/aclrtFree pair inside the wrapper would add device-allocator
+// latency to every decode step for a buffer whose size never changes between
+// steps. The caller allocates once and reuses. This does not weaken §3.4 --
+// the wrapper still allocates no OPERAND data; it just no longer pretends
+// there is no scratch.
+//
+// Contents are write-before-read within a single launch, so the caller need
+// not initialize it, and nothing in it survives the launch.
+inline constexpr std::uint64_t Dsv4MoeDecodeWorkspaceBytes(
+    std::uint32_t top_k, std::uint32_t inter) noexcept {
+  return static_cast<std::uint64_t>(top_k) * inter * 4u;
+}
 
 // Both builders validate the same geometry and differ only in which extent
 // carries the work, so they share one implementation behind two names -- the
 // names are the contract, and §2.6 requires the two rejections stay distinct:
 // invalid_argument for a caller mistake, unsupported_shape for a geometry
 // this version does not implement.
+// `aiv_count` is the Vector-core count to build the grid from -- what
+// detail::QueryAivCoreCount() returned, or 0 to take kMoeBlockAivFallback.
+// It is a PARAMETER rather than something these builders query themselves
+// because this header is included by device TUs and must stay ACL-free
+// (§2.4); the query lives in the launch layer, and the grid derivation stays
+// here with the rest of the validation (§2.5).
 Status MakeDsv4MoeDecodeTopkTiling(std::uint32_t hidden, std::uint32_t inter,
                                    std::uint32_t num_experts,
                                    std::uint32_t top_k,
+                                   std::uint32_t aiv_count,
                                    Dsv4MoeBlockTilingData* out) noexcept;
 
 Status MakeDsv4MoePrefillTiling(std::uint32_t hidden, std::uint32_t inter,
                                 std::uint32_t num_experts,
                                 std::uint32_t total_tokens,
+                                std::uint32_t aiv_count,
                                 Dsv4MoeBlockTilingData* out) noexcept;
 
 }  // namespace moe::kernels::arch35

@@ -817,11 +817,18 @@ bool BenchDecodePool(const DeviceCtx& ctx, int warmup, int iters,
   Rng rng(0xD54E01ULL);
   const std::vector<float> x = rng.normal(G::kHidden);
 
-  DeviceBuffer d_x, d_ids, d_rw, d_y;
+  DeviceBuffer d_x, d_ids, d_rw, d_y, d_actws;
   rc = d_x.Alloc(G::kHidden * sizeof(float));
   if (rc == ACL_SUCCESS) rc = d_ids.Alloc(top_k * sizeof(std::int32_t));
   if (rc == ACL_SUCCESS) rc = d_rw.Alloc(top_k * sizeof(float));
   if (rc == ACL_SUCCESS) rc = d_y.Alloc(G::kHidden * sizeof(float));
+  // The decode gang's `activated` plane, [top_k, inter] FP32. Allocated ONCE
+  // here and reused across every timed iteration -- which is exactly why it
+  // is an operand rather than a per-launch allocation: a malloc inside the
+  // timed window would measure the device allocator, not the kernel.
+  if (rc == ACL_SUCCESS)
+    rc = d_actws.Alloc(static_cast<std::size_t>(
+        Dsv4MoeDecodeWorkspaceBytes(top_k, G::kInter)));
   if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), G::kHidden * sizeof(float));
   if (rc == ACL_SUCCESS)
     rc = d_ids.Upload(topk_ids.data(), top_k * sizeof(std::int32_t));
@@ -842,7 +849,8 @@ bool BenchDecodePool(const DeviceCtx& ctx, int warmup, int iters,
             pool.w3p.as<Mxfp4Pair>(), pool.w3s.as<E8M0>(),
             pool.w2p.as<Mxfp4Pair>(), pool.w2s.as<E8M0>(),
             d_ids.as<std::int32_t>(), d_rw.as<float>(), G::kHidden, G::kInter,
-            num_experts, top_k, d_y.as<float>(), ctx.stream);
+            num_experts, top_k, d_y.as<float>(), d_actws.as<float>(),
+            ctx.stream);
       },
       // The accumulator zeroing, outside the window. Async on `stream` so it
       // is ordered against the launch rather than against the host.
