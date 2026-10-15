@@ -13,13 +13,35 @@
 //
 // Device benchmarking goes through the Launch* host wrappers. Those now
 // exist, so this binary measures real hardware when an NPU is visible: all
-// six arch35 operators are wired, and the stream is synchronized inside the
-// timed region (see TimedLaunch -- a chevron dispatch is asynchronous, so
-// timing the launch call alone measures enqueue cost).
+// six arch35 operators plus the two whole-MoE-block entry points are wired,
+// and the stream is synchronized inside the timed region (see TimedLaunch --
+// a chevron dispatch is asynchronous, so timing the launch call alone
+// measures enqueue cost).
 //
 // dsv4_moe_expert is the one operator here that issues TWO chevron dispatches
 // per call, so its row is doubly sync-inclusive and carries two tiling
 // allocations; BenchDsv4ExpertDevice says why that is structural.
+//
+// TWO TIMING PATHS, kept apart on purpose. Most rows use Measure(), a
+// steady_clock bracket around launch-plus-synchronize. The two whole-MoE-block
+// rows (dsv4_moe_decode_topk, dsv4_moe_prefill_batched) instead use
+// TimedLaunchEvents(), which brackets the launch with ACL_EVENT_TIME_LINE
+// events on the stream and subtracts them on the device clock. That is a
+// tighter window -- the tiling aclrtMalloc and the host call overhead fall
+// outside it -- but it is still NOT an isolated kernel time, because the v1
+// wrappers synchronize and free inside it (CLAUDE.md section 3.7).
+// TimedLaunchEvents says exactly what is in and out of the window. The two
+// paths are not comparable to each other and are never mixed inside one row.
+//
+// The block rows also report p50 and p99 rather than mean and min, because
+// decode is a latency-critical single-token step where the tail is the
+// figure of interest. P99 is nearest-rank: below 100 timed iterations it IS
+// the slowest sample, so a real tail wants `iters` of 100 or more -- the
+// default is 20.
+//
+// NEITHER BLOCK KERNEL HAS EVER BEEN TIMED ON HARDWARE. Both passed
+// functional verification on a 950PR; these rows exist so the timing claim
+// can be made at all (CLAUDE.md section 5.7).
 //
 // paged_compressor_rope does not go through Measure() and reports HOLD and
 // EMIT separately; see BenchPagedCompressorDevice for why a stateful operator
@@ -80,8 +102,36 @@ struct Timing {
   double stddev_us = 0.0;
   double min_us = 0.0;
   double p50_us = 0.0;
+  // Nearest-rank P99: sorted[ceil(0.99*n) - 1]. With fewer than 100 samples
+  // that index IS the maximum, which is the honest answer rather than an
+  // interpolation dressed up as a tail estimate -- at the default
+  // iters = 20 this column is the slowest of 20, nothing more. A real P99
+  // wants `iters` at 100 or above.
+  double p99_us = 0.0;
   int iterations = 0;
 };
+
+// Mean, stddev and order statistics from a sample vector. Shared so the
+// steady_clock path, the event-timed path and the pre-collected-sample path
+// (Summarize, below) cannot drift in how they compute the same columns.
+Timing StatsOf(std::vector<double> samples) {
+  Timing t;
+  t.iterations = static_cast<int>(samples.size());
+  if (samples.empty()) return t;
+
+  const double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
+  t.mean_us = sum / static_cast<double>(samples.size());
+  double var = 0.0;
+  for (const double s : samples) var += (s - t.mean_us) * (s - t.mean_us);
+  t.stddev_us = std::sqrt(var / static_cast<double>(samples.size()));
+  std::sort(samples.begin(), samples.end());
+  t.min_us = samples.front();
+  t.p50_us = samples[samples.size() / 2];
+  const std::size_t rank = static_cast<std::size_t>(
+      std::ceil(0.99 * static_cast<double>(samples.size())));
+  t.p99_us = samples[(rank == 0 ? 1 : rank) - 1];
+  return t;
+}
 
 // Runs `warmup` discarded iterations, then `iters` timed ones. `body` must do
 // the work and nothing else: set up buffers before calling.
@@ -98,18 +148,10 @@ Timing Measure(int warmup, int iters, const std::function<void()>& body) {
         std::chrono::duration<double, std::micro>(t1 - t0).count());
   }
 
-  Timing t;
+  Timing t = StatsOf(std::move(samples));
+  // Preserved from before StatsOf existed: a zero-sample run still reports
+  // the iteration count it was asked for rather than 0.
   t.iterations = iters;
-  if (samples.empty()) return t;
-
-  const double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
-  t.mean_us = sum / static_cast<double>(samples.size());
-  double var = 0.0;
-  for (const double s : samples) var += (s - t.mean_us) * (s - t.mean_us);
-  t.stddev_us = std::sqrt(var / static_cast<double>(samples.size()));
-  std::sort(samples.begin(), samples.end());
-  t.min_us = samples.front();
-  t.p50_us = samples[samples.size() / 2];
   return t;
 }
 
@@ -141,6 +183,63 @@ void Row(const std::string& geometry, const Timing& t, double bytes,
 // for to be, not because a measurement failed.
 void HostSkipped() {
   std::printf("  [host]   skipped (--device-only)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Reporting: the whole-MoE-block rows
+// ---------------------------------------------------------------------------
+// Two extra tables rather than extra columns on Header/Row, for two reasons.
+// The mean/sd/min table above is what every other section prints and widening
+// it would churn six sections to serve two. And these two rows are read for a
+// different question: decode is a latency-critical single-token step, so the
+// columns that matter are p50 and the tail, not the mean -- a mean over a
+// run that contains one descheduled iteration reports a latency the operator
+// never had.
+void HeaderBlockLatency(const char* kernel) {
+  std::printf("\n=== %s ===\n", kernel);
+  std::printf("%-30s %10s %10s %10s %9s %11s %11s\n", "geometry", "p50 us",
+              "p99 us", "mean us", "sd us", "GB/s", "GFLOP/s");
+  std::printf("%-30s %10s %10s %10s %9s %11s %11s\n",
+              "------------------------------", "----------", "----------",
+              "----------", "---------", "-----------", "-----------");
+}
+
+// p50 drives the derived rates, not the mean: the bandwidth and FLOP columns
+// are meant to describe a typical iteration, and the mean is the one
+// statistic here a single stall can move arbitrarily far.
+void RowBlockLatency(const std::string& geometry, const Timing& t,
+                     double bytes, double flops) {
+  const double secs = t.p50_us * 1e-6;
+  const double gbs = secs > 0.0 ? bytes / secs / 1e9 : 0.0;
+  const double gflops = secs > 0.0 ? flops / secs / 1e9 : 0.0;
+  std::printf("%-30s %10.2f %10.2f %10.2f %9.2f %11.2f %11.2f\n",
+              geometry.c_str(), t.p50_us, t.p99_us, t.mean_us, t.stddev_us,
+              gbs, gflops);
+}
+
+void HeaderBlockThroughput(const char* kernel) {
+  std::printf("\n=== %s ===\n", kernel);
+  std::printf("%-18s %10s %10s %9s %13s %10s %9s %10s\n", "geometry", "p50 us",
+              "p99 us", "sd us", "tokens/s", "GB/s", "FLOP/B", "TFLOP/s");
+  std::printf("%-18s %10s %10s %9s %13s %10s %9s %10s\n", "------------------",
+              "----------", "----------", "---------", "-------------",
+              "----------", "---------", "----------");
+}
+
+// `bytes` is COMPULSORY traffic -- each distinct operand moved once -- so
+// FLOP/B here is the intensity of the problem, not of the execution. The
+// prefill section says below why the executed traffic can be a multiple of
+// it and why that multiple is not knowable from the host.
+void RowBlockThroughput(const std::string& geometry, const Timing& t,
+                        double tokens, double bytes, double flops) {
+  const double secs = t.p50_us * 1e-6;
+  const double toks = secs > 0.0 ? tokens / secs : 0.0;
+  const double gbs = secs > 0.0 ? bytes / secs / 1e9 : 0.0;
+  const double tflops = secs > 0.0 ? flops / secs / 1e12 : 0.0;
+  const double intensity = bytes > 0.0 ? flops / bytes : 0.0;
+  std::printf("%-18s %10.2f %10.2f %9.2f %13.1f %10.2f %9.3f %10.3f\n",
+              geometry.c_str(), t.p50_us, t.p99_us, t.stddev_us, toks, gbs,
+              intensity, tflops);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +515,594 @@ void BenchDsv4ExpertDevice(const DeviceCtx& ctx, int warmup, int iters) {
   char geo[64];
   std::snprintf(geo, sizeof(geo), "[device] h=%u i=%u", kHidden, kInter);
   Row(geo, t, bytes, flops);
+}
+
+// ---------------------------------------------------------------------------
+// Device-timeline timing, for the whole-MoE-block rows
+// ---------------------------------------------------------------------------
+// WHAT THE EVENT WINDOW DOES AND DOES NOT CONTAIN. "Hardware event timer"
+// invites reading the number as an isolated kernel time, and it is not one.
+// The window is bracketed by two aclrtRecordEvent calls on `stream` around
+// the Launch* call, so it spans the wrapper's tiling H2D and the kernel --
+// but the v1 wrappers synchronize the stream and free the staging buffer
+// before returning (CLAUDE.md section 3.7), so the trailing aclrtFree and the
+// return into this loop land inside the window too. It is tighter than the
+// steady_clock rows above, which additionally carry the tiling aclrtMalloc
+// and the host-side call overhead, and it is still a host-observed round trip
+// with a kernel inside it. Isolating the kernel needs a caller-owned-tiling
+// wrapper variant, which does not exist (section 3.7).
+//
+// `prologue` runs BEFORE the start record. That is where the decode path's
+// y zeroing goes: zeroing the accumulator is a caller obligation of the
+// atomic-add summation contract (section 3.4), not work the kernel does, so
+// timing it would charge the operator for its own ABI.
+//
+// Nothing in this section has been executed on hardware (section 5.7).
+class EventPair {
+ public:
+  EventPair() = default;
+  EventPair(const EventPair&) = delete;
+  EventPair& operator=(const EventPair&) = delete;
+  ~EventPair() {
+    if (stop_ != nullptr) (void)aclrtDestroyEvent(stop_);
+    if (start_ != nullptr) (void)aclrtDestroyEvent(start_);
+  }
+
+  // ACL_EVENT_TIME_LINE is what makes the event carry a timestamp; an event
+  // created without it can be waited on but not subtracted.
+  aclError Create() {
+    aclError rc = aclrtCreateEventWithFlag(&start_, ACL_EVENT_TIME_LINE);
+    if (rc == ACL_SUCCESS) {
+      rc = aclrtCreateEventWithFlag(&stop_, ACL_EVENT_TIME_LINE);
+    }
+    return rc;
+  }
+
+  aclrtEvent start() const noexcept { return start_; }
+  aclrtEvent stop() const noexcept { return stop_; }
+
+ private:
+  aclrtEvent start_ = nullptr;
+  aclrtEvent stop_ = nullptr;
+};
+
+bool TimedLaunchEvents(const std::function<moe::kernels::arch35::Status()>& launch,
+                       const std::function<aclError()>& prologue,
+                       aclrtStream stream, int warmup, int iters, Timing* out,
+                       std::string* why) {
+  using moe::kernels::arch35::Status;
+
+  EventPair ev;
+  aclError rc = ev.Create();
+  if (rc != ACL_SUCCESS) {
+    *why = AclFail("aclrtCreateEventWithFlag(ACL_EVENT_TIME_LINE)", rc);
+    return false;
+  }
+
+  std::vector<double> samples;
+  samples.reserve(static_cast<std::size_t>(iters < 0 ? 0 : iters));
+
+  const int total = (warmup < 0 ? 0 : warmup) + (iters < 1 ? 1 : iters);
+  for (int i = 0; i < total; ++i) {
+    if (prologue) {
+      rc = prologue();
+      if (rc != ACL_SUCCESS) {
+        *why = AclFail("prologue (accumulator zeroing)", rc);
+        return false;
+      }
+      // The prologue is enqueued on `stream`, so it must retire before the
+      // start record or its cost lands inside the window.
+      rc = aclrtSynchronizeStream(stream);
+      if (rc != ACL_SUCCESS) {
+        *why = AclFail("aclrtSynchronizeStream(prologue)", rc);
+        return false;
+      }
+    }
+
+    rc = aclrtRecordEvent(ev.start(), stream);
+    if (rc != ACL_SUCCESS) {
+      *why = AclFail("aclrtRecordEvent(start)", rc);
+      return false;
+    }
+
+    const Status st = launch();
+    if (st != Status::success) {
+      // Every ACL failure inside a wrapper is recorded (CLAUDE.md section
+      // 3.5), so report the record rather than just the Status -- otherwise a
+      // tiling malloc, a bad grid and a device fault all read the same.
+      const auto& f = moe::kernels::arch35::LastLaunchFailure();
+      *why = "launch returned Status=" +
+             std::to_string(static_cast<unsigned>(st)) + " [op=" +
+             std::string(f.op != nullptr ? f.op : "-") + ", call=" +
+             std::string(f.call != nullptr ? f.call : "-") +
+             ", aclError=" + std::to_string(f.acl_error) + "]";
+      return false;
+    }
+
+    rc = aclrtRecordEvent(ev.stop(), stream);
+    if (rc == ACL_SUCCESS) rc = aclrtSynchronizeStream(stream);
+    if (rc != ACL_SUCCESS) {
+      *why = AclFail("aclrtRecordEvent(stop)/aclrtSynchronizeStream", rc);
+      return false;
+    }
+
+    float ms = 0.0F;
+    rc = aclrtEventElapsedTime(&ms, ev.start(), ev.stop());
+    if (rc != ACL_SUCCESS) {
+      *why = AclFail("aclrtEventElapsedTime", rc);
+      return false;
+    }
+    if (i >= (warmup < 0 ? 0 : warmup)) {
+      samples.push_back(static_cast<double>(ms) * 1000.0);
+    }
+
+    // Both events are reused across iterations. aclrtResetEvent requires the
+    // stream's tasks to have completed, which the synchronize above
+    // guarantees.
+    rc = aclrtResetEvent(ev.start(), stream);
+    if (rc == ACL_SUCCESS) rc = aclrtResetEvent(ev.stop(), stream);
+    if (rc != ACL_SUCCESS) {
+      *why = AclFail("aclrtResetEvent", rc);
+      return false;
+    }
+  }
+
+  *out = StatsOf(std::move(samples));
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// The whole-MoE-block geometry, shared by the decode and prefill sections
+// ---------------------------------------------------------------------------
+// Spelled locally rather than pulled from op_host/dsv4_moe_block_tiling.h:
+// that header is operator-private (CLAUDE.md section 1.2). The strides below
+// are the ones MakeDsv4Moe*Tiling derives and validates; if they ever
+// disagree the builder returns unsupported_shape, so a drift surfaces as a
+// failed row rather than as a wrong number.
+struct BlockGeometry {
+  static constexpr std::uint32_t kHidden = 4096;
+  static constexpr std::uint32_t kInter = 2048;
+  static constexpr std::uint32_t kGroup = 32;  // MXFP4 block size
+
+  static constexpr std::size_t kW13PackedExpert =
+      static_cast<std::size_t>(kInter) * (kHidden / 2);
+  static constexpr std::size_t kW13ScaleExpert =
+      static_cast<std::size_t>(kInter) * (kHidden / kGroup);
+  static constexpr std::size_t kW2PackedExpert =
+      static_cast<std::size_t>(kHidden) * (kInter / 2);
+  static constexpr std::size_t kW2ScaleExpert =
+      static_cast<std::size_t>(kHidden) * (kInter / kGroup);
+
+  // One expert's whole weight stream: 3 x 4 MiB packed + 3 x 256 KiB scales
+  // = 13,369,344 B = 12.75 MiB. This is the number the decode row's
+  // bandwidth is built from.
+  static constexpr std::size_t kBytesPerExpert =
+      2 * (kW13PackedExpert + kW13ScaleExpert) +
+      (kW2PackedExpert + kW2ScaleExpert);
+
+  // Three GEMVs of inter*hidden multiply-adds per token-expert evaluation.
+  // The SwiGLU is deliberately NOT counted, for the same reason as the
+  // single-expert row above: it is O(inter) transcendental work against
+  // 50 MFLOP, and pricing a sigmoid at one flop would be arbitrary.
+  static constexpr double kFlopsPerTokenExpert =
+      3.0 * 2.0 * static_cast<double>(kInter) * static_cast<double>(kHidden);
+};
+
+// The weight buffers for a pool of `num_experts`, with `fill_experts` of them
+// carrying real data at their strided offsets.
+//
+// WHY NOT UPLOAD THE WHOLE POOL. At num_experts = 64 the pool is 816 MiB and
+// the host-side random fill alone would dominate the run. Only the routed
+// experts are ever read, so the rest is left zeroed: an all-zero MXFP4 row
+// decodes to zero, which is finite and harmless, and the kernel never
+// touches it anyway. This is a benchmark -- a wrong number in an unread
+// expert cannot become a wrong answer (CLAUDE.md section 4.6).
+struct ExpertPool {
+  DeviceBuffer w1p, w1s, w3p, w3s, w2p, w2s;
+
+  aclError Stage(std::uint32_t num_experts,
+                 const std::vector<std::int32_t>& fill_experts,
+                 std::uint64_t seed) {
+    using G = BlockGeometry;
+    const std::size_t n = num_experts;
+    aclError rc = w1p.Alloc(n * G::kW13PackedExpert);
+    if (rc == ACL_SUCCESS) rc = w3p.Alloc(n * G::kW13PackedExpert);
+    if (rc == ACL_SUCCESS) rc = w2p.Alloc(n * G::kW2PackedExpert);
+    if (rc == ACL_SUCCESS) rc = w1s.Alloc(n * G::kW13ScaleExpert);
+    if (rc == ACL_SUCCESS) rc = w3s.Alloc(n * G::kW13ScaleExpert);
+    if (rc == ACL_SUCCESS) rc = w2s.Alloc(n * G::kW2ScaleExpert);
+    if (rc != ACL_SUCCESS) return rc;
+
+    if (rc == ACL_SUCCESS) rc = w1p.Zero();
+    if (rc == ACL_SUCCESS) rc = w3p.Zero();
+    if (rc == ACL_SUCCESS) rc = w2p.Zero();
+    if (rc == ACL_SUCCESS) rc = w1s.Zero();
+    if (rc == ACL_SUCCESS) rc = w3s.Zero();
+    if (rc == ACL_SUCCESS) rc = w2s.Zero();
+    if (rc != ACL_SUCCESS) return rc;
+
+    Rng rng(seed);
+    // E8M0 near the bias (127) so the decode cannot overflow to inf and turn
+    // the measurement into a run over NaNs -- the same band the single-expert
+    // row uses.
+    const std::vector<std::uint8_t> p13 = rng.bytes(G::kW13PackedExpert);
+    const std::vector<std::uint8_t> p13b = rng.bytes(G::kW13PackedExpert);
+    const std::vector<std::uint8_t> p2 = rng.bytes(G::kW2PackedExpert);
+    const std::vector<std::uint8_t> s13 =
+        rng.bytes(G::kW13ScaleExpert, 120, 134);
+    const std::vector<std::uint8_t> s13b =
+        rng.bytes(G::kW13ScaleExpert, 120, 134);
+    const std::vector<std::uint8_t> s2 = rng.bytes(G::kW2ScaleExpert, 120, 134);
+
+    for (const std::int32_t e : fill_experts) {
+      const std::size_t i = static_cast<std::size_t>(e);
+      rc = UploadAt(w1p, i * G::kW13PackedExpert, p13);
+      if (rc == ACL_SUCCESS) rc = UploadAt(w3p, i * G::kW13PackedExpert, p13b);
+      if (rc == ACL_SUCCESS) rc = UploadAt(w2p, i * G::kW2PackedExpert, p2);
+      if (rc == ACL_SUCCESS) rc = UploadAt(w1s, i * G::kW13ScaleExpert, s13);
+      if (rc == ACL_SUCCESS) rc = UploadAt(w3s, i * G::kW13ScaleExpert, s13b);
+      if (rc == ACL_SUCCESS) rc = UploadAt(w2s, i * G::kW2ScaleExpert, s2);
+      if (rc != ACL_SUCCESS) return rc;
+    }
+    return ACL_SUCCESS;
+  }
+
+ private:
+  // DeviceBuffer::Upload only writes at the base, and the pool layout needs
+  // an offset, so this is the one place a raw aclrtMemcpy is warranted.
+  static aclError UploadAt(const DeviceBuffer& dst, std::size_t offset,
+                           const std::vector<std::uint8_t>& src) {
+    return aclrtMemcpy(static_cast<std::uint8_t*>(dst.get()) + offset,
+                       dst.bytes() - offset, src.data(), src.size(),
+                       ACL_MEMCPY_HOST_TO_DEVICE);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// device: dsv4_moe_decode_topk
+//
+// One token, top_k routed experts, block_dim == top_k: one AIV owns a whole
+// expert end to end, so `activated` never reaches GM. This is the row the
+// design note in launch.hpp explicitly says has never been measured -- the
+// decision to take parallelism from the experts rather than the row tiles
+// leaves 26 of 32 AIVs idle at top_k = 6, bought in exchange for keeping the
+// w1/w3 weight stream at 1x on a kernel measured at 3.76 FLOP/B.
+//
+// TRAFFIC. Each of the top_k cores reads its own expert's 12.75 MiB exactly
+// once, so the compulsory figure IS the executed figure here -- no two cores
+// share an expert in a top_k set of distinct ids, so there is no reuse to
+// over- or under-count. Plus x read by every core (top_k x 16 KiB; it is 16
+// KiB of the 76.5 MiB stream) and y written once per slot by the atomic add.
+// At top_k = 6 that is 6 x 12.75 MiB = 76.5 MiB against 302 MFLOP, i.e.
+// ~3.76 FLOP/B: bandwidth-bound by a wide margin, so GB/s is the column that
+// says whether this kernel is doing well.
+//
+// THE ACCUMULATOR MUST BE ZEROED BEFORE EVERY TIMED LAUNCH. Decode sums the
+// top_k slots into y with an atomic-add store and the wrapper does not touch
+// operand data (CLAUDE.md section 3.4), so a benchmark loop that zeroed once
+// and then ran 100 iterations would be measuring a kernel accumulating into
+// a growing y -- arithmetically garbage, and on this geometry it would reach
+// inf within a few dozen iterations. The zeroing is the `prologue` above and
+// sits outside the event window.
+//
+// Returns the p50 in `out_p50_us` so the caller can form the speedup against
+// the legacy sequential path; false means the row failed and said why.
+bool BenchDecodePool(const DeviceCtx& ctx, int warmup, int iters,
+                     std::uint32_t num_experts,
+                     const std::vector<std::int32_t>& topk_ids,
+                     const std::vector<float>& routing_weights,
+                     double* out_p50_us) {
+  using namespace moe::kernels::arch35;
+  using G = BlockGeometry;
+
+  const std::uint32_t top_k = static_cast<std::uint32_t>(topk_ids.size());
+
+  ExpertPool pool;
+  aclError rc = pool.Stage(num_experts, topk_ids, 0xD54E0DEULL);
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] experts=%u: pool staging failed (%s)\n",
+                num_experts, AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return false;
+  }
+
+  Rng rng(0xD54E01ULL);
+  const std::vector<float> x = rng.normal(G::kHidden);
+
+  DeviceBuffer d_x, d_ids, d_rw, d_y;
+  rc = d_x.Alloc(G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_ids.Alloc(top_k * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS) rc = d_rw.Alloc(top_k * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS)
+    rc = d_ids.Upload(topk_ids.data(), top_k * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS)
+    rc = d_rw.Upload(routing_weights.data(), top_k * sizeof(float));
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] experts=%u: setup failed (%s)\n", num_experts,
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return false;
+  }
+
+  Timing t;
+  std::string why;
+  const bool ok = TimedLaunchEvents(
+      [&] {
+        return LaunchDsv4MoeDecodeTopk(
+            d_x.as<float>(), pool.w1p.as<Mxfp4Pair>(), pool.w1s.as<E8M0>(),
+            pool.w3p.as<Mxfp4Pair>(), pool.w3s.as<E8M0>(),
+            pool.w2p.as<Mxfp4Pair>(), pool.w2s.as<E8M0>(),
+            d_ids.as<std::int32_t>(), d_rw.as<float>(), G::kHidden, G::kInter,
+            num_experts, top_k, d_y.as<float>(), ctx.stream);
+      },
+      // The accumulator zeroing, outside the window. Async on `stream` so it
+      // is ordered against the launch rather than against the host.
+      [&] {
+        return aclrtMemsetAsync(d_y.get(), d_y.bytes(), 0, d_y.bytes(),
+                                ctx.stream);
+      },
+      ctx.stream, warmup, iters, &t, &why);
+  if (!ok) {
+    std::printf("  [device] experts=%u top_k=%u: FAILED -- %s\n", num_experts,
+                top_k, why.c_str());
+    return false;
+  }
+
+  const double bytes =
+      static_cast<double>(top_k) * static_cast<double>(G::kBytesPerExpert) +
+      static_cast<double>(top_k) * static_cast<double>(G::kHidden) * 4.0 +
+      static_cast<double>(top_k) * static_cast<double>(G::kHidden) * 4.0;
+  const double flops =
+      static_cast<double>(top_k) * G::kFlopsPerTokenExpert;
+
+  char geo[64];
+  std::snprintf(geo, sizeof(geo), "[device] pool=%u top_k=%u", num_experts,
+                top_k);
+  RowBlockLatency(geo, t, bytes, flops);
+  if (out_p50_us != nullptr) *out_p50_us = t.p50_us;
+  return true;
+}
+
+void BenchDsv4MoeDecodeTopkDevice(const DeviceCtx& ctx, int warmup,
+                                  int iters) {
+  using namespace moe::kernels::arch35;
+  using G = BlockGeometry;
+
+  // Neither sorted nor the identity, so a row measuring a kernel that used
+  // the SLOT index instead of topk_expert_ids[slot] would at least be
+  // measuring the same addressing the correctness suite exercises.
+  const std::vector<std::int32_t> ids_tight = {4, 0, 5, 2, 1, 3};
+  const std::vector<float> routing_weights = {0.35F, 0.25F, 0.15F,
+                                              0.10F, 0.08F, 0.07F};
+
+  double p50_tight = 0.0;
+  const bool have_tight = BenchDecodePool(ctx, warmup, iters, 6, ids_tight,
+                                          routing_weights, &p50_tight);
+
+  // A SECOND POOL SIZE, because the first one cannot answer the question it
+  // looks like it answers. At num_experts = 6 the routed set IS the whole
+  // resident pool and the six weight streams are contiguous -- which
+  // launch.hpp blesses as a valid staging ("passing ids 0..top_k-1 is as
+  // valid as keeping all 256 resident"), but which is also the most
+  // favourable address pattern this kernel will ever see. A production
+  // decode step picks 6 of a resident pool, so the six streams are scattered
+  // across hundreds of MiB. The traffic is identical; the page and TLB
+  // behaviour is not, and that difference is the whole reason to run this
+  // row.
+  //
+  // 64 rather than 256: the pool is 64 x 12.75 MiB = 816 MiB, and 256 would
+  // be 3.26 GiB of HBM for a benchmark. If even 816 MiB does not allocate the
+  // row says so and the section continues -- a benchmark is never a gate
+  // (CLAUDE.md section 4.6).
+  const std::vector<std::int32_t> ids_sparse = {40, 0, 55, 23, 11, 37};
+  (void)BenchDecodePool(ctx, warmup, iters, 64, ids_sparse, routing_weights,
+                        nullptr);
+
+  // ---- the legacy sequential baseline --------------------------------
+  //
+  // What the decode path replaces: top_k separate LaunchDsv4MoeExpert calls,
+  // each of which is TWO chevron dispatches with a GM round trip for
+  // `activated` between them, two tiling staging allocations and two
+  // wrapper-internal stream synchronizations (CLAUDE.md sections 3.7 and the
+  // dsv4_moe_expert note above).
+  //
+  // HOW TO READ THE SPEEDUP, because it flatters the new kernel in one way
+  // and penalises it in another, and neither is separable from here:
+  //   * it counts top_k x the legacy per-call HOST overhead (2 mallocs, 2
+  //     syncs, 2 frees), which a batched legacy caller would pay once per
+  //     expert but could not avoid -- the wrappers own their staging;
+  //   * against that, the legacy row below runs ONE expert's weight stream
+  //     and is multiplied by top_k, which assumes the six calls neither
+  //     contend nor share cache. On a weight-stream-bound kernel they would
+  //     contend, so the true sequential wall clock is likely WORSE than
+  //     top_k x this figure.
+  // It is a host-observed round-trip ratio, not a kernel-time ratio.
+  if (!have_tight) return;
+
+  ExpertPool one;
+  aclError rc = one.Stage(1, {0}, 0xD54E0DEULL);
+  const std::size_t workspace_bytes = Dsv4MoeExpertWorkspaceBytes(G::kInter);
+
+  Rng rng(0xD54E01ULL);
+  const std::vector<float> x = rng.normal(G::kHidden);
+
+  DeviceBuffer d_x, d_y, d_ws;
+  if (rc == ACL_SUCCESS) rc = d_x.Alloc(G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Alloc(G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_ws.Alloc(workspace_bytes);
+  if (rc == ACL_SUCCESS) rc = d_x.Upload(x.data(), G::kHidden * sizeof(float));
+  if (rc == ACL_SUCCESS) rc = d_y.Zero();
+  if (rc == ACL_SUCCESS) rc = d_ws.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] legacy baseline: setup failed (%s)\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  Timing t;
+  std::string why;
+  const bool ok = TimedLaunchEvents(
+      [&] {
+        return LaunchDsv4MoeExpert(
+            one.w1p.as<Mxfp4Pair>(), one.w1s.as<E8M0>(),
+            one.w3p.as<Mxfp4Pair>(), one.w3s.as<E8M0>(),
+            one.w2p.as<Mxfp4Pair>(), one.w2s.as<E8M0>(), G::kHidden / 2,
+            G::kHidden / G::kGroup, G::kInter / 2, G::kInter / G::kGroup,
+            d_x.as<float>(), G::kHidden, G::kInter, d_y.as<float>(),
+            d_ws.get(), workspace_bytes, ctx.stream);
+      },
+      // dsv4_moe_expert OVERWRITES y, so there is no accumulator to zero.
+      nullptr, ctx.stream, warmup, iters, &t, &why);
+  if (!ok) {
+    std::printf("  [device] legacy baseline: FAILED -- %s\n", why.c_str());
+    return;
+  }
+
+  const std::uint32_t top_k = static_cast<std::uint32_t>(ids_tight.size());
+  const double legacy_p50 = t.p50_us * static_cast<double>(top_k);
+  char geo[64];
+  std::snprintf(geo, sizeof(geo), "[device] legacy 1 expert");
+  RowBlockLatency(geo, t,
+                  static_cast<double>(G::kBytesPerExpert) +
+                      static_cast<double>(G::kHidden) * 4.0 * 2.0 +
+                      static_cast<double>(workspace_bytes) * 2.0,
+                  G::kFlopsPerTokenExpert);
+  std::printf("  [device] legacy sequential baseline: %u x %.2f us = %.2f us "
+              "p50; fused decode p50 %.2f us -> %.2fx\n",
+              top_k, t.p50_us, legacy_p50, p50_tight,
+              p50_tight > 0.0 ? legacy_p50 / p50_tight : 0.0);
+  std::printf("           The ratio is host-observed round trips, not kernel "
+              "times: it charges the legacy path\n"
+              "           top_k x (2 dispatches + 2 tiling allocations + 2 "
+              "syncs), and assumes six sequential\n"
+              "           weight streams neither contend nor share cache. "
+              "See the note above the baseline.\n");
+}
+
+// ---------------------------------------------------------------------------
+// device: dsv4_moe_prefill_batched
+//
+// M >> 1, one expert per token, 32 AIVs grid-striding over tokens. Unlike
+// decode this one saturates the grid at any M >= 32, and the question the
+// sweep answers is where the per-token weight stream stops dominating.
+//
+// THE BANDWIDTH COLUMN IS COMPULSORY TRAFFIC AND THE EXECUTED TRAFFIC IS A
+// MULTIPLE OF IT. This is the one number in this file most likely to be
+// misread, so it is stated plainly rather than buried. `bytes` counts each
+// distinct expert's 12.75 MiB once, plus x and y. The kernel grid-strides:
+// core c takes tokens c, c+32, c+64, ... so two tokens a core processes
+// consecutively are 32 apart in the batch. The caller is expected to hand in
+// tokens already GROUPED by expert (launch.hpp), so with E distinct experts
+// and M tokens a bucket spans ~M/E consecutive positions -- and a core sees
+// the same expert twice in a row only when a bucket is wider than 32
+// positions, i.e. only when M/E > 32. At M = 16 and 64 with six buckets
+// every token a core touches is a different expert from the last, so the
+// executed weight stream approaches (cores x experts touched) x 12.75 MiB,
+// up to 32x the compulsory figure; at M = 256 the buckets are ~43 wide and
+// some reuse appears.
+//
+// So GB/s here is "compulsory bytes per second" and a figure ABOVE the
+// hardware's HBM bandwidth is not an error in the row -- it means the real
+// stream is being served from cache. What the sweep shows honestly is the
+// SHAPE: tokens/s should climb steeply from M = 16 to M = 256 if reuse is
+// materialising and flatten if it is not. Neither has been observed on
+// hardware (CLAUDE.md section 5.7).
+void BenchDsv4MoePrefillBatchedDevice(const DeviceCtx& ctx, int warmup,
+                                      int iters) {
+  using namespace moe::kernels::arch35;
+  using G = BlockGeometry;
+
+  constexpr std::uint32_t kExperts = 6;  // a step's active expert set
+  const std::uint32_t kBatches[] = {16, 64, 128, 256};
+  const std::uint32_t kMaxTokens = 256;
+
+  ExpertPool pool;
+  aclError rc = pool.Stage(kExperts, {0, 1, 2, 3, 4, 5}, 0xD54E0DEULL);
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] pool staging failed (%s)\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  // One allocation at the largest M, reused by every row of the sweep: the
+  // smaller rows pass a smaller total_tokens and the kernel reads a prefix.
+  // Allocation is setup, not work, and must not sit between the rows.
+  Rng rng(0xD54E02ULL);
+  const std::vector<float> x_tokens =
+      rng.normal(static_cast<std::size_t>(kMaxTokens) * G::kHidden);
+
+  DeviceBuffer d_xt, d_yt, d_t2e;
+  const std::size_t tok_bytes =
+      static_cast<std::size_t>(kMaxTokens) * G::kHidden * sizeof(float);
+  rc = d_xt.Alloc(tok_bytes);
+  if (rc == ACL_SUCCESS) rc = d_yt.Alloc(tok_bytes);
+  if (rc == ACL_SUCCESS) rc = d_t2e.Alloc(kMaxTokens * sizeof(std::int32_t));
+  if (rc == ACL_SUCCESS) rc = d_xt.Upload(x_tokens.data(), tok_bytes);
+  // Prefill OVERWRITES y_tokens, so no zeroing is required between
+  // iterations -- there is no accumulator and hence no prologue below. It is
+  // zeroed once so a token the kernel never writes reads as 0 rather than as
+  // whatever the allocator returned.
+  if (rc == ACL_SUCCESS) rc = d_yt.Zero();
+  if (rc != ACL_SUCCESS) {
+    std::printf("  [device] setup failed (%s)\n",
+                AclFail("aclrtMalloc/aclrtMemcpy", rc).c_str());
+    return;
+  }
+
+  for (const std::uint32_t m : kBatches) {
+    // Contiguous, near-equal buckets: token t goes to expert (t*E)/M, which
+    // is the grouped-by-expert layout the contract expects from a dispatch.
+    // Correctness does not depend on the grouping, only reuse does -- which
+    // is exactly what this sweep is measuring.
+    std::vector<std::int32_t> token_to_expert(m);
+    for (std::uint32_t tok = 0; tok < m; ++tok) {
+      token_to_expert[tok] = static_cast<std::int32_t>(
+          (static_cast<std::uint64_t>(tok) * kExperts) / m);
+    }
+    rc = d_t2e.Upload(token_to_expert.data(), m * sizeof(std::int32_t));
+    if (rc != ACL_SUCCESS) {
+      std::printf("  [device] M=%u: token map upload failed (%s)\n", m,
+                  AclFail("aclrtMemcpy", rc).c_str());
+      continue;
+    }
+
+    Timing t;
+    std::string why;
+    const bool ok = TimedLaunchEvents(
+        [&] {
+          return LaunchDsv4MoePrefillBatched(
+              d_xt.as<float>(), pool.w1p.as<Mxfp4Pair>(), pool.w1s.as<E8M0>(),
+              pool.w3p.as<Mxfp4Pair>(), pool.w3s.as<E8M0>(),
+              pool.w2p.as<Mxfp4Pair>(), pool.w2s.as<E8M0>(),
+              d_t2e.as<std::int32_t>(), G::kHidden, G::kInter, kExperts, m,
+              d_yt.as<float>(), ctx.stream);
+        },
+        nullptr, ctx.stream, warmup, iters, &t, &why);
+    if (!ok) {
+      std::printf("  [device] M=%u: FAILED -- %s\n", m, why.c_str());
+      continue;
+    }
+
+    // Every one of the six buckets is non-empty at M = 16 (the smallest
+    // bucket is 2 tokens), so all six experts are touched at every point of
+    // the sweep and the compulsory weight term does not vary with M.
+    const double bytes =
+        static_cast<double>(kExperts) *
+            static_cast<double>(G::kBytesPerExpert) +
+        static_cast<double>(m) * static_cast<double>(G::kHidden) * 4.0 * 2.0;
+    const double flops = static_cast<double>(m) * G::kFlopsPerTokenExpert;
+
+    char geo[32];
+    std::snprintf(geo, sizeof(geo), "[device] M=%u E=%u", m, kExperts);
+    RowBlockThroughput(geo, t, static_cast<double>(m), bytes, flops);
+  }
+
+  std::printf("  [device] GB/s is COMPULSORY traffic (each distinct expert "
+              "once); the grid-stride schedule\n"
+              "           re-streams weights up to 32x that below M/E = 32, "
+              "so read the tokens/s trend\n"
+              "           across the sweep, not the absolute GB/s. See the "
+              "note above this function.\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -735,18 +1422,7 @@ void BenchMhcPostDevice(const DeviceCtx& ctx, int warmup, int iters) {
 // Summarize pre-collected samples. Needed because the compressor cannot use
 // Measure(): see BenchPagedCompressorDevice.
 Timing Summarize(std::vector<double> samples) {
-  Timing t;
-  t.iterations = static_cast<int>(samples.size());
-  if (samples.empty()) return t;
-  const double sum = std::accumulate(samples.begin(), samples.end(), 0.0);
-  t.mean_us = sum / static_cast<double>(samples.size());
-  double var = 0.0;
-  for (const double s : samples) var += (s - t.mean_us) * (s - t.mean_us);
-  t.stddev_us = std::sqrt(var / static_cast<double>(samples.size()));
-  std::sort(samples.begin(), samples.end());
-  t.min_us = samples.front();
-  t.p50_us = samples[samples.size() / 2];
-  return t;
+  return StatsOf(std::move(samples));
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +1590,7 @@ void BenchPagedCompressorDevice(const DeviceCtx& ctx, int warmup, int iters) {
 // Device dispatchers
 // ---------------------------------------------------------------------------
 // Always defined so the host sections can call them unconditionally; each one
-// either measures or prints why it did not. All five kernels are now wired.
+// either measures or prints why it did not. Every operator is now wired.
 void DeviceSectionMxfp4(const DeviceCtx& ctx, int warmup, int iters) {
 #if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
   if (ctx.usable) {
@@ -939,6 +1615,34 @@ void DeviceSectionDsv4Expert(const DeviceCtx& ctx, int warmup, int iters) {
   (void)iters;
 #endif
   DeviceRowUnavailable("dsv4_moe_expert", ctx);
+}
+
+void DeviceSectionDsv4MoeDecodeTopk(const DeviceCtx& ctx, int warmup,
+                                    int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchDsv4MoeDecodeTopkDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("dsv4_moe_decode_topk", ctx);
+}
+
+void DeviceSectionDsv4MoePrefillBatched(const DeviceCtx& ctx, int warmup,
+                                        int iters) {
+#if defined(MOE_KERNEL_LAUNCH_LAYER_AVAILABLE)
+  if (ctx.usable) {
+    BenchDsv4MoePrefillBatchedDevice(ctx, warmup, iters);
+    return;
+  }
+#else
+  (void)warmup;
+  (void)iters;
+#endif
+  DeviceRowUnavailable("dsv4_moe_prefill_batched", ctx);
 }
 
 void DeviceSectionPagedCompressor(const DeviceCtx& ctx, int warmup,
@@ -1294,6 +1998,50 @@ void BenchDsv4Expert(const DeviceCtx& ctx, int warmup, int iters,
 }
 
 // ---------------------------------------------------------------------------
+// 6. dsv4_moe_decode_topk -- the whole MoE block, M = 1
+//
+// NO HOST ROOFLINE HERE, and the reason is arithmetic rather than a gap.
+// The reference for this kernel is top_k independent evaluations of exactly
+// the expert body the dsv4_moe_expert host row above already measures --
+// moe_decode_topk_mxfp4_cpu loops moe_expert_swiglu_mxfp4_cpu over the
+// routed slots and sums the results. So the host figure is 6 x a number
+// already on screen, and measuring it costs ~6 x 19 ms x iters of scalar
+// single-threaded wall clock: at the default counts that is ~2.6 s, roughly
+// four times the entire current host-reference budget, to print a product
+// the reader can form from the row above.
+//
+// The device rows are what this section exists for. Both the decode and the
+// prefill entry points passed functional verification on hardware; neither
+// has ever been TIMED on it (CLAUDE.md section 5.7).
+// ---------------------------------------------------------------------------
+void BenchDsv4MoeDecodeTopk(const DeviceCtx& ctx, int warmup, int iters) {
+  HeaderBlockLatency("dsv4_moe_decode_topk (whole MoE block, M=1, top_k=6)");
+  std::printf("  [host]   not benchmarked: the reference is top_k x the "
+              "dsv4_moe_expert host row above\n           (same expert body, "
+              "summed over the routed slots), so it is that figure x 6.\n");
+  DeviceSectionDsv4MoeDecodeTopk(ctx, warmup, iters);
+}
+
+// ---------------------------------------------------------------------------
+// 7. dsv4_moe_prefill_batched -- the whole MoE block, M >> 1
+//
+// Same reasoning as above and more so: the host reference is M evaluations
+// of the expert body, which at M = 256 is ~5 s per iteration of scalar C++.
+// The sweep is a device-side question anyway -- it is measuring whether the
+// grid-stride schedule turns a grouped token batch into weight reuse, and a
+// single-threaded host loop has no schedule to measure.
+// ---------------------------------------------------------------------------
+void BenchDsv4MoePrefillBatched(const DeviceCtx& ctx, int warmup, int iters) {
+  HeaderBlockThroughput(
+      "dsv4_moe_prefill_batched (whole MoE block, M sweep, 6 experts)");
+  std::printf("  [host]   not benchmarked: the reference is M x the "
+              "dsv4_moe_expert host row above, ~5 s per\n           iteration "
+              "at M=256, and a scalar host loop has no grid schedule to "
+              "measure.\n");
+  DeviceSectionDsv4MoePrefillBatched(ctx, warmup, iters);
+}
+
+// ---------------------------------------------------------------------------
 // 5. paged_compressor_rope
 //
 // The reference's decode cadence is stateful (a persistent ring buffer across
@@ -1428,6 +2176,8 @@ int main(int argc, char** argv) {
   BenchIndexer(ctx, warmup, iters, device_only);
   BenchMxfp4Gemv(ctx, warmup, iters, device_only);
   BenchDsv4Expert(ctx, warmup, iters, device_only);
+  BenchDsv4MoeDecodeTopk(ctx, warmup, iters);
+  BenchDsv4MoePrefillBatched(ctx, warmup, iters);
   BenchPagedCompressor(ctx, warmup, iters);
   ReportScaling(ctx);
 
