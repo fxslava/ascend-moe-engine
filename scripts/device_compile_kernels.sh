@@ -149,6 +149,7 @@ EXTRA_KERNELS="
 fast_fp8_indexer_topk:fast_fp8_indexer_score_kernel
 fast_fp8_indexer_topk:fast_fp8_indexer_select_kernel
 dsv4_moe_expert:dsv4_moe_block_kernel
+dsv4_moe_expert:dsv4_moe_prefill_cube_kernel
 "
 
 for e in $EXTRA_KERNELS; do
@@ -168,6 +169,8 @@ done
 EXTRA_HOST="
 dsv4_moe_expert:dsv4_moe_block
 dsv4_moe_expert:dsv4_moe_block_tiling
+dsv4_moe_expert:dsv4_moe_prefill_cube
+dsv4_moe_expert:dsv4_moe_prefill_cube_tiling
 "
 
 for e in $EXTRA_HOST; do

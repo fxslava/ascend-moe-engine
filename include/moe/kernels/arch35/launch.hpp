@@ -275,6 +275,57 @@ Status LaunchDsv4MoeDecodeTopk(
     std::uint32_t top_k, float* y_gm, float* activated_ws_gm,
     aclrtStream stream);
 
+// ---------------------------------------------------------------------------
+// dsv4_moe_prefill_cube -- the same prefill arithmetic on the CUBE, in BF16
+// ---------------------------------------------------------------------------
+// A W4A16 path: weights stay MXFP4 in GM and are dequantized to BF16
+// EXACTLY (E2M1 needs two mantissa bits, the E8M0 scale is a power of two,
+// BF16 keeps eight), while X is cast FP32 -> BF16, which is the only lossy
+// step. Compare against an oracle that casts X the same way; BF16 keeps an
+// 8-bit mantissa, so one store carries up to 2^-9 relative error (§4.7).
+//
+// It is NOT the native Cube MXFP4 path, and cannot be: MmadMx admits only
+// fp4/fp8 for BOTH operands -- there is no float or bfloat16_t A-matrix
+// overload -- so 1730 TFLOPS would require quantizing activations to a ~2-bit
+// mantissa and retiring the weight-only golden. Cube BF16 is 432 TFLOPS, and
+// against 1.6 TB/s the two are indistinguishable below M ~ 68 because neither
+// beats the memory system there. NEVER MEASURED on hardware (§5.7).
+//
+// `workspace_gm` is CALLER-OWNED and must be at least
+// Dsv4MoePrefillCubeWorkspaceBytes(total_tokens, hidden, inter). It carries
+// the Matmul KFC message queue AND the dequantized weight planes; it needs no
+// initialization and nothing in it outlives the call.
+//
+// `x_tokens_gm` is expected ALREADY GROUPED BY EXPERT, as for the AIV prefill
+// entry point: that ordering is what lets one dequantization of an expert
+// serve its whole token group, which is where this path's advantage comes
+// from.
+Status LaunchDsv4MoePrefillCube(
+    const float* x_tokens_gm, const Mxfp4Pair* w1_packed_gm,
+    const E8M0* w1_scale_gm, const Mxfp4Pair* w3_packed_gm,
+    const E8M0* w3_scale_gm, const Mxfp4Pair* w2_packed_gm,
+    const E8M0* w2_scale_gm, const std::int32_t* token_to_expert_gm,
+    std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
+    std::uint32_t total_tokens, float* y_tokens_gm, void* workspace_gm,
+    aclrtStream stream);
+
+// The workspace size the caller must allocate for LaunchDsv4MoePrefillCube.
+// Public for the same reason the decode one is: the caller allocates it.
+inline constexpr std::uint64_t Dsv4MoePrefillCubeWorkspaceBytes(
+    std::uint32_t total_tokens, std::uint32_t hidden,
+    std::uint32_t inter) noexcept {
+  // KFC message queue reserve, then X in BF16, then W1+W3, then W2. Widened
+  // before every multiply (§2.7): w13 alone is 32 MiB at 4096x2048.
+  const std::uint64_t kKfcReserve = 1ull << 20;
+  const std::uint64_t x_bf16 =
+      static_cast<std::uint64_t>(total_tokens) * hidden * 2u;
+  const std::uint64_t w13_bf16 =
+      2ull * static_cast<std::uint64_t>(inter) * hidden * 2u;
+  const std::uint64_t w2_bf16 =
+      static_cast<std::uint64_t>(hidden) * inter * 2u;
+  return kKfcReserve + x_bf16 + w13_bf16 + w2_bf16;
+}
+
 Status LaunchDsv4MoePrefillBatched(
     const float* x_tokens_gm, const Mxfp4Pair* w1_packed_gm,
     const E8M0* w1_scale_gm, const Mxfp4Pair* w3_packed_gm,

@@ -83,6 +83,10 @@ set(MOE_ARCH35_EXTRA_KERNEL_SOURCES
   # points of that operator -- one directory, one host ABI, one tiling POD --
   # so they are listed here rather than added to MOE_ARCH35_OPS.
   "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_block_kernel.cpp"
+  # dsv4_moe_prefill_cube: the same prefill arithmetic with W1/W3/W2 on the
+  # CUBE in BF16, as a MIX AIC+AIV kernel. A third entry point of the same
+  # operator, so it is listed here for the same reason as the two above.
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
 )
 
 # Additional op_host TUs: the launch wrappers and tiling builders belonging to
@@ -94,6 +98,8 @@ set(MOE_ARCH35_EXTRA_KERNEL_SOURCES
 set(MOE_ARCH35_EXTRA_HOST_SOURCES
   "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block.cpp"
   "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.cpp"
 )
 
 foreach(_src IN LISTS MOE_ARCH35_EXTRA_HOST_SOURCES)
