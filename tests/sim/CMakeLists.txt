@@ -165,6 +165,11 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     ${_dsv4_asc_objects}
   )
   add_dependencies(test_dsv4_moe_block_sim dsv4_moe_expert_camodel_objects)
+  # The suite runs each launch under a hang watchdog on its own thread: an
+  # unbalanced event handshake in the tile ring presents as a hang, and
+  # without this the only symptom is ctest expiring with no launch named.
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_dsv4_moe_block_sim PRIVATE Threads::Threads)
   target_include_directories(test_dsv4_moe_block_sim PRIVATE
     "${CMAKE_SOURCE_DIR}/include"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
@@ -190,20 +195,30 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   if(DSV4_WERROR)
     target_compile_options(test_dsv4_moe_block_sim PRIVATE -Werror)
   endif()
-  # TIMEOUT is 6 hours, and the reason is structural rather than a guess.
+  # TIMEOUT is 6 hours. MEASURED, 2026-10-15: this suite takes ~4,930 s
+  # (~82 min) at hidden = inter = 512, top_k = 2, tokens = 2, block_dim = 2,
+  # over ~1.5 M simulated cycles. So the budget is ~4.4x headroom, which is
+  # about right for a shared host -- do not tune it to the measurement.
   #
-  # CAModel cost tracks PER-CORE instruction count, not total work. The
-  # retired two-phase kernel spread one expert over 32 cores, so a 512x512
-  # case was ~24.6 K MACs per core and finished in ~260 s. These kernels are
-  # monolithic by design: one core runs a whole expert, which at the SMALLEST
-  # admissible width is 3 * 512 * 512 = 786 K MACs on a single core -- ~32x
-  # the per-core work for ~32x the simulator time, per launch, and this suite
-  # issues two launches.
+  # DO NOT PREDICT THIS NUMBER FROM THE SINGLE-EXPERT SUITE. Two attempts at
+  # a closed-form cost model were both wrong by a wide margin, in opposite
+  # directions, and the error in each was extrapolating across KERNELS:
   #
-  # It cannot be tuned down. Shrinking top_k or the token count only idles
-  # cores; per-core work is one whole expert either way. And the width cannot
-  # go below 512, the reduction quantum (kMoeBlockReductionQuantum), because
-  # below it a row's group count no longer divides across the 16 lanes.
+  #   per-core reading   (one core runs a whole expert, 786 K MACs, ~32x the
+  #                      retired two-phase kernel's ~24.6 K per core)
+  #                      -> predicts ~4.6 h.   Observed ~82 min.
+  #   total-work reading (786 K MACs -> ~260 s, 1.57 M -> ~540 s, taken from
+  #                      the single-expert suite and scaled linearly)
+  #                      -> predicts ~18 min.  Observed ~82 min.
+  #
+  # The single-expert suite is a DIFFERENT kernel on a DIFFERENT grid (32
+  # cores, two-phase) and CAModel joins simulated threads in parallel, so
+  # neither its per-core nor its total-work rate carries over. Time this
+  # suite; do not derive it.
+  #
+  # The geometry cannot be tuned down either: the width cannot go below 512,
+  # the reduction quantum (kMoeBlockReductionQuantum), because below it a
+  # row's group count no longer divides across the 16 lanes.
   #
   # So this is a SOAK gate, not something to run in a tight loop. The fast
   # gates for these kernels are tests/emu (host, seconds) and the BiSheng
@@ -213,6 +228,129 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   set_tests_properties(Dsv4MoeBlockSim PROPERTIES
     LABELS "sim;arch35;camodel;functional;soak"
     TIMEOUT 21600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # -------------------------------------------------------------------------
+  # Collapsed boundary-grid gate: tests/sim/kernel/ is SIM ONLY
+  # -------------------------------------------------------------------------
+  # The sim kernel TU textually #includes the production kernel so the compute
+  # bodies are verbatim, which means it also defines the production __global__
+  # entries. It therefore must NOT be linked beside dsv4_moe_block_kernel.o --
+  # this target links the sim objects and the tiling/launch_common TUs only.
+  set(_dsv4_sim_kernel_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_block_inductive_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_block_inductive_launch.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.cpp"
+    "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+  )
+  set(_dsv4_sim_kernel_objects)
+  foreach(_source IN LISTS _dsv4_sim_kernel_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_sim_kernel/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_sim_kernel"
+      COMMAND "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_sim_kernel_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_sim_kernel_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_block_sim_kernel_objects
+                    DEPENDS ${_dsv4_sim_kernel_objects})
+
+  add_executable(test_dsv4_moe_block_inductive_sim
+    test_dsv4_moe_block_inductive_sim.cpp
+    ${_dsv4_sim_kernel_objects}
+  )
+  add_dependencies(test_dsv4_moe_block_inductive_sim
+                   dsv4_moe_block_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_block_inductive_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_block_inductive_sim PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_dsv4_moe_block_inductive_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_block_inductive_sim PRIVATE
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_block_inductive_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+
+  # ISOLATION, ASSERTED rather than assumed: no production target may list a
+  # tests/sim/kernel/ source. The whole point of the directory is that
+  # verification scaffolding cannot reach a shipped artifact, and that holds
+  # only until someone adds a source to the wrong target during a refactor.
+  foreach(_prod_target moe_emu ascend_moe_engine arch35_device_launch)
+    if(TARGET ${_prod_target})
+      get_target_property(_prod_type ${_prod_target} TYPE)
+      if(NOT _prod_type STREQUAL "INTERFACE_LIBRARY")
+        get_target_property(_prod_sources ${_prod_target} SOURCES)
+        if(_prod_sources)
+          foreach(_prod_source IN LISTS _prod_sources)
+            if(_prod_source MATCHES "/sim/kernel/")
+              message(FATAL_ERROR
+                "Production target '${_prod_target}' lists a sim/kernel/ "
+                "source:\n  ${_prod_source}\n"
+                "Verification scaffolding must not link into a production "
+                "artifact.")
+            endif()
+          endforeach()
+        endif()
+      endif()
+    endif()
+  endforeach()
+
+  # TIMEOUT 1800. MEASURED: this gate takes ~644 s against the full suite's
+  # ~4,932 s -- a 7.7x cut. 1800 s is ~2.8x headroom.
+  #
+  # IT IS 7.7x AND NOT 16x, AND THE REASON IS WORTH KEEPING. The collapsed
+  # grid runs 4 of 16 tiles per phase on one core: ~196 K MACs against the
+  # full suite's ~3.14 M over four cores, so a sixteenth of the WORK. Solving
+  # the two measurements as t = F + W with a 1/16 work ratio:
+  #
+  #     W (variable, full grid) ~= 4,574 s
+  #     F (fixed: simulator bring-up, binary load, teardown) ~= 358 s
+  #
+  # F does not shrink. So ~358 s is the FLOOR for any CAModel run of this
+  # kernel on this host, the best possible speedup is 4932/358 ~= 13.8x even
+  # at zero work, and collapsing further than this buys very little: the
+  # variable part is already down to ~286 s.
+  #
+  # Anyone asked for a "sub-30-second" CAModel gate here should be shown this
+  # arithmetic: the fixed cost alone is ~12x that target.
+  add_test(NAME Dsv4MoeBlockInductiveSim
+           COMMAND test_dsv4_moe_block_inductive_sim)
+  set_tests_properties(Dsv4MoeBlockInductiveSim PROPERTIES
+    LABELS "sim;arch35;camodel;inductive;functional"
+    TIMEOUT 1800
     ENVIRONMENT
       "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
   )

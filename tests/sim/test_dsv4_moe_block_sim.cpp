@@ -9,282 +9,31 @@
 //
 // GEOMETRY IS CHOSEN FOR SIMULATOR COST, and the reason is worth recording.
 // These kernels are monolithic: one core runs a whole expert for a whole
-// token. CAModel wall time scales with TOTAL simulated work (measured on the
-// single-expert suite: 786 K MACs -> ~260 s, 1.57 M -> ~540 s), and total
-// work here is top_k (or token count) times a full expert. So the widths are
-// the smallest the host gate admits -- 512, the reduction quantum -- and the
-// slot and token counts are small. The LANE geometry at 512 is degenerate
+// token. So the widths are the smallest the host gate admits -- 512, the
+// reduction quantum -- and the slot and token counts are small.
+//
+// MEASURED COST, 2026-10-15: this suite takes ~4,930 s (~82 min) at the
+// constants below, over ~1.5 M simulated cycles.
+//
+// An earlier version of this comment claimed CAModel wall time scales with
+// TOTAL simulated work, citing the single-expert suite (786 K MACs -> ~260 s,
+// 1.57 M -> ~540 s) and scaling linearly. That predicts ~18 min here and is
+// wrong; the opposite per-core reading in tests/sim/CMakeLists.txt predicts
+// ~4.6 h and is also wrong. The observed ~82 min sits between them.
+//
+// The common error was extrapolating across KERNELS: the single-expert suite
+// is two-phase over 32 cores, this one is monolithic over 2, and CAModel
+// joins simulated threads in parallel, so neither rate transfers. Time a
+// suite at its own shape rather than deriving it from another's. The LANE geometry at 512 is degenerate
 // (groups_per_lane = 1, where the coalesced and the old contiguous-block maps
 // coincide); that is fine HERE because this suite is testing expert-stride
 // addressing, routing and the UB-resident `activated`, not the lane map,
 // which Dsv4MoeExpertSim covers at 1024 and tests/emu covers on the host.
 
-#include "dsv4_moe_block_tiling.h"
-#include "moe/emu/dsv4_layers.h"
-#include "moe/kernels/arch35/launch.hpp"
-
-#include <acl/acl.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <limits>
-#include <random>
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include "dsv4_moe_block_sim_common.hpp"
 
 namespace {
-constexpr std::uint32_t kHidden = 512;
-constexpr std::uint32_t kInter = 512;
-constexpr std::uint32_t kGroup = 32;
-constexpr std::uint32_t kExperts = 4;
-constexpr std::uint32_t kTopK = 2;
-constexpr std::uint32_t kTokens = 2;
-constexpr float kLimit = 10.0F;
-constexpr std::uint64_t kSeed = 0xD5A4B10CULL;
-constexpr float kAbsTolerance = 1.0e-2F;
-constexpr float kRelTolerance = 1.0e-2F;
 
-using moe::kernels::arch35::E8M0;
-using moe::kernels::arch35::Mxfp4Pair;
-
-[[noreturn]] void Fail(const std::string& message) {
-  throw std::runtime_error(message);
-}
-
-void Require(bool condition, const std::string& message) {
-  if (!condition) Fail(message);
-}
-
-std::string AclError(const char* call, aclError status) {
-  const char* recent = aclGetRecentErrMsg();
-  return std::string(call) + " failed with ACL status " +
-         std::to_string(status) + ": " +
-         (recent != nullptr ? recent : "<no recent ACL error>");
-}
-
-void RequireAcl(aclError status, const char* call) {
-  if (status != ACL_SUCCESS) Fail(AclError(call, status));
-}
-
-class Runtime {
- public:
-  Runtime() {
-    RequireAcl(aclInit(nullptr), "aclInit");
-    initialized_ = true;
-    std::uint32_t device_count = 0;
-    RequireAcl(aclrtGetDeviceCount(&device_count), "aclrtGetDeviceCount");
-    Require(device_count > 0,
-            "CAModel reports no simulated Ascend device (device count is 0)");
-    RequireAcl(aclrtSetDevice(0), "aclrtSetDevice(0)");
-    device_set_ = true;
-    RequireAcl(aclrtCreateStream(&stream_), "aclrtCreateStream");
-  }
-
-  Runtime(const Runtime&) = delete;
-  Runtime& operator=(const Runtime&) = delete;
-
-  ~Runtime() {
-    if (stream_ != nullptr) aclrtDestroyStream(stream_);
-    if (device_set_) aclrtResetDevice(0);
-    if (initialized_) aclFinalize();
-  }
-
-  aclrtStream stream() const noexcept { return stream_; }
-
-  void Close() {
-    if (stream_ != nullptr) {
-      RequireAcl(aclrtDestroyStream(stream_), "aclrtDestroyStream");
-      stream_ = nullptr;
-    }
-    if (device_set_) {
-      RequireAcl(aclrtResetDevice(0), "aclrtResetDevice(0)");
-      device_set_ = false;
-    }
-    if (initialized_) {
-      RequireAcl(aclFinalize(), "aclFinalize");
-      initialized_ = false;
-    }
-  }
-
- private:
-  aclrtStream stream_ = nullptr;
-  bool initialized_ = false;
-  bool device_set_ = false;
-};
-
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
-    Require(bytes_ > 0, "device buffer size must be nonzero");
-    RequireAcl(aclrtMalloc(&pointer_, bytes_, ACL_MEM_MALLOC_HUGE_FIRST),
-               "aclrtMalloc");
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  ~DeviceBuffer() {
-    if (pointer_ != nullptr) {
-      const aclError status = aclrtFree(pointer_);
-      if (status != ACL_SUCCESS) {
-        std::fprintf(stderr, "[CLEANUP] %s\n",
-                     AclError("aclrtFree", status).c_str());
-      }
-    }
-  }
-
-  void* get() const noexcept { return pointer_; }
-  std::size_t bytes() const noexcept { return bytes_; }
-
-  void Zero() {
-    RequireAcl(aclrtMemset(pointer_, bytes_, 0, bytes_), "aclrtMemset");
-  }
-
- private:
-  void* pointer_ = nullptr;
-  std::size_t bytes_;
-};
-
-template <typename T>
-void CopyToDevice(DeviceBuffer& destination, const std::vector<T>& source) {
-  const std::size_t bytes = source.size() * sizeof(T);
-  Require(destination.bytes() >= bytes, "host-to-device copy exceeds buffer");
-  RequireAcl(aclrtMemcpy(destination.get(), destination.bytes(), source.data(),
-                         bytes, ACL_MEMCPY_HOST_TO_DEVICE),
-             "aclrtMemcpy(HOST_TO_DEVICE)");
-}
-
-template <typename T>
-void CopyFromDevice(std::vector<T>& destination, const DeviceBuffer& source) {
-  const std::size_t bytes = destination.size() * sizeof(T);
-  Require(source.bytes() >= bytes, "device-to-host copy exceeds buffer");
-  RequireAcl(aclrtMemcpy(destination.data(), bytes, source.get(), bytes,
-                         ACL_MEMCPY_DEVICE_TO_HOST),
-             "aclrtMemcpy(DEVICE_TO_HOST)");
-}
-
-std::uint8_t EncodeFp4(float value) {
-  std::uint8_t best = 0;
-  float error = std::numeric_limits<float>::infinity();
-  for (std::uint8_t code = 0; code < 16; ++code) {
-    const float candidate = std::fabs(value - moe::emu::DecodeFp4E2M1(code));
-    if (candidate < error) {
-      best = code;
-      error = candidate;
-    }
-  }
-  return best;
-}
-
-// One contiguous buffer per role holding every expert, which is the device
-// layout: expert e starts at e * <role>_expert_stride.
-struct ExpertBank {
-  std::uint32_t rows = 0;
-  std::uint32_t cols = 0;
-  std::vector<Mxfp4Pair> packed;  // [experts, rows, cols/2]
-  std::vector<E8M0> scales;       // [experts, rows, cols/32]
-
-  std::size_t PackedStride() const {
-    return static_cast<std::size_t>(rows) * (cols / 2u);
-  }
-  std::size_t ScaleStride() const {
-    return static_cast<std::size_t>(rows) * (cols / kGroup);
-  }
-  moe::emu::Mxfp4Matrix View(std::uint32_t expert) const {
-    return {packed.data() + static_cast<std::size_t>(expert) * PackedStride(),
-            scales.data() + static_cast<std::size_t>(expert) * ScaleStride(),
-            static_cast<int>(rows), static_cast<int>(cols)};
-  }
-};
-
-ExpertBank MakeBank(std::uint32_t rows, std::uint32_t cols,
-                    std::uint32_t experts, std::mt19937_64& rng) {
-  Require(cols % kGroup == 0, "MXFP4 width must be group aligned");
-  ExpertBank bank;
-  bank.rows = rows;
-  bank.cols = cols;
-  bank.packed.resize(static_cast<std::size_t>(experts) * rows * (cols / 2u));
-  bank.scales.resize(static_cast<std::size_t>(experts) * rows * (cols / kGroup));
-  std::normal_distribution<float> source_weight(0.0F, 1.7F);
-  for (std::uint32_t e = 0; e < experts; ++e) {
-    for (std::uint32_t row = 0; row < rows; ++row) {
-      for (std::uint32_t group = 0; group < cols / kGroup; ++group) {
-        // The expert id participates so no two experts share a scale
-        // pattern -- otherwise a wrong-expert read could go unnoticed.
-        const E8M0 scale_code =
-            static_cast<E8M0>(126u + ((row + group + e) % 3u));
-        bank.scales[static_cast<std::size_t>(e) * bank.ScaleStride() +
-                    static_cast<std::size_t>(row) * (cols / kGroup) + group] =
-            scale_code;
-        const float scale =
-            std::ldexp(1.0F, static_cast<int>(scale_code) - 127);
-        for (std::uint32_t col = group * kGroup; col < (group + 1u) * kGroup;
-             col += 2u) {
-          const std::uint8_t low = EncodeFp4(source_weight(rng) / scale);
-          const std::uint8_t high = EncodeFp4(source_weight(rng) / scale);
-          bank.packed[static_cast<std::size_t>(e) * bank.PackedStride() +
-                      static_cast<std::size_t>(row) * (cols / 2u) + col / 2u] =
-              static_cast<Mxfp4Pair>(low | (high << 4u));
-        }
-      }
-    }
-  }
-  return bank;
-}
-
-struct Diff {
-  float max_abs = 0.0F;
-  bool within_tolerance = true;
-};
-
-Diff Compare(const std::vector<float>& actual,
-             const std::vector<float>& expected) {
-  Require(actual.size() == expected.size(), "comparison size mismatch");
-  Diff diff;
-  for (std::size_t i = 0; i < actual.size(); ++i) {
-    if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
-      diff.max_abs = std::numeric_limits<float>::infinity();
-      diff.within_tolerance = false;
-      continue;
-    }
-    const float delta = std::fabs(actual[i] - expected[i]);
-    diff.max_abs = std::max(diff.max_abs, delta);
-    if (delta > kAbsTolerance + kRelTolerance * std::fabs(expected[i])) {
-      diff.within_tolerance = false;
-    }
-  }
-  return diff;
-}
-
-bool NonDegenerate(const std::vector<float>& values) {
-  if (values.empty()) return false;
-  double sum = 0.0;
-  double sum_sq = 0.0;
-  for (const float value : values) {
-    if (!std::isfinite(value)) return false;
-    sum += value;
-    sum_sq += static_cast<double>(value) * value;
-  }
-  const double mean = sum / static_cast<double>(values.size());
-  const double mean_sq = sum_sq / static_cast<double>(values.size());
-  const double variance = std::max(0.0, mean_sq - mean * mean);
-  return std::sqrt(mean_sq) > 1.0e-6 && std::sqrt(variance) > 1.0e-6;
-}
-
-std::string LaunchFailure(const char* name, moe::kernels::arch35::Status st) {
-  const auto& failure = moe::kernels::arch35::LastLaunchFailure();
-  const char* call =
-      failure.call != nullptr ? failure.call : "<no recorded ACL call>";
-  return std::string(name) + " returned " +
-         moe::kernels::arch35::ToString(st) + "; last ACL " + call +
-         " status " + std::to_string(failure.acl_error) + "; " +
-         (aclGetRecentErrMsg() != nullptr ? aclGetRecentErrMsg()
-                                          : "<no recent ACL error>");
-}
 
 void RunTest() {
   std::mt19937_64 rng(kSeed);
@@ -348,10 +97,10 @@ void RunTest() {
       DeviceBuffer d_x(x.size() * sizeof(float));
       DeviceBuffer d_ids(topk_ids.size() * sizeof(std::int32_t));
       DeviceBuffer d_rw(routing_weights.size() * sizeof(float));
-      DeviceBuffer d_y(static_cast<std::size_t>(kHidden) * sizeof(float));
+      auto d_y = MakeGuardedOutput(kHidden);
       DeviceBuffer d_xt(x_tokens.size() * sizeof(float));
       DeviceBuffer d_t2e(token_to_expert.size() * sizeof(std::int32_t));
-      DeviceBuffer d_yt(actual_prefill.size() * sizeof(float));
+      auto d_yt = MakeGuardedOutput(actual_prefill.size());
 
       CopyToDevice(d_w1p, w1.packed);
       CopyToDevice(d_w1s, w1.scales);
@@ -366,7 +115,13 @@ void RunTest() {
       CopyToDevice(d_t2e, token_to_expert);
 
       // DECODE ACCUMULATES: the caller zeroes y, per the wrapper contract.
-      d_y.Zero();
+      // Only the LOGICAL extent -- the guard tail past it stays poisoned, or
+      // it could not witness a store past the end.
+      RequireAcl(aclrtMemset(d_y->get(), d_y->bytes(), 0,
+                             static_cast<std::size_t>(kHidden) * sizeof(float)),
+                 "aclrtMemset(decode y, logical extent only)");
+
+      LaunchWatchdog watchdog(kLaunchBudgetSeconds, "[dsv4_moe_block_sim]");
 
       const auto decode_st = moe::kernels::arch35::LaunchDsv4MoeDecodeTopk(
           static_cast<const float*>(d_x.get()),
@@ -378,13 +133,16 @@ void RunTest() {
           static_cast<const E8M0*>(d_w2s.get()),
           static_cast<const std::int32_t*>(d_ids.get()),
           static_cast<const float*>(d_rw.get()), kHidden, kInter, kExperts,
-          kTopK, static_cast<float*>(d_y.get()), runtime.stream());
+          kTopK, static_cast<float*>(d_y->get()), runtime.stream());
       if (decode_st != moe::kernels::arch35::Status::success) {
         Fail(LaunchFailure("LaunchDsv4MoeDecodeTopk", decode_st));
       }
+      watchdog.Arm("dsv4_moe_decode_topk");
       RequireAcl(aclrtSynchronizeStream(runtime.stream()),
                  "aclrtSynchronizeStream(decode)");
-      CopyFromDevice(actual_decode, d_y);
+      watchdog.Disarm();
+      RequireGuardIntact(*d_y, kHidden, "decode y");
+      CopyFromDevice(actual_decode, *d_y);
 
       const auto prefill_st = moe::kernels::arch35::LaunchDsv4MoePrefillBatched(
           static_cast<const float*>(d_xt.get()),
@@ -395,14 +153,26 @@ void RunTest() {
           static_cast<const Mxfp4Pair*>(d_w2p.get()),
           static_cast<const E8M0*>(d_w2s.get()),
           static_cast<const std::int32_t*>(d_t2e.get()), kHidden, kInter,
-          kExperts, kTokens, static_cast<float*>(d_yt.get()),
+          kExperts, kTokens, static_cast<float*>(d_yt->get()),
           runtime.stream());
       if (prefill_st != moe::kernels::arch35::Status::success) {
         Fail(LaunchFailure("LaunchDsv4MoePrefillBatched", prefill_st));
       }
+      watchdog.Arm("dsv4_moe_prefill_batched");
       RequireAcl(aclrtSynchronizeStream(runtime.stream()),
                  "aclrtSynchronizeStream(prefill)");
-      CopyFromDevice(actual_prefill, d_yt);
+      watchdog.Disarm();
+      RequireGuardIntact(*d_yt, actual_prefill.size(), "prefill y");
+      CopyFromDevice(actual_prefill, *d_yt);
+
+      // A launch can return ACL_SUCCESS and still have faulted on device.
+      const DumpCensus dumps = ExceptionDumps();
+      if (dumps.non_empty > 0) {
+        Fail("device left " + std::to_string(dumps.non_empty) +
+             " non-empty excp_log*.dump file(s) of " +
+             std::to_string(dumps.files) +
+             "; a launch faulted even though ACL reported success");
+      }
     }
     runtime.Close();
   }
