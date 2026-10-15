@@ -537,7 +537,10 @@ void BenchDsv4ExpertDevice(const DeviceCtx& ctx, int warmup, int iters) {
 // atomic-add summation contract (section 3.4), not work the kernel does, so
 // timing it would charge the operator for its own ABI.
 //
-// Nothing in this section has been executed on hardware (section 5.7).
+// STATUS ON HARDWARE (section 5.7). This loop HAS now been run on a 950PR
+// and its first version failed there -- see the aclrtResetEvent note at the
+// bottom of the loop. No timing has been collected from it yet: the rows it
+// drives have been executed but never successfully measured.
 class EventPair {
  public:
   EventPair() = default;
@@ -636,15 +639,21 @@ bool TimedLaunchEvents(const std::function<moe::kernels::arch35::Status()>& laun
       samples.push_back(static_cast<double>(ms) * 1000.0);
     }
 
-    // Both events are reused across iterations. aclrtResetEvent requires the
-    // stream's tasks to have completed, which the synchronize above
-    // guarantees.
-    rc = aclrtResetEvent(ev.start(), stream);
-    if (rc == ACL_SUCCESS) rc = aclrtResetEvent(ev.stop(), stream);
-    if (rc != ACL_SUCCESS) {
-      *why = AclFail("aclrtResetEvent", rc);
-      return false;
-    }
+    // NO aclrtResetEvent HERE, and this is the one place in the loop where
+    // the obvious-looking call is wrong. An earlier version reset both
+    // events at the end of each iteration, reading aclrtResetEvent's "wait
+    // for the stream's tasks to complete before resetting" as an
+    // instruction to reset once they had. On hardware that returned
+    // aclError=207000, ACL_ERROR_RT_EVENT_STATE_INVALID, on the first
+    // iteration of every block row -- so both rows failed in the harness
+    // while the kernels themselves were passing 18/18 in the device suite.
+    //
+    // aclrtRecordEvent already re-arms the event: recording an event that
+    // carries a previous timestamp overwrites it, which is what makes the
+    // create-once/record-per-iteration loop the standard shape. Reset is for
+    // a recorded event that will NOT be recorded again and must be returned
+    // to the unrecorded state for a waiter; applying it to an event this
+    // loop is about to record again is the state error the runtime reports.
   }
 
   *out = StatsOf(std::move(samples));
