@@ -41,6 +41,22 @@ namespace moe::kernels::arch35::dsv4_moe_block {
 
 using namespace AscendC;
 
+// The tile ring is described twice on purpose: op_kernel/<op>_arch35.h owns
+// the UB layout (§1.2, private), while dsv4_moe_block_tiling.h owns what the
+// host declares as dyn_ub_size at the chevron. Both sides see this TU, so tie
+// them together here. A drift would under-declare the dynamic region, and a
+// SIMT VF handed a buffer outside it faults with AIV error 341 on its first
+// UB access -- legal budget, clean link, immediate fault on every core.
+static_assert(kTileSlots == kMoeBlockTileSlots,
+              "tile ring slot count disagrees between the UB layout and the "
+              "tiling header the host sizes dyn_ub_size from");
+static_assert(kTileSkewBytes == kMoeBlockTileSkewBytes,
+              "tile ring skew disagrees between the UB layout and the tiling "
+              "header the host sizes dyn_ub_size from");
+static_assert(kRowsPerTile == kMoeBlockRowsPerTile,
+              "rows per tile disagrees between the UB layout and the tiling "
+              "header");
+
 // ---------------------------------------------------------------------------
 // Lane geometry: one scale group per lane per step, groups interleaved
 // ---------------------------------------------------------------------------
@@ -329,22 +345,45 @@ __aicore__ inline __gm__ std::uint8_t* Bytes(GM_ADDR p) {
   return reinterpret_cast<__gm__ std::uint8_t*>(p);
 }
 
+// One down-phase tile into one ring slot. Factored out so the unrolled loop
+// body below names a slot and nothing else, and so the argument list cannot
+// drift between the prologue and the steady state.
+__aicore__ inline void IssueDownTile(const Geometry& g,
+                                     __gm__ std::uint8_t* w2_packed,
+                                     __gm__ std::uint8_t* w2_scale,
+                                     __ubuf__ float* act_ub, float route_weight,
+                                     std::uint32_t tile_base,
+                                     __ubuf__ float* slot) {
+  asc_vf_call<MoeBlockDownTileSimt>(
+      dim3(kSimtThreads), w2_packed, w2_scale, act_ub, g.hidden, g.inter,
+      g.w2_packed_row_stride, g.w2_scale_row_stride, route_weight, tile_base,
+      slot);
+}
+
 // One expert, one token, end to end, on this core.
 //
-// `act` and `tile` are UB; `x_ub` holds the token. `activated` stays in UB
-// between the two phases -- the point of the whole design. The down tile is
+// `act` and the tile ring are UB; `x_ub` holds the token. `activated` stays in
+// UB between the two phases -- the point of the whole design. The down tile is
 // written to `yGm` with whatever atomic mode the caller has set.
+//
+// `tiles` is the kTileSlots-slot output ring, allocated by the caller with
+// kTileSkewBytes between slots so the two are bank-disjoint.
 __aicore__ inline void RunExpertToken(
     const Geometry& g, __gm__ std::uint8_t* w1_packed,
     __gm__ std::uint8_t* w1_scale, __gm__ std::uint8_t* w3_packed,
     __gm__ std::uint8_t* w3_scale, __gm__ std::uint8_t* w2_packed,
     __gm__ std::uint8_t* w2_scale, const LocalTensor<float>& xTensor,
-    const LocalTensor<float>& actTensor, const LocalTensor<float>& tile,
+    const LocalTensor<float>& actTensor,
+    const LocalTensor<float> (&tiles)[kTileSlots],
     const GlobalTensor<float>& yGm, std::uint64_t y_base, float route_weight) {
   __ubuf__ float* x_ub = reinterpret_cast<__ubuf__ float*>(xTensor.GetPhyAddr());
   __ubuf__ float* act_ub =
       reinterpret_cast<__ubuf__ float*>(actTensor.GetPhyAddr());
-  __ubuf__ float* tile_ub = reinterpret_cast<__ubuf__ float*>(tile.GetPhyAddr());
+  __ubuf__ float* tile_ub[kTileSlots];
+  for (std::uint32_t slot = 0; slot < kTileSlots; ++slot) {
+    tile_ub[slot] =
+        reinterpret_cast<__ubuf__ float*>(tiles[slot].GetPhyAddr());
+  }
 
   // --- phase 1: gate + up + clamped SwiGLU, straight into actTensor -------
   const std::uint32_t inter_tiles =
@@ -361,20 +400,73 @@ __aicore__ inline void RunExpertToken(
   }
 
   // --- phase 2: the down GEMV over the completed `activated` ---------------
+  //
+  // Double-buffered and unrolled by kTileSlots, so ONE DataSyncBarrier
+  // publishes both slots' VFs per pipeline step instead of one per tile. The
+  // two slots are bank-disjoint (kTileSkewBytes), so a single coalesced
+  // barrier before the pair of stores is what the consumer needs: MTE3 reads
+  // slot 0 and slot 1 only after both VFs have been published.
+  //
+  // WHY THE NEXT PAIR'S VFs ARE ISSUED AFTER MTE3_V, NOT BEFORE
+  // They write the same two slots MTE3 is reading. Issuing them earlier is a
+  // WAR hazard that no fence covers until MTE3_V, so the gain here is a
+  // halved barrier and event count, NOT overlap across the pair. Overlapping
+  // a VF with another tile's store requires a third slot. Do not "optimize"
+  // these two calls above the MTE3_V wait.
+  //
+  // Set/Wait are balanced 1:1 per unrolled step, so no event token outlives
+  // the loop and nothing leaks into the next launch.
   const std::uint32_t hidden_tiles =
       (g.hidden + kRowsPerTile - 1u) / kRowsPerTile;
-  for (std::uint32_t tile_idx = 0; tile_idx < hidden_tiles; ++tile_idx) {
-    const std::uint32_t tile_base = tile_idx * kRowsPerTile;
-    asc_vf_call<MoeBlockDownTileSimt>(
-        dim3(kSimtThreads), w2_packed, w2_scale, act_ub, g.hidden, g.inter,
-        g.w2_packed_row_stride, g.w2_scale_row_stride, route_weight, tile_base,
-        tile_ub);
+
+  // Prologue: prime both slots. Clamped, so a grid smaller than the ring does
+  // not prime a slot no iteration consumes.
+  const std::uint32_t primed =
+      hidden_tiles < kTileSlots ? hidden_tiles : kTileSlots;
+  for (std::uint32_t slot = 0; slot < primed; ++slot) {
+    IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
+                  slot * kRowsPerTile, tile_ub[slot]);
+  }
+
+  // Steady state: whole pairs only.
+  std::uint32_t tile_idx = 0;
+  for (; tile_idx + kTileSlots <= hidden_tiles; tile_idx += kTileSlots) {
+    DataSyncBarrier<MemDsbT::ALL>();  // publishes BOTH slots' VFs
+    SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
+    WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
+
+    // Slot index is a compile-time constant in each unrolled body, so the
+    // scalar dispatch path carries no modulo and no branch.
+    DataCopy(yGm[y_base + (tile_idx + 0u) * kRowsPerTile], tiles[0],
+             kRowsPerTile);
+    DataCopy(yGm[y_base + (tile_idx + 1u) * kRowsPerTile], tiles[1],
+             kRowsPerTile);
+
+    SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
+    WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
+
+    // Both slots are free again: issue the next pair.
+    const std::uint32_t next = tile_idx + kTileSlots;
+    if (next < hidden_tiles) {
+      IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
+                    next * kRowsPerTile, tile_ub[0]);
+    }
+    if (next + 1u < hidden_tiles) {
+      IssueDownTile(g, w2_packed, w2_scale, act_ub, route_weight,
+                    (next + 1u) * kRowsPerTile, tile_ub[1]);
+    }
+  }
+
+  // Epilogue: an odd final tile. UNREACHABLE at admissible geometry -- hidden
+  // is a multiple of 512 and 512/32 = 16, so hidden_tiles is always even.
+  // Kept because the admissibility rule, not this loop, is what guarantees
+  // that, and tests/emu/test_dsv4_moe_block_addressing_emu.cpp is what pins
+  // it. The host oracle fails if the rule is ever loosened.
+  if (tile_idx < hidden_tiles) {
     DataSyncBarrier<MemDsbT::ALL>();
     SetFlag<HardEvent::V_MTE3>(kEvVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvVToMte3);
-    DataCopy(yGm[y_base + tile_base], tile, kRowsPerTile);
-    // The tile buffer is reused by the next iteration's VF, so the store must
-    // retire before that VF writes it again.
+    DataCopy(yGm[y_base + tile_idx * kRowsPerTile], tiles[0], kRowsPerTile);
     SetFlag<HardEvent::MTE3_V>(kEvMte3ToV);
     WaitFlag<HardEvent::MTE3_V>(kEvMte3ToV);
   }
@@ -455,7 +547,14 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
   LocalMemAllocator<> alloc;
   LocalTensor<float> xTensor = alloc.Alloc<float>(g.hidden);
   LocalTensor<float> actTensor = alloc.Alloc<float>(g.inter);
-  LocalTensor<float> tile = alloc.Alloc<float>(kRowsPerTile);
+  // The output tile ring. Allocation ORDER IS THE LAYOUT, so the skew is
+  // allocated as its own segment between the two slots: back-to-back 128 B
+  // slots would give a 256 B stride, the UB bank period.
+  LocalTensor<float> tile0 = alloc.Alloc<float>(kRowsPerTile);
+  LocalTensor<float> tileSkew = alloc.Alloc<float>(kTileSkewBytes / 4u);
+  LocalTensor<float> tile1 = alloc.Alloc<float>(kRowsPerTile);
+  (void)tileSkew;  // reserved spacer; never read or written
+  const LocalTensor<float> tiles[kTileSlots] = {tile0, tile1};
 
   DataCopy(xTensor, xGm, g.hidden);
   SetFlag<HardEvent::MTE2_V>(kEvMte2ToV);
@@ -464,7 +563,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_decode_topk(
 
   // Fold the router gate into the down store and accumulate across slots.
   SetAtomicAdd<float>();
-  RunExpertToken(g, w1p, w1s, w3p, w3s, w2p, w2s, xTensor, actTensor, tile,
+  RunExpertToken(g, w1p, w1s, w3p, w3s, w2p, w2s, xTensor, actTensor, tiles,
                  yGm, 0u, route_weight);
   SetAtomicNone();
 }
@@ -516,8 +615,43 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_batched(
   LocalMemAllocator<> alloc;
   LocalTensor<float> xTensor = alloc.Alloc<float>(g.hidden);
   LocalTensor<float> actTensor = alloc.Alloc<float>(g.inter);
-  LocalTensor<float> tile = alloc.Alloc<float>(kRowsPerTile);
+  // The output tile ring. Allocation ORDER IS THE LAYOUT, so the skew is
+  // allocated as its own segment between the two slots: back-to-back 128 B
+  // slots would give a 256 B stride, the UB bank period.
+  LocalTensor<float> tile0 = alloc.Alloc<float>(kRowsPerTile);
+  LocalTensor<float> tileSkew = alloc.Alloc<float>(kTileSkewBytes / 4u);
+  LocalTensor<float> tile1 = alloc.Alloc<float>(kRowsPerTile);
+  (void)tileSkew;  // reserved spacer; never read or written
+  const LocalTensor<float> tiles[kTileSlots] = {tile0, tile1};
 
+  // WEIGHT REUSE: THE GRID-STRIDE MAP IS THE REUSE MECHANISM. DO NOT BLOCK IT.
+  //
+  // It is tempting to give each core a CONTIGUOUS chunk of tokens so that a
+  // core sees a run of same-expert tokens and re-reads w1/w3/w2 out of its
+  // SIMT DataCache. That trade is backwards here, and the arithmetic says so.
+  //
+  // Weights are never staged in UB -- they cannot be: one expert's w1 packed
+  // plane alone is inter * hidden/2 = 4 MiB at the production geometry,
+  // against a 221,184 B usable UB ceiling. So there is no staged buffer to
+  // reuse and no DMA to elide; the only thing a mapping can change is the
+  // GM/L2 access pattern's locality.
+  //
+  // With this grid-stride map, at step s every core is working on token
+  // block_idx + s * block_dim. If the CALLER presents tokens grouped by
+  // expert -- which is the cheap host-side sort, and the actual lever -- then
+  // at any instant all 32 cores are inside the same expert, so ONE expert's
+  // ~12 MiB of w1+w3+w2 serves the whole grid and sits comfortably in L2.
+  //
+  // Contiguous chunking would instead put 32 DIFFERENT experts in flight at
+  // once, ~384 MiB of working set against a 128 MiB L2: it buys per-core
+  // temporal reuse and pays for it with grid-wide L2 thrash.
+  //
+  // So intra-expert batching for this kernel is a HOST ordering concern, not
+  // a kernel mapping change. tests/emu/test_dsv4_moe_block_addressing_emu.cpp
+  // pins the co-residency property this map depends on.
+  //
+  // NEVER MEASURED: no L2 or DataCache behaviour here has been observed on
+  // hardware (§5.7). This is a working-set argument, not a benchmark result.
   for (std::uint32_t token = block_idx; token < g.total_tokens;
        token += g.block_dim) {
     const std::uint32_t expert = static_cast<std::uint32_t>(
@@ -546,7 +680,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_batched(
     DataSyncBarrier<MemDsbT::ALL>();
 
     // Plain overwrite: one token, one expert, one output row.
-    RunExpertToken(g, w1p, w1s, w3p, w3s, w2p, w2s, xTensor, actTensor, tile,
+    RunExpertToken(g, w1p, w1s, w3p, w3s, w2p, w2s, xTensor, actTensor, tiles,
                    yGm, row, 1.0f);
   }
 }

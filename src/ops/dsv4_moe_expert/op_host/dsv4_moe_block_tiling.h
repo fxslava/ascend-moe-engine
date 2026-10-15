@@ -81,15 +81,28 @@ inline constexpr std::uint32_t kMoeBlockPrefillBlockDim = 32u;
 //   xF32        hidden floats   the token, resident for the whole expert
 //   actF32      inter  floats   `activated`, written by gate/up, read by down
 //                               -- NEVER goes to GM, which is the point
-//   tile        32     floats   one 32-row output tile staged for MTE3
+//   tile ring   2 x 32  floats  the down phase's double-buffered output tiles,
+//                               with kMoeBlockTileSkewBytes BETWEEN them
 //
+// THE RING CONSTANTS LIVE HERE, not in op_kernel/<op>_arch35.h, because the
+// host wrapper has to declare dyn_ub_size at the chevron and §1.2 makes
+// op_kernel/ private -- a public header may not depend on it. The kernel's
+// own copies are checked against these in dsv4_moe_block_kernel.cpp, so a
+// drift between the two is a compile error rather than an under-declared
+// dynamic region (which is the error-341 class).
+inline constexpr std::uint32_t kMoeBlockTileSlots = 2u;
+inline constexpr std::uint32_t kMoeBlockTileSkewBytes = 32u;
+
 // uint64 because the extents are caller-supplied and §2.7 requires widening
 // before the multiply; the caller checks the ceiling, then narrows.
 inline constexpr std::uint64_t Dsv4MoeBlockDynUbBytes(
     std::uint32_t hidden, std::uint32_t inter) noexcept {
   return static_cast<std::uint64_t>(hidden) * 4u +
          static_cast<std::uint64_t>(inter) * 4u +
-         static_cast<std::uint64_t>(kMoeBlockRowsPerTile) * 4u;
+         static_cast<std::uint64_t>(kMoeBlockTileSlots) *
+             kMoeBlockRowsPerTile * 4u +
+         static_cast<std::uint64_t>(kMoeBlockTileSlots - 1u) *
+             kMoeBlockTileSkewBytes;
 }
 
 inline constexpr std::uint32_t kMoeBlockDynUbCeilingBytes = 221184u;  // 216 KiB

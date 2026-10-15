@@ -29,8 +29,14 @@
 //     offset  size     segment
 //     0       16,384   xF32     resident FP32 x[hidden] for this token
 //     16,384  8,192    actF32   `activated`[inter], gate/up -> down
-//     24,576  128      tile     32 FP32 results staged for one MTE3
-//     dynamic total 24,704 B  of the 221,184 B ceiling
+//     24,576  128      tile[0]  32 FP32 results staged for one MTE3
+//     24,704  32       skew     breaks the 256 B UB bank alias (kTileSkewBytes)
+//     24,736  128      tile[1]  the ping-pong partner
+//     dynamic total 24,864 B  of the 221,184 B ceiling
+//
+// The skew is a real allocation, not padding to be reclaimed: back-to-back
+// 128 B slots would give a 256 B stride, the bank period. Allocating it as a
+// segment is what keeps LocalMemAllocator's order == the layout.
 //
 // Packed nibbles and E8M0 scales are NOT staged in UB: SIMT lanes read them
 // from GM through the SIMT DataCache with a 16 B uint4 asc_ldca per scale
@@ -88,13 +94,49 @@ inline constexpr std::uint32_t kXF32BytesMax = kHiddenMax * 4;   // 16,384
 inline constexpr std::uint32_t kActF32BytesMax = kInterMax * 4;  // 8,192
 inline constexpr std::uint32_t kTileBytes = kRowsPerTile * 4;    // 128
 
+// --- the down-phase tile ring ----------------------------------------------
+//
+// Phase 2 double-buffers the output tile: the VF for one slot is published and
+// stored while the other slot holds the previous tile's result, so the loop
+// unrolls by kTileSlots and pays ONE DataSyncBarrier per unrolled pair rather
+// than one per tile.
+//
+// WHY ONLY TWO SLOTS, AND WHAT THAT COSTS
+// With two slots the next pair's VFs cannot be issued before the current
+// pair's MTE3 stores have retired: they would write the very slots MTE3 is
+// still reading, and that WAR hazard is not covered by any fence until
+// MTE3_V. So two slots buy a HALVED barrier and event count, not compute/DMA
+// overlap across the pair. Overlapping a VF with the store of a different
+// tile needs a third slot, which is a separate change and a separate proof.
+inline constexpr std::uint32_t kTileSlots = 2;
+
+// 32 B of skew between slots. Two 128 B slots placed back to back have a
+// 256 B stride, which is exactly the UB bank alias to avoid; 160 B is not a
+// multiple of 256 B or 4 KiB. This is stride arithmetic, not a measured win --
+// no claim is made here about observed bank-conflict behaviour, and nothing in
+// this layout was ranked by a static analyzer (CLAUDE.md section 5.6).
+inline constexpr std::uint32_t kTileSkewBytes = 32;
+inline constexpr std::uint32_t kTileSlotStrideBytes = kTileBytes + kTileSkewBytes;
+static_assert(kTileSlotStrideBytes % 256u != 0u,
+              "the tile slot stride must not alias the 256 B UB bank period");
+static_assert(kTileSlotStrideBytes % 4096u != 0u,
+              "the tile slot stride must not alias the 4 KiB UB bank period");
+static_assert(kTileSkewBytes % 32u == 0u,
+              "the skew must keep every slot base 32 B aligned for MTE3");
+
+// The region: kTileSlots payloads with a skew between (not after) them.
+inline constexpr std::uint32_t kTileRegionBytes =
+    kTileSlots * kTileBytes + (kTileSlots - 1u) * kTileSkewBytes;  // 288
+static_assert(kTileRegionBytes == 288, "tile ring must occupy 288 B");
+
 // Static UB is zero: neither entry point has a TPipe or a TBuf.
 inline constexpr std::uint32_t kStaticUbBytes = 0;
 inline constexpr std::uint32_t kDynUbBytesMax =
-    kXF32BytesMax + kActF32BytesMax + kTileBytes;
+    kXF32BytesMax + kActF32BytesMax + kTileRegionBytes;
 
-static_assert(kDynUbBytesMax == 24704,
-              "dsv4_moe_block dynamic UB must sum to 24,704 B");
+static_assert(kDynUbBytesMax == 24864,
+              "dsv4_moe_block dynamic UB must sum to 24,864 B "
+              "(16,384 x + 8,192 act + 288 tile ring)");
 static_assert(kStaticUbBytes + kDynUbBytesMax <= kUsableUbBytes,
               "dsv4_moe_block UB layout exceeds the arch35 usable ceiling");
 static_assert(kUbTotalBytes - kUbReservedBytes - kStaticUbBytes -
