@@ -358,6 +358,403 @@ void moe_prefill_batched_mxfp4_cpu(const Mxfp4Matrix* w1, const Mxfp4Matrix* w3,
                                    std::vector<float>* scratch);
 
 // ---------------------------------------------------------------------------
+// W4A16: the oracle for the CUBE prefill entry point
+// ---------------------------------------------------------------------------
+// The oracle above is W4A32 -- MXFP4 weights against FP32 activations, which
+// is what the AIV kernels compute because they decode nibbles into FP32
+// registers. `dsv4_moe_prefill_cube` cannot: the Cube's BF16 tensor path takes
+// BF16 on BOTH sides, so the activations are rounded too and the answer is a
+// DIFFERENT function. Diffing that kernel against the W4A32 oracle would
+// charge it for a rounding the hardware forces, so this family mirrors the
+// rounding instead.
+//
+// WHERE THE TWO DIFFER, PRECISELY -- there is exactly one new lossy step and
+// it happens twice:
+//
+//   X    -> BF16   before the gate/up GEMMs      (RNE, <= 2^-9 relative)
+//   act  -> BF16   before the down GEMM          (RNE, <= 2^-9 relative)
+//
+// Everything else is bit-for-bit the same arithmetic:
+//
+//   * MXFP4 -> BF16 is EXACT. An E2M1 magnitude is one of {0, .5, 1, 1.5, 2,
+//     3, 4, 6}: three significant bits at most, against BF16's eight. The
+//     E8M0 scale is a power of two, so the product only moves the exponent
+//     field. Exact for scale codes 1..254 wherever the product stays inside
+//     BF16's normal range -- and `Mxfp4DequantIsExactInBf16` below is how a
+//     test states that domain instead of assuming it.
+//   * the group scale's PLACEMENT is free. The W4A32 oracle scales each
+//     32-element group SUBTOTAL; a Cube GEMM can only distribute the scale
+//     into every product. Scaling by a power of two commutes with rounding,
+//     so the two agree bit-exactly WITHIN a group. Across groups they differ
+//     only by FP32 reassociation (<= cols * 2^-24), because the additions
+//     then happen in a different order -- a real difference, bounded and
+//     unrelated to the scale.
+//   * the accumulation is FP32 on both sides. A product of two BF16 values
+//     needs at most 16 significand bits, so every product is exact in FP32
+//     and only the summation order is in question.
+
+// RNE round of an FP32 value to BF16 precision, returned widened back to
+// FP32. This is `Cast(..., RoundMode::CAST_RINT)` and torch's
+// `.to(torch.bfloat16)`; it is the kernel's one lossy operation.
+float bf16_round_cpu(float value) noexcept;
+
+// True where `DecodeFp4E2M1(nibble) * DecodeFp8E8M0(scale_code)` is exactly
+// representable in BF16 AND the device agrees -- i.e. where the "MXFP4 -> BF16
+// is lossless" claim actually holds. It is the DOMAIN OF AGREEMENT, not just a
+// representability test, so it excludes three things:
+//
+//   * the NaN scale code 0xFF. The device's decode turns it into +inf where
+//     this oracle yields NaN -- documented on DecodeE8M0 in
+//     include/moe/kernels/arch35/arch35_common.hpp, and the Cube path's
+//     E8M0ToBf16 truncation does the same.
+//   * a product that overflows. The largest E2M1 magnitude is 6 = 1.5 * 2^2,
+//     so scale codes at the top of the range leave FP32, never mind BF16.
+//   * a product that lands in BF16's SUBNORMAL range. The bit layouts happen
+//     to align, so such a value is representable -- but the device flushes
+//     subnormals to zero, so the two sides disagree there regardless. Scale
+//     code 0 (2^-127) is the case that matters, and it is the same flush the
+//     AIV path records.
+//
+// Real MXFP4 checkpoints do not place scales at either extreme; a synthetic
+// weight set can, which is why a test states this domain rather than assuming
+// the whole code range.
+bool Mxfp4DequantIsExactInBf16(std::uint8_t nibble, std::uint8_t scale_code) noexcept;
+
+// One row of an MXFP4 matrix dequantized the way the Cube path does it: each
+// nibble's magnitude times its group's scale, the product then held at BF16
+// precision. Inside the exact domain above the rounding is a no-op, which is
+// the whole claim.
+void mxfp4_dequant_row_bf16_cpu(const Mxfp4Matrix& weight, int row, float* out);
+
+// y[row] = sum over c of W_bf16[row, c] * x_bf16[c], FP32 accumulate, natural
+// column order, the group scale distributed into every product.
+//
+// `x_bf16` holds FP32 words that must ALREADY be BF16-representable -- pass
+// them through bf16_round_cpu first. Taking FP32 here rather than packed
+// uint16 keeps this callable from the same buffers the device wrapper is
+// handed, and an un-rounded input would silently make this a W4A32 GEMM.
+void mxfp4_gemv_w4a16_cpu(const Mxfp4Matrix& weight, const float* x_bf16, float* y);
+
+// The clamped-SwiGLU expert over the W4A16 path. `x` is FP32 as the caller
+// holds it; the rounding to BF16 happens inside, because it is part of the
+// function the kernel computes and not a preprocessing step the caller may
+// skip.
+void moe_expert_swiglu_mxfp4_w4a16_cpu(const Mxfp4Matrix& w1, const Mxfp4Matrix& w3,
+                                       const Mxfp4Matrix& w2, const float* x,
+                                       float* out, float limit,
+                                       std::vector<float>* scratch);
+
+// Prefill, W4A16: the golden for `dsv4_moe_prefill_cube`. Same signature and
+// same token-to-expert contract as moe_prefill_batched_mxfp4_cpu, so a suite
+// can run both and attribute the difference to the activation rounding alone.
+void moe_prefill_batched_mxfp4_w4a16_cpu(const Mxfp4Matrix* w1,
+                                         const Mxfp4Matrix* w3,
+                                         const Mxfp4Matrix* w2,
+                                         const float* x_tokens,
+                                         const std::int32_t* token_to_expert,
+                                         int total_tokens, int num_experts,
+                                         float* y_tokens, float limit,
+                                         std::vector<float>* scratch);
+
+// ---------------------------------------------------------------------------
+// FLASH-STYLE TILED W4A16: the same function, never materializing the
+// intermediate
+// ---------------------------------------------------------------------------
+// `moe_prefill_batched_mxfp4_w4a16_cpu` above is the monolithic shape: all
+// `inter` gate/up values, then the activation, then the down GEMM. The tiled
+// shape slices the CONTRACTION axis into chunks of R and keeps one chunk
+// alive, dequantizing W1/W3/W2 at the moment each element is multiplied:
+//
+//   Y = 0
+//   for r0 in 0, R, 2R, ... < inter:
+//     gate/up = W1b[r0:r0+R, :] @ xb,  W3b[r0:r0+R, :] @ xb
+//     act     = bf16(silu(min(gate, L)) * clamp(up, -L, L))
+//     Y      += W2b[:, r0:r0+R] @ act
+//
+// There is no GM workspace of dequantized weights and no M x inter
+// intermediate at any point; the scratch footprint is
+// `moe_prefill_flash_scratch_floats()` and does not grow with `inter`.
+//
+// IT IS THE SAME FUNCTION UP TO ONE REASSOCIATION, and that is the precise
+// claim tests/emu checks rather than assumes:
+//
+//   * gate, up and act are BIT-IDENTICAL to the monolithic oracle at every R.
+//     gate[r] reduces over the hidden axis of ROW r alone and the rows are
+//     independent, so slicing W1/W3's output rows reorders nothing.
+//   * the DOWN GEMM's additions are reordered: the monolithic form sums
+//     `inter` products into one running FP32 accumulator, the tiled form sums
+//     each chunk into its own and adds the subtotal to Y. A two-level tree
+//     against a flat sum -- pure FP32 reassociation, and the only difference.
+//   * so the two extremes are bit-exact for opposite reasons: R >= inter is a
+//     single chunk whose accumulator IS the flat sum; R == 1 adds each
+//     product to Y on its own, which is also the flat sum. Only 1 < R < inter
+//     is genuinely reassociated.
+//
+// `inter % R != 0` is supported: the final chunk is short. R is NOT required
+// to be a multiple of the 32-element MXFP4 group -- the group scale is
+// distributed into every product, so a chunk that splits a group changes
+// nothing about the arithmetic -- but the device tiling will use a multiple
+// of 32, and nothing here depends on that choice.
+
+// The scratch requirement in floats: `hidden + 3 * min(R, inter)`, i.e.
+// xb[hidden] plus gate/up/act over one chunk. Exposed so a test can hold the
+// "nothing is materialized" claim to an arithmetic statement rather than to a
+// comment: at fixed R it must be the same number for every `inter`. Returns 0
+// for a nonpositive extent.
+std::size_t moe_prefill_flash_scratch_floats(int hidden, int inter, int chunk) noexcept;
+
+// One expert, tiled over the intermediate axis in chunks of `chunk` (= R).
+// `x` is FP32 as the caller holds it; the BF16 rounding happens inside and
+// ONCE for the whole token, not once per chunk. Throws std::invalid_argument
+// on a nonpositive R -- a zero chunk would skip the reduction and return a
+// zeroed output, which is the one failure mode an oracle must not have.
+void moe_expert_swiglu_mxfp4_w4a16_flash_cpu(const Mxfp4Matrix& w1,
+                                             const Mxfp4Matrix& w3,
+                                             const Mxfp4Matrix& w2,
+                                             const float* x, float* out,
+                                             float limit, int chunk,
+                                             std::vector<float>* scratch);
+
+// Prefill over a batch of tokens, tiled. Same token-to-expert contract as
+// moe_prefill_batched_mxfp4_w4a16_cpu plus the chunk size, so a suite can run
+// both over one fixture and attribute the whole difference to the down GEMM's
+// reassociation.
+void moe_prefill_flash_ffn_w4a16_cpu(const Mxfp4Matrix* w1,
+                                     const Mxfp4Matrix* w3,
+                                     const Mxfp4Matrix* w2,
+                                     const float* x_tokens,
+                                     const std::int32_t* token_to_expert,
+                                     int total_tokens, int num_experts,
+                                     float* y_tokens, float limit, int chunk,
+                                     std::vector<float>* scratch);
+
+// One logical element of an MXFP4 matrix, dequantized exactly as the Cube
+// path does it: decode the nibble, multiply by the group's power-of-two E8M0
+// scale, hold the product at BF16. Shared by the 1D-strip reference above and
+// the 2D block-tiled Cube model below so that the nibble order and the
+// group-scale indexing exist in ONE place. Unchecked -- it is an inner-loop
+// primitive and its callers validate the matrix and the indices first.
+float mxfp4_dequant_element_bf16_cpu(const Mxfp4Matrix& w, int row, int col) noexcept;
+
+// ---------------------------------------------------------------------------
+// 2D/3D BLOCK-TILED CUBE MODEL (Ascend 950PR, DaVinci v3 / dav-3510)
+// ---------------------------------------------------------------------------
+// `moe_prefill_flash_ffn_w4a16_cpu` above tiles ONE axis -- the contraction --
+// and reduces each output row whole. That is the AIV/Vector shape and it is
+// reserved for that path. The Cube cannot be driven that way: it computes
+// fractal GEMMs out of L0A/L0B into an L0C accumulator, so the schedule that
+// fits it tiles the OUTPUT SPACE in two dimensions and streams three
+// contractions through fixed-size buffers.
+//
+// THE SCHEDULE MODELLED, exactly as a Cube kernel would run it:
+//
+//   for each output tile (m0, h0)            <- the grid; no barriers between
+//     Y_acc[M_tile, H_tile] = 0              <- FP32, resident in L0C
+//     for r0 in 0, R_tile, ... < inter
+//       gate/up[M_tile, R_tile] = 0          <- FP32, resident in L0C
+//       for k0 in 0, K_tile, ... < hidden
+//         X   [M_tile, K_tile] -> L0A        <- BF16, rounded on the fly
+//         W1/W3[R_tile, K_tile] -> L0B       <- dequantized per block
+//         gate += X * W1^T, up += X * W3^T   <- mmad, FP32 into L0C
+//       act[M_tile, R_tile] = bf16(silu(min(gate, L)) * clamp(up, -L, L))
+//       W2[H_tile, R_tile] -> L0B            <- dequantized per block
+//       Y_acc += act * W2^T                  <- mmad, FP32 into L0C
+//     write Y_acc to GM                      <- once, at the end of the tile
+//
+// FIVE PROPERTIES THIS MODEL EXISTS TO PIN DOWN, each checked in
+// tests/emu/test_dsv4_moe_prefill_cube_2d_emu.cpp rather than asserted here:
+//
+//   1. SPATIAL INDEPENDENCE, operationally. Output tiles share no state, so
+//      the VISIT ORDER cannot change the answer. `CubeTileGeometry::visit`
+//      exists for exactly that test: row-major, column-major, reversed and
+//      shuffled must agree BIT FOR BIT. An implementation that leaked a
+//      scratchpad or an accumulator between tiles would fail it, which is a
+//      stronger statement than "the source contains no barrier".
+//   2. WRITE-ONCE COVERAGE. The tiles partition the output exactly: the trace
+//      counts the elements written and the suite poisons the destination
+//      first, so neither a gap nor an overlap can pass.
+//   3. THE BUFFER BUDGET IS A HARD CONSTRAINT, not a comment. The footprint
+//      of every fragment actually loaded is computed during the run and
+//      reported through `CubeTileTrace`, so the suite asserts an OBSERVED
+//      peak against the platform's L0A/L0B/L0C sizes.
+//   4. THE REDUCTION HIERARCHY IS THREE-LEVEL, and that is what separates this
+//      model from the 1D one numerically. See the note on `CubeTileGeometry`.
+//   5. THE COST OF THE SCHEDULE IS VISIBLE. Computing gate/up inside the
+//      (m, h) tile loop recomputes the whole intermediate once per H tile:
+//      the trace reports that redundancy as a number instead of leaving it to
+//      be discovered on hardware.
+//
+// W4A16 semantics are unchanged from the rest of the family: X rounded to
+// BF16 (once -- the rounding is idempotent, so doing it per fragment is the
+// same function), exact power-of-two E8M0 scaling, lossless E2M1 -> BF16, and
+// FP32 accumulation.
+
+// DaVinci v3 per-AI-core Cube buffer capacities, from the toolkit's own
+// platform configs (x86_64-linux/data/platform_config/Ascend950PR_*.ini:
+// l0_a/l0_b = 65536, l0_c_size = 262144, l1_size = 524288) and matching the
+// whitepaper's Table in ascend_950PR_950DT_specs.markdown. The ini is the
+// authority: its UB figure (253,952 B) is the one the whitepaper's
+// per-subsystem "512 KB UB" contradicts, so the two are not interchangeable
+// as sources even where they agree on the L0 sizes.
+inline constexpr std::size_t kCubeL0ABytes = 65536;   // 64 KiB
+inline constexpr std::size_t kCubeL0BBytes = 65536;   // 64 KiB
+inline constexpr std::size_t kCubeL0CBytes = 262144;  // 256 KiB
+inline constexpr std::size_t kCubeL1Bytes = 524288;   // 512 KiB
+
+// The fractal unit. C0 for BF16 is 16 ELEMENTS (32 B) -- 64 is the C0 of the
+// b4 family, which does not apply here because this path dequantizes to BF16
+// before the Cube sees anything. The MAC array's K depth is the same 16, so
+// one `mmad` reduces 16 products and L0C accumulates between fractals: that
+// is where the three-level reduction below comes from.
+inline constexpr int kCubeFractal = 16;
+
+// How the grid walks the output tiles. Scheduling only: a correct
+// implementation must give the same answer for all four, and the suite checks
+// that rather than taking it on trust.
+enum class CubeTileVisit {
+  kRowMajor,     // m outer, h inner
+  kColumnMajor,  // h outer, m inner
+  kReversed,     // row-major, backwards
+  kShuffled,     // permuted from `visit_seed`
+};
+
+// THE REDUCTION HIERARCHY, because it is the whole numerical difference
+// between this model and the flat 1D one:
+//
+//   level 0   one mmad, C0 = 16 products, summed in natural order
+//   level 1   one K_tile (or R_tile) block, the fractals accumulated in L0C
+//   level 2   the whole contraction axis, the blocks accumulated in L0C
+//
+// The monolithic oracle sums the same products FLAT. So the two differ by
+// FP32 reassociation on every GEMM -- bounded, and bounded by the depth of
+// the trees rather than by anything measured. Level 0's internal order is NOT
+// specified by the ISA; natural order is one admissible choice and the bound
+// the suite derives covers any of them.
+//
+// One consequence is worth stating because a tolerance that ignores it is
+// wrong: the gate/up reassociation is amplified by the BF16 store of `act`.
+// A gate value within the reassociation of a BF16 tie rounds the other way,
+// so `act` can differ by ONE BF16 ULP -- 2^-9 relative, four orders above the
+// FP32 reassociation that caused it. The suite measures that flip set and
+// bounds its contribution separately instead of hiding it in one number.
+struct CubeTileGeometry {
+  int m_tile = 16;   // tokens per output tile      {16, 32}
+  int h_tile = 64;   // hidden columns per tile     {64, 128}
+  int r_tile = 64;   // contraction along `inter`   {64, 128}
+  int k_tile = 64;   // contraction along `hidden`  {64, 128}
+  // Buffer slots per operand: 1 for a serial loop, 2 for the double buffering
+  // a real kernel needs to overlap MTE1 with the Cube. The budget is charged
+  // for all of them, which is why it is part of the geometry and not an
+  // implementation detail.
+  int buffer_depth = 2;
+  CubeTileVisit visit = CubeTileVisit::kRowMajor;
+  std::uint64_t visit_seed = 0;
+};
+
+// Bytes resident in each Cube buffer, charged at the hardware's dtypes: the
+// A/B fragments are BF16 (2 B) even though this host model holds them in
+// float, and the accumulators are FP32 (4 B).
+//
+//   L0A   max(X[M, K], act[M, R]) * 2 B * depth      the two phases' A matrices
+//   L0B   max(W1/W3[R, K], W2[H, R]) * 2 B * depth   ditto for B; W1 and W3
+//                                                    reuse one slot, since
+//                                                    they feed the Cube one
+//                                                    after the other
+//   L0C   (Y_acc[M, H] + gate[M, R] + up[M, R]) * 4 B
+//         charged TOGETHER, not as a max: Y_acc is resident across the whole
+//         r loop while gate and up are being produced inside it.
+//   L1    every block streamed for one r step, at BF16, plus the X block
+struct CubeBufferFootprint {
+  std::size_t l0a_bytes = 0;
+  std::size_t l0b_bytes = 0;
+  std::size_t l0c_bytes = 0;
+  std::size_t l1_bytes = 0;
+
+  bool Fits() const {
+    return l0a_bytes <= kCubeL0ABytes && l0b_bytes <= kCubeL0BBytes &&
+           l0c_bytes <= kCubeL0CBytes && l1_bytes <= kCubeL1Bytes;
+  }
+};
+
+// The footprint of a FULL tile of this geometry, and of one actual (possibly
+// ragged) fragment set. A ragged tile is a strict subset of a full one, so the
+// full-tile figure is the peak -- which the trace's observed peak confirms
+// rather than assumes.
+CubeBufferFootprint moe_prefill_cube_tile_footprint(const CubeTileGeometry& geometry) noexcept;
+CubeBufferFootprint moe_prefill_cube_fragment_footprint(int m_extent, int h_extent,
+                                                        int r_extent, int k_extent,
+                                                        int buffer_depth) noexcept;
+
+// Is this geometry one the hardware can run? Three separate conditions, kept
+// separate because they fail for different reasons:
+//   * every tile extent positive and a whole multiple of the 16x16x16 fractal;
+//   * buffer_depth in 1..2;
+//   * the full-tile footprint inside L0A/L0B/L0C/L1.
+// The enumerated tile sets {16,32} x {64,128} x {64,128} x {64,128} all pass;
+// one step past them does not, and the suite exhibits that rather than
+// claiming it.
+bool moe_prefill_cube_tile_geometry_admissible(const CubeTileGeometry& geometry) noexcept;
+
+// Scratch, in floats: the host mirror of the modelled buffer set, which is
+// what makes "no global workspace" checkable. Sized by the TILE only -- it
+// does not grow with `hidden`, `inter` or the token count.
+std::size_t moe_prefill_cube_2d_scratch_floats(const CubeTileGeometry& geometry) noexcept;
+
+// What the run actually did. Everything here is OBSERVED during the loop, not
+// recomputed from the geometry afterwards, so the suite's assertions are about
+// the execution and not about the formula.
+struct CubeTileTrace {
+  // The largest footprint any single fragment set reached.
+  CubeBufferFootprint peak;
+  // Grid shape and coverage.
+  std::uint64_t output_tiles = 0;
+  std::uint64_t output_elements_written = 0;  // must equal M * hidden exactly
+  // The largest actual fragment extents seen, so a ragged run can be told
+  // apart from a run that quietly skipped its tails.
+  int max_m_extent = 0;
+  int max_h_extent = 0;
+  int max_r_extent = 0;
+  int max_k_extent = 0;
+  int min_m_extent = 0;
+  int min_h_extent = 0;
+  int min_r_extent = 0;
+  int min_k_extent = 0;
+  // Multiply-accumulates issued, by phase. The gate/up figure is the one that
+  // carries the schedule's cost: computing the intermediate inside the (m, h)
+  // tile loop repeats it once per H tile.
+  std::uint64_t gate_up_macs = 0;
+  std::uint64_t down_macs = 0;
+  std::uint64_t intermediate_recompute_factor = 0;  // ceil(hidden / H_tile)
+  // How many times a weight BLOCK was dequantized into its L0B slot. This is
+  // the B-fragment reuse the Cube exists for, as a number: a token tile whose
+  // tokens share one expert stages each block ONCE and reduces all M rows
+  // against it, while a tile straddling an expert boundary must restage. The
+  // golden stays per-token correct either way -- it does not assume the
+  // dispatch grouped the tokens -- and this counter is how the suite shows
+  // what that assumption would have bought.
+  std::uint64_t gate_up_fragment_stagings = 0;
+  std::uint64_t down_fragment_stagings = 0;
+};
+
+// The 2D block-tiled Cube golden. Same token-to-expert contract as
+// `moe_prefill_batched_mxfp4_w4a16_cpu`, so a suite can run both over one
+// fixture and attribute the whole difference to the reduction hierarchy.
+// `trace` may be null. Throws std::invalid_argument on a null operand, a
+// ragged expert set, an out-of-range expert id, or an inadmissible geometry --
+// never silently returns a zeroed output, which for a golden is the one
+// unacceptable failure mode.
+void moe_prefill_cube_flash_2d_w4a16_cpu(const Mxfp4Matrix* w1,
+                                         const Mxfp4Matrix* w3,
+                                         const Mxfp4Matrix* w2,
+                                         const float* x_tokens,
+                                         const std::int32_t* token_to_expert,
+                                         int total_tokens, int num_experts,
+                                         float* y_tokens, float limit,
+                                         const CubeTileGeometry& geometry,
+                                         CubeTileTrace* trace,
+                                         std::vector<float>* scratch);
+
+// ---------------------------------------------------------------------------
 // Activation block quantizer (oracle for the bf16_block_quant_fp8 operator)
 // ---------------------------------------------------------------------------
 // BF16/FP32 -> FP8 E4M3 with one FP32 scale per 128 elements:

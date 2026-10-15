@@ -20,6 +20,17 @@ add_library(moe_emu STATIC
   bf16_block_quant.cpp
   shared_kv_swa_attention.cpp
   moe_block.cpp
+  # the W4A16 oracle for the CUBE prefill entry point: same MoE block, but
+  # with the activations rounded to BF16 the way the Cube's tensor path
+  # forces. A separate TU because it is a separate function, not a mode.
+  moe_prefill_w4a16.cpp
+  # The 2D/3D block-tiled CUBE model: the same W4A16 function, scheduled the
+  # way the 950PR Cube runs it -- a 2-D output grid, an L0C-resident
+  # accumulator, three contractions streamed through fixed L0A/L0B fragments.
+  # A separate TU from the 1D strip above because its reduction hierarchy is
+  # three levels deep where the strip's is flat, which makes it a different
+  # function and not a mode.
+  moe_prefill_cube_2d.cpp
   semi_e2e_pipeline.cpp
 )
 

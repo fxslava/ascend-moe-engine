@@ -14,6 +14,14 @@ set(MOE_EMU_TESTS
   test_bf16_block_quant_emu
   test_dsv4_moe_block_addressing_emu
   test_dsv4_moe_block_gang_emu
+  test_dsv4_moe_prefill_cube_emu
+  # The flash-style tiled W4A16 FFN, verified on the host BEFORE the kernel is
+  # written (CLAUDE.md section 5.5): the chunked loop's indexing is what is
+  # wrong the first time and needs no hardware to check.
+  test_dsv4_moe_prefill_flash_emu
+  # The 2D/3D block-tiled Cube model, verified against the same monolithic
+  # oracle plus the 950PR L0A/L0B/L0C budgets.
+  test_dsv4_moe_prefill_cube_2d_emu
 )
 
 # -----------------------------------------------------------------------------
