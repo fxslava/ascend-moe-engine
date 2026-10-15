@@ -25,8 +25,12 @@
 
 namespace {
 
+// Dsv4MoeDecodeWorkspaceBytes is deliberately NOT exercised here. It is
+// public ABI in include/moe/kernels/arch35/launch.hpp, and that header pulls
+// in <acl/acl.h> -- which this target must not require, because it is built in
+// the host-emu configuration too. The launch-layer suites that do include
+// launch.hpp are where the workspace size is used and therefore pinned.
 using moe::kernels::arch35::Dsv4MoeBlockTilingData;
-using moe::kernels::arch35::Dsv4MoeDecodeWorkspaceBytes;
 using moe::kernels::arch35::MakeDsv4MoeDecodeTopkTiling;
 using moe::kernels::arch35::MakeDsv4MoePrefillTiling;
 using moe::kernels::arch35::Status;
@@ -143,21 +147,11 @@ int main() {
     }
   }
 
-  // --- the workspace size the caller must allocate ------------------------
-  // The kernel indexes it as [top_k, inter] FP32, so anything smaller is an
-  // out-of-bounds store on the last slot.
-  if (Dsv4MoeDecodeWorkspaceBytes(6u, kInter) != 6ull * kInter * 4ull) {
-    Fail("Dsv4MoeDecodeWorkspaceBytes is not top_k * inter * sizeof(float)");
-  }
-  if (Dsv4MoeDecodeWorkspaceBytes(8u, kInter) != 65536ull) {
-    Fail("the production workspace ceiling is not 64 KiB at top_k = 8");
-  }
-
   if (g_failures != 0) {
     std::printf("\n%d failure(s)\n", g_failures);
     return 1;
   }
-  std::puts("[PASS] the shipping tiling builders derive the SKU-aware grids, "
-            "size the gang workspace, and keep their rejections distinct");
+  std::puts("[PASS] the shipping tiling builders derive the SKU-aware grids "
+            "and keep their rejections distinct");
   return 0;
 }

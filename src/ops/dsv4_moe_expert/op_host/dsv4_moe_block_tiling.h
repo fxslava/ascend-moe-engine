@@ -251,10 +251,15 @@ MOE_ARCH35_ASSERT_TILING_POD(Dsv4MoeBlockTilingData, 84);
 //
 // Contents are write-before-read within a single launch, so the caller need
 // not initialize it, and nothing in it survives the launch.
-inline constexpr std::uint64_t Dsv4MoeDecodeWorkspaceBytes(
-    std::uint32_t top_k, std::uint32_t inter) noexcept {
-  return static_cast<std::uint64_t>(top_k) * inter * 4u;
-}
+//
+// THE SIZE HELPER IS PUBLIC, AND DELIBERATELY NOT HERE.
+// Dsv4MoeDecodeWorkspaceBytes() lives in include/moe/kernels/arch35/launch.hpp
+// because the CALLER allocates this buffer, which makes its size part of the
+// public ABI rather than operator-private detail. This header is
+// operator-private (§1.2) -- tests/bench spells the block geometry locally
+// rather than include it, and op_host/ is not on the npu or bench include
+// path -- so a size helper defined here is unreachable by exactly the callers
+// that need it. That was a real build break, not a theoretical one.
 
 // Both builders validate the same geometry and differ only in which extent
 // carries the work, so they share one implementation behind two names -- the

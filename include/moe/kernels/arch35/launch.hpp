@@ -252,6 +252,20 @@ Status LaunchDsv4MoeExpert(
 //
 // AS BEFORE: `y_gm` is ACCUMULATED INTO across the top_k slots, so THE CALLER
 // MUST ZERO IT before the launch.
+// The workspace size the caller must allocate: top_k * inter FP32.
+//
+// PUBLIC on purpose. The caller owns this buffer, so its size is part of this
+// operator's ABI; op_host/dsv4_moe_block_tiling.h is operator-private (§1.2)
+// and is not on the npu or bench include path, so a definition there cannot
+// be reached by the callers that have to allocate.
+//
+// uint64 because top_k * inter * 4 is formed from caller-supplied extents and
+// §2.7 requires widening before the multiply.
+inline constexpr std::uint64_t Dsv4MoeDecodeWorkspaceBytes(
+    std::uint32_t top_k, std::uint32_t inter) noexcept {
+  return static_cast<std::uint64_t>(top_k) * inter * 4u;
+}
+
 Status LaunchDsv4MoeDecodeTopk(
     const float* x_gm, const Mxfp4Pair* w1_packed_gm, const E8M0* w1_scale_gm,
     const Mxfp4Pair* w3_packed_gm, const E8M0* w3_scale_gm,
