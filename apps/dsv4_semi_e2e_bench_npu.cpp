@@ -547,18 +547,17 @@ class DescriptorBag {
     return tensor;
   }
 
-  // A transposed 2-D view: same bytes, swapped extents and strides. The router
-  // GEMM needs gate.weight as [K, N] while the checkpoint stores [N, K].
-  aclTensor* Transposed2d(std::int64_t rows, std::int64_t cols, int32_t dtype, void* address, const char* label) {
-    std::int64_t dims[2] = {cols, rows};
-    std::int64_t strides[2] = {1, cols};
-    std::int64_t storage = rows * cols;
-    aclTensor* tensor = aclCreateTensor(dims, 2, static_cast<aclDataType>(dtype), strides, 0,
-                                        static_cast<aclFormat>(ascend_moe::kAclFormatNd), &storage, 1, address);
-    DSV4_REQUIRE(tensor != nullptr, label << ": aclCreateTensor (transposed) returned null");
-    tensors_.push_back(tensor);
-    return tensor;
-  }
+  // THERE IS DELIBERATELY NO Transposed2d() HERE ANY MORE.
+  //
+  // It built a [cols, rows] view with strides {1, cols} over an unmodified
+  // [rows, cols] buffer -- a correct description of those bytes, and an
+  // aclnnMatmul B operand that ValidateDenseMatmul rejects and that the
+  // operator has no transpose flag to accept. Both its callers (the router
+  // gate and the indexer head gate) now stage a physically transposed copy
+  // through Checkpoint::StageTransposedBf16 and view it with Tensor(), which
+  // derives the contiguous strides the contract requires. The helper is gone
+  // rather than left unused because its signature is the obvious thing to
+  // reach for next time, and it produces exactly the layout that fails.
 
   aclTensorList* List(const std::vector<aclTensor*>& members, const char* label) {
     aclTensorList* list = aclCreateTensorList(members.data(), static_cast<std::uint64_t>(members.size()));
@@ -610,6 +609,67 @@ class Checkpoint {
     source_.ReadNamed(name, host.data(), host.size(), 0, bytes);
     void* device = arena_.Stage(host.data(), bytes, name.c_str());
     staged_.emplace(name, device);
+    bytes_ += bytes;
+    return device;
+  }
+
+  // A [rows, cols] BF16 checkpoint tensor staged as a PHYSICALLY TRANSPOSED
+  // [cols, rows] row-major buffer, so an aclnnMatmul B operand can be a
+  // plain contiguous view.
+  //
+  // WHY A HOST TRANSPOSE RATHER THAN A TRANSPOSED VIEW. Both aclnnMatmul B
+  // operands here -- the router gate and the indexer head gate -- are stored
+  // [N, K] in the checkpoint and wanted [K, N] by the GEMM. The cheap-looking
+  // answer is a view with swapped extents and strides {1, N}, which is what
+  // this file used to do, and on hardware it aborted in ValidateDenseMatmul:
+  //
+  //   aclnnMatmul: B must have contiguous row-major strides
+  //
+  // The validator is right and is not what needs relaxing. aclnnMatmul's
+  // plan signature is (self, mat2, out, cubeMathType, ...) -- there is NO
+  // transpose flag to condition the stride rule on, which is exactly why the
+  // contract reads "no implicit weight transpose". The operator that DOES
+  // take one is aclnnQuantMatmulV5, whose transpose_x2 is how every
+  // quantized projection in this file consumes its [N, K] weights without a
+  // repack. The dense path has no such parameter, so the bytes themselves
+  // have to be in the order the contract states.
+  //
+  // The cost is one staging-time pass over the tensor and no extra HBM: the
+  // transposed copy REPLACES the original staging rather than joining it,
+  // since neither call site wants the [N, K] orientation for anything else.
+  // It is outside the timed region.
+  void* StageTransposedBf16(const std::string& name, std::int64_t rows, std::int64_t cols) {
+    // Keyed apart from Stage()'s cache: the two orientations are different
+    // device buffers and handing one out for the other is the bug this
+    // method exists to remove.
+    const std::string key = name + "#transposed";
+    const auto cached = staged_.find(key);
+    if (cached != staged_.end()) return cached->second;
+    RequireDtype(name, "BF16");
+    RequireShape(name, {rows, cols});
+    const std::size_t elements = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+    const std::size_t bytes = source_.NamedByteSize(name);
+    DSV4_REQUIRE(bytes == elements * 2,
+                 name << ": BF16 payload is " << bytes << " B, expected " << elements * 2);
+    std::vector<std::uint8_t> host(bytes);
+    source_.ReadNamed(name, host.data(), host.size(), 0, bytes);
+
+    // [r, c] -> [c, r]. Element-wise memcpy of the 2-byte payload rather than
+    // a std::uint16_t cast: the repacked file's data segment is not
+    // guaranteed 2-byte aligned, the same reason StageAsFloat copies out.
+    std::vector<std::uint8_t> flipped(bytes);
+    for (std::int64_t r = 0; r < rows; ++r) {
+      for (std::int64_t c = 0; c < cols; ++c) {
+        const std::size_t from = (static_cast<std::size_t>(r) * static_cast<std::size_t>(cols) +
+                                  static_cast<std::size_t>(c)) * 2U;
+        const std::size_t to = (static_cast<std::size_t>(c) * static_cast<std::size_t>(rows) +
+                                static_cast<std::size_t>(r)) * 2U;
+        std::memcpy(flipped.data() + to, host.data() + from, 2);
+      }
+    }
+
+    void* device = arena_.Stage(flipped.data(), bytes, key.c_str());
+    staged_.emplace(key, device);
     bytes_ += bytes;
     return device;
   }
@@ -1149,6 +1209,38 @@ int main(int argc, char** argv) {
 
     AclnnGraph graph(ops);
     DescriptorBag bag;
+
+    // -----------------------------------------------------------------------
+    // DRAIN BEFORE ANYTHING DEVICE-OWNING UNWINDS.
+    //
+    // Declared here, after `arena`, `graph` and `bag`, so reverse-order
+    // destruction runs it FIRST and the stream is quiet before any of them
+    // goes away. Without it the order is exactly backwards on the throwing
+    // path: DescriptorBag destroys the aclTensors, AclnnGraph destroys the
+    // executors and DeviceArena aclrtFree()s the single allocation every
+    // operand is a window into -- and only then does stream_guard, declared
+    // up at the top, get around to draining. The success path happens to be
+    // safe because it synchronizes explicitly before returning; a host-side
+    // throw part-way through does not.
+    //
+    // That is the shape behind the hang observed on hardware: the
+    // ValidateDenseMatmul abort on the router gate left queued work holding
+    // addresses the arena then freed underneath it.
+    //
+    // The drain is AclStreamGuard::Drain(), which is bounded --
+    // aclrtSynchronizeStreamWithTimeout at 5 s, then aclrtDestroyStreamForce
+    // -- and noexcept, so it can neither block indefinitely nor replace an
+    // in-flight exception. It is idempotent: a forced destroy nulls the
+    // stream and stream_guard's own reset() then does nothing.
+    //
+    // NOT a plain aclrtSynchronizeStream. Unwinding from a validation failure
+    // is precisely when the stream may never retire, so the one call that
+    // must not be unbounded here is the blocking one.
+    struct StreamQuiesce {
+      ascend_moe::AclStreamGuard& guard;
+      ~StreamQuiesce() { guard.Drain(); }
+    } quiesce{stream_guard};
+
     Timeline timeline;
 
     const std::size_t bundle = static_cast<std::size_t>(kHcStreams) * kHiddenSize;
@@ -1659,8 +1751,12 @@ int main(int argc, char** argv) {
 
     // --- the indexer's head gate and its synthesized activation history ----
     const std::string indexer_prefix = layer_name(options.layer2, "attn.indexer");
-    void* i_weights_proj =
-        checkpoint.Stage(indexer_prefix + ".weights_proj.weight", "BF16", {kIndexerHeads, kHiddenSize});
+    // Staged transposed: the checkpoint holds [heads, hidden] and the dense
+    // GEMM below wants B as a contiguous [hidden, heads]. See
+    // Checkpoint::StageTransposedBf16 for why this is a physical repack and
+    // not a strided view.
+    void* i_weights_proj_t =
+        checkpoint.StageTransposedBf16(indexer_prefix + ".weights_proj.weight", kIndexerHeads, kHiddenSize);
     const std::int32_t indexer_blocks = (options.indexer_seq_len + kIndexerBlockSize - 1) / kIndexerBlockSize;
     auto* i_head_weights = static_cast<float*>(arena.Take(static_cast<std::size_t>(kIndexerHeads) * 4, "indexer.gate"));
     auto* i_query = static_cast<arch35::Fp8E4M3*>(
@@ -1677,7 +1773,7 @@ int main(int argc, char** argv) {
     void* i_workspace = arena.Take(indexer_workspace_bytes, "indexer.workspace");
 
     aclTensor* t_weights_proj =
-        bag.Transposed2d(kIndexerHeads, kHiddenSize, kAclBf16, i_weights_proj, "indexer.weights_proj");
+        bag.Tensor({kHiddenSize, kIndexerHeads}, kAclBf16, i_weights_proj_t, "indexer.weights_proj^T");
     aclTensor* t_head_weights_bf16 = nullptr;
     void* i_head_weights_bf16 = arena.Take(static_cast<std::size_t>(kIndexerHeads) * 2, "indexer.gate_bf16");
     t_head_weights_bf16 = bag.Tensor({1, kIndexerHeads}, kAclBf16, i_head_weights_bf16, "indexer.gate_bf16");
@@ -1691,7 +1787,11 @@ int main(int argc, char** argv) {
 
     // --- the MoE block -----------------------------------------------------
     const std::string moe_prefix = layer_name(options.moe_layer, "ffn");
-    void* gate_weight = checkpoint.Stage(moe_prefix + ".gate.weight", "BF16", {kNumRoutedExperts, kHiddenSize});
+    // Staged transposed, as the indexer head gate above: the checkpoint holds
+    // [experts, hidden] and the router GEMM wants B as a contiguous
+    // [hidden, experts].
+    void* gate_weight_t =
+        checkpoint.StageTransposedBf16(moe_prefix + ".gate.weight", kNumRoutedExperts, kHiddenSize);
 
     // The route row. This is a HASH layer, so the six experts are a pure
     // function of the token id -- which the host must know before it can
@@ -1733,7 +1833,8 @@ int main(int argc, char** argv) {
     void* r_weights = arena.Take(kNumExpertsPerTok * 4, "router.weights");
     void* r_experts = arena.Take(kNumExpertsPerTok * 4, "router.experts");
 
-    aclTensor* t_gate_w = bag.Transposed2d(kNumRoutedExperts, kHiddenSize, kAclBf16, gate_weight, "ffn.gate.weight");
+    aclTensor* t_gate_w =
+        bag.Tensor({kHiddenSize, kNumRoutedExperts}, kAclBf16, gate_weight_t, "ffn.gate.weight^T");
     aclTensor* t_logits_bf16 = bag.Tensor({1, kNumRoutedExperts}, kAclBf16, r_logits_bf16, "router.logits_bf16");
     aclTensor* t_logits = bag.Tensor({1, kNumRoutedExperts}, kAclFloat32, r_logits, "router.logits");
     aclTensor* t_softplus = bag.Tensor({1, kNumRoutedExperts}, kAclFloat32, r_softplus, "router.softplus");

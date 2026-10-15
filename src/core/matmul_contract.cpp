@@ -5,6 +5,28 @@
 #include "moe/core/op_table.hpp"
 
 namespace ascend_moe {
+// WHY THE ROW-MAJOR STRIDE RULE BELOW IS NOT CONDITIONAL ON A TRANSPOSE FLAG.
+//
+// The obvious relaxation, once a caller hits the stride check with an [N, K]
+// weight, is to permit a transposed B as well:
+//
+//   (transpose_b && strides[0] == 1 && strides[1] == dims[0]) || ...
+//
+// There is nothing to condition it on. aclnnMatmul's plan signature is
+// (self, mat2, out, cubeMathType, workspaceSize, executor) -- see
+// MatmulPlanFn in op_table.hpp and the signature assertion in
+// aclnn_signature_check.cpp -- and carries no transpose parameter, so a
+// relaxed check here would admit a column-major B that nothing downstream
+// has been told to read that way. The operator that does take the flag is
+// aclnnQuantMatmulV5, whose transpose_x2 is how every quantized projection
+// in this tree consumes [N, K] weights without a repack; the dense path is
+// not that operator.
+//
+// So a caller holding [N, K] repacks to [K, N] in host staging before it
+// reaches here. apps/dsv4_semi_e2e_bench_npu.cpp does this for the router
+// gate and the indexer head gate in Checkpoint::StageTransposedBf16; the
+// strided view it used to pass instead is what this check caught on
+// hardware.
 void ValidateDenseMatmul(const aclTensor* self, const aclTensor* mat2, aclTensor* out,
                          int8_t cube_math_type) {
   struct Matrix {
@@ -21,8 +43,18 @@ void ValidateDenseMatmul(const aclTensor* self, const aclTensor* mat2, aclTensor
                  "aclnnMatmul: " << name << " must be a nonempty 2-D matrix");
     DSV4_ACL_CHECK(aclGetViewStrides(tensor, &raw, &count));
     std::unique_ptr<int64_t[]> strides(raw);
+    // The observed strides are in the message because the usual cause is a
+    // transposed view, and {1, dims[0]} against the required {dims[1], 1}
+    // says that at a glance -- where the bare rule leaves the reader to go
+    // and find which operand and which orientation.
     DSV4_REQUIRE(count == 2 && strides[0] == dims[1] && strides[1] == 1,
-                 "aclnnMatmul: " << name << " must have contiguous row-major strides");
+                 "aclnnMatmul: " << name << " must have contiguous row-major strides; ["
+                                 << dims[0] << ',' << dims[1] << "] wants {" << dims[1]
+                                 << ", 1} but has {"
+                                 << (count == 2 ? strides[0] : -1) << ", "
+                                 << (count == 2 ? strides[1] : -1)
+                                 << "}. aclnnMatmul has no transpose flag: repack to [K, N] in "
+                                    "host staging rather than passing a transposed view");
     aclDataType dtype{};
     aclFormat format{};
     void* address = nullptr;
