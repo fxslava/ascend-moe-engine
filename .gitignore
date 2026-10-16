@@ -29,3 +29,15 @@ data/dsv4_layer0/kernel_fixtures/
 
 # Device-compile gate output (scripts/device_compile_kernels.sh)
 build_dav3510/
+
+# dav-3510 CAModel run output, written into the working directory by the
+# simulator and the driver stub on every ctest of a `camodel`-labelled gate.
+# `instr.bin` is an append-only instruction trace that reached 17 MB over three
+# runs; `stars_log*.dump` is the STARS task log and `excp_log*.dump` the
+# exception dumps the sim fixtures census after a launch. All three were
+# tracked by accident and carry no information about the source -- a diff of
+# them says only that someone ran the simulator.
+instr.bin
+stars_log*.dump
+excp_log*.dump
+log_ca/
