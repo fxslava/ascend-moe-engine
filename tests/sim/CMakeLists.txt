@@ -64,6 +64,36 @@ if(TARGET moe_emu)
     LABELS "sim;arch35;contract"
     TIMEOUT 30
   )
+
+  # The collapsed trip schedule for the Cube prefill gate. Registered here,
+  # OUTSIDE the CAModel guard, and deliberately so: the sample-set builder is
+  # pure index arithmetic, it decides what the simulator run proves, and
+  # section 5.5 puts that class of logic on the host. It needs no toolkit and
+  # no device, so it must run everywhere the CI gate runs -- including on a
+  # machine that can never build the CAModel target it serves.
+  #
+  # It compiles the SAME header the device TU includes (kernel/..._sample_set.h
+  # is ACL-free for this reason), so a drift between the audited schedule and
+  # the executed one is impossible rather than merely unlikely.
+  add_executable(test_dsv4_moe_prefill_cube_sample_set_sim
+    test_dsv4_moe_prefill_cube_sample_set_sim.cpp
+  )
+  target_include_directories(test_dsv4_moe_prefill_cube_sample_set_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_sample_set_sim PRIVATE
+    -Wall -Wextra
+  )
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_prefill_cube_sample_set_sim PRIVATE
+                           -Werror)
+  endif()
+  add_test(NAME Dsv4MoePrefillCubeSampleSet
+           COMMAND test_dsv4_moe_prefill_cube_sample_set_sim)
+  set_tests_properties(Dsv4MoePrefillCubeSampleSet PROPERTIES
+    LABELS "sim;arch35;contract;inductive"
+    TIMEOUT 60
+  )
 endif()
 
 option(ENABLE_DSV4_CAMODEL_TEST
@@ -117,6 +147,8 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_expert_tiling.h"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_block_arch35.h"
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_block_tiling.h"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.h"
     "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.hpp"
     "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/arch35_common.hpp"
     "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/launch.hpp"
@@ -430,6 +462,191 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   set_tests_properties(Dsv4MoeBlockDecodeInductiveSim PROPERTIES
     LABELS "sim;arch35;camodel;inductive;functional;gang"
     TIMEOUT 1800
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # -------------------------------------------------------------------------
+  # Collapsed boundary-grid gate for the CUBE PREFILL path
+  # -------------------------------------------------------------------------
+  # Third sim kernel, third target, for the same reason as the second: its TU
+  # textually includes dsv4_moe_prefill_cube_kernel.cpp so the compute bodies
+  # are verbatim production code, which also brings along the production
+  # __global__ entry. Two such objects cannot be linked into one binary, so
+  # each collapsed gate gets its own executable.
+  #
+  # This is the ONLY gate that executes a MIX AIC+AIV kernel: the other two
+  # are KERNEL_TYPE_MIX_AIV_1_0 and never stand up a KfcServer. What it adds
+  # over them is therefore the Cube side -- the AIV->AIC message queue, the
+  # Matmul framework's L0A/L0B/L0C staging, C at TPosition::VECIN and A taken
+  # from VECOUT -- none of which any other hardware-free gate touches.
+  set(_dsv4_prefill_cube_sim_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_inductive_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_inductive_launch.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.cpp"
+    "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+  )
+  set(_dsv4_prefill_cube_sim_objects)
+  foreach(_source IN LISTS _dsv4_prefill_cube_sim_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+      # ASCEND_HOME_PATH IS PASSED EXPLICITLY, and it is not redundant.
+      # BiSheng's ASC plugin loader reads that variable from the ENVIRONMENT
+      # and aborts with "PlugIn Err: can not find ASCEND_HOME_PATH" (an
+      # LLVM report_fatal_error, exit 134, no diagnostic naming the source) if
+      # it is unset. A CMake custom command does not inherit the shell that
+      # configured the build, so sourcing set_env.sh before `cmake` is not
+      # enough -- it has to be sourced before every `cmake --build` too. The
+      # sibling gates above rely on exactly that; this one does not need to.
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_sample_set.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_prefill_cube_sim_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_prefill_cube_sim_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_prefill_cube_sim_kernel_objects
+                    DEPENDS ${_dsv4_prefill_cube_sim_objects})
+
+  add_executable(test_dsv4_moe_prefill_cube_inductive_sim
+    test_dsv4_moe_prefill_cube_inductive_sim.cpp
+    ${_dsv4_prefill_cube_sim_objects}
+  )
+  add_dependencies(test_dsv4_moe_prefill_cube_inductive_sim
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_inductive_sim
+                         PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_prefill_cube_inductive_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+
+  # LINK-TIME DRIVER STUBS, and -rpath-link ONLY -- never -rpath (§4.4).
+  #
+  # libruntime.so's DT_NEEDED closure reaches libascend_hal.so, which ships
+  # with the DRIVER and not the toolkit; CANN carries a link-time stub for it
+  # so a host with no driver can still link. Without the stub on the link path
+  # this target fails with "undefined reference to drvHdcGetCapacity" and a
+  # page of sibling drv*/hal* symbols.
+  #
+  # It goes on -rpath-link and NOT on BUILD_RPATH deliberately: the stub must
+  # be invisible at RUN time, or it could satisfy the device probe in place of
+  # a real driver -- or, here, in place of the CAModel's own
+  # simulator/dav_3510/camodel/libascend_hal.so, which the ctest ENVIRONMENT
+  # below puts first on LD_LIBRARY_PATH. That is the whole point of the
+  # distinction §4.4 draws.
+  #
+  # The search list is wider than the root CMakeLists' MOE_CANN_DEVLIB_DIRS,
+  # which looks under ${ASCEND_HOME_PATH}/devlib{,/linux/<arch>}. On
+  # 9.2.0-beta.2 the stub is under ${ASCEND_HOME_PATH}/<arch>/devlib instead,
+  # so the root's list resolves to a directory that exists and does not hold
+  # it. Searched here rather than assumed.
+  set(_dsv4_devlib_dirs)
+  foreach(_candidate
+      "${ASCEND_HOME_PATH}/x86_64-linux/devlib"
+      "${ASCEND_HOME_PATH}/x86_64-linux/devlib/linux/x86_64"
+      "${ASCEND_HOME_PATH}/devlib/linux/x86_64-linux"
+      "${ASCEND_HOME_PATH}/devlib")
+    if(EXISTS "${_candidate}/libascend_hal.so")
+      list(APPEND _dsv4_devlib_dirs "${_candidate}")
+    endif()
+  endforeach()
+  if(NOT _dsv4_devlib_dirs)
+    message(FATAL_ERROR
+      "No libascend_hal.so link-time stub found under ${ASCEND_HOME_PATH}; "
+      "test_dsv4_moe_prefill_cube_inductive_sim cannot link without it. See "
+      "CLAUDE.md §4.4.")
+  endif()
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # ---------------------------------------------------------------------
+  # THIS GATE DOES NOT PASS YET, AND THAT IS THE POINT OF REGISTERING IT.
+  # ---------------------------------------------------------------------
+  # MEASURED, 2026-10-15, first ever execution of dsv4_moe_prefill_cube on
+  # anything. The CAModel brings up a simulated Ascend950PR (dav_3510, 32
+  # cores) and the launch starts, then:
+  #
+  #   * at ONE sampled tile, over both launches: killed at 1800 s without
+  #     completing. From [TASK_BEGIN] onward the simulator floods
+  #     `[ERROR] pem_lsu.cc:484 mem_map_calc_49bit_op0 invalid ldst addr`
+  #     with a REPEATING cycle of small addresses (4, 8, 12 ... 60, 72, 76,
+  #     120, 124) -- the shape of struct field offsets against a base of
+  #     zero -- and never terminates.
+  #   * at ZERO sampled tiles (the 0xFFFFFFFF setup-only diagnostic): NOT ONE
+  #     pem_lsu error, so the fault is produced by ProcessTokenTile and not by
+  #     the MIX bring-up. That run did not return either, but its hang is most
+  #     likely an artefact of the diagnostic rather than a kernel defect: the
+  #     AIC's REGIST_CUBE_OBJ does ClearWorkspace() on the KFC queue before
+  #     entering `while (server.isRun())`, and with no tiles to run the AIV
+  #     posts its quit and exits before that clear, which would zero the flag
+  #     the server is waiting on. Stated as a hypothesis, not a finding.
+  #
+  # So the TIMEOUT below is NOT derived from a completed run -- no trip of this
+  # kernel has ever completed, so there is no per-trip cost to measure and
+  # nothing to extrapolate. 7200 s is a holding value chosen to be clearly
+  # longer than the 1800 s that was already insufficient; replace it with a
+  # measurement once the kernel executes.
+  #
+  # The gate is registered red on purpose. It sits behind
+  # ENABLE_DSV4_CAMODEL_TEST (OFF by default), so it does not break a normal
+  # build, and a gate that fails on a broken kernel is a working gate. It goes
+  # green when the kernel does.
+  #
+  # NOTE ON COST, for whoever fixes this: the dominant simulated work per tile
+  # is the FULL re-dequantization of the expert's W1/W3/W2 -- 3 x 512 rows at
+  # the gate's geometry, each row a DataCopy / Cast / 16 x Muls / DataCopy
+  # sandwiched between three SetFlag/WaitFlag pairs. ProcessTokenTile does that
+  # on EVERY tile, including consecutive tiles of the same expert, which the
+  # operator's own tiling header says it does not ("the dequantization is
+  # O(weights) and runs ONCE per expert"). Making that claim true would cut
+  # this gate's cost by the number of tiles per expert as a side effect.
+  add_test(NAME Dsv4MoePrefillCubeInductiveSim
+           COMMAND test_dsv4_moe_prefill_cube_inductive_sim)
+  set_tests_properties(Dsv4MoePrefillCubeInductiveSim PROPERTIES
+    LABELS "sim;arch35;camodel;inductive;functional;cube;mix"
+    TIMEOUT 7200
     ENVIRONMENT
       "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
   )

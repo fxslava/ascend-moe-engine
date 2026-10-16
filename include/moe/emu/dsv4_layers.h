@@ -537,99 +537,192 @@ void moe_prefill_flash_ffn_w4a16_cpu(const Mxfp4Matrix* w1,
 float mxfp4_dequant_element_bf16_cpu(const Mxfp4Matrix& w, int row, int col) noexcept;
 
 // ---------------------------------------------------------------------------
-// 2D/3D BLOCK-TILED CUBE MODEL (Ascend 950PR, DaVinci v3 / dav-3510)
+// TWO-PHASE ON-CHIP FUSED CUBE PIPELINE (Ascend 950PR, DaVinci v3 / dav-3510)
 // ---------------------------------------------------------------------------
 // `moe_prefill_flash_ffn_w4a16_cpu` above tiles ONE axis -- the contraction --
 // and reduces each output row whole. That is the AIV/Vector shape and it is
 // reserved for that path. The Cube cannot be driven that way: it computes
 // fractal GEMMs out of L0A/L0B into an L0C accumulator, so the schedule that
-// fits it tiles the OUTPUT SPACE in two dimensions and streams three
-// contractions through fixed-size buffers.
+// fits it streams three contractions through fixed-size on-chip buffers.
 //
-// THE SCHEDULE MODELLED, exactly as a Cube kernel would run it:
+// THIS MODEL REPLACED A NESTED (m, h) OUTPUT GRID, and the reason is the whole
+// point of the rewrite. The previous schedule put the gate/up GEMMs INSIDE the
+// hidden-tile loop, which recomputed the entire intermediate once per H tile
+// -- 64x the gate/up MACs at hidden 4096, H_tile 64. Correct, and unusable.
+// The two-phase schedule below pays for a resident `act[M_tile, inter]` plane
+// instead and evaluates gate and up EXACTLY ONCE, which is a property the
+// suite asserts as an arithmetic identity on the trace rather than a claim in
+// a comment:
 //
-//   for each output tile (m0, h0)            <- the grid; no barriers between
-//     Y_acc[M_tile, H_tile] = 0              <- FP32, resident in L0C
-//     for r0 in 0, R_tile, ... < inter
-//       gate/up[M_tile, R_tile] = 0          <- FP32, resident in L0C
-//       for k0 in 0, K_tile, ... < hidden
-//         X   [M_tile, K_tile] -> L0A        <- BF16, rounded on the fly
-//         W1/W3[R_tile, K_tile] -> L0B       <- dequantized per block
-//         gate += X * W1^T, up += X * W3^T   <- mmad, FP32 into L0C
-//       act[M_tile, R_tile] = bf16(silu(min(gate, L)) * clamp(up, -L, L))
-//       W2[H_tile, R_tile] -> L0B            <- dequantized per block
-//       Y_acc += act * W2^T                  <- mmad, FP32 into L0C
-//     write Y_acc to GM                      <- once, at the end of the tile
+//     gate_up_macs == 2 * M * inter * hidden          (multiplier 1.0x)
+//     act_elements_written == M * inter               (each stored once)
+//
+// THE SCHEDULE MODELLED, exactly as a MIX AIC+AIV kernel would run it. There
+// are TWO phases, separated in time, over a grid whose only axis is the token
+// tile -- there is no (m, h) grid any more:
+//
+//   for each token tile m0 (M_tile = 16 rows)     <- the grid; no barriers
+//     act[M_tile, inter]                          <- BF16, resident in UB
+//
+//     PHASE 1  gate / up / SwiGLU
+//     for r0 in 0, R_sub, ... < inter             <- R_sub = 128
+//       gate/up[M_tile, R_sub] = 0                <- FP32 accumulator
+//       for k0 in 0, K_sub, ... < hidden          <- K_sub = 128
+//         X[M_tile, K_sub] -> L0A                 <- ONE read, used TWICE
+//         W1[R_sub, K_sub], W3[R_sub, K_sub]      <- dequantized per sub-tile
+//         gate += X * W1^T,  up += X * W3^T       <- mmad, FP32
+//       act[:, r0 : r0 + R_sub] =                 <- Vector, clamped SwiGLU
+//           bf16(silu(min(gate, L)) * clamp(up, -L, L))
+//
+//     PHASE 2  down projection
+//     for h0 in 0, H_sub, ... < hidden            <- H_sub = 64
+//       Y_acc[M_tile, H_sub] = 0                  <- FP32 accumulator
+//       for r0 in 0, R_sub2, ... < inter          <- R_sub2 = 256
+//         W2[H_sub, R_sub2] -> L0B                <- dequantized per sub-tile
+//         Y_acc += act[:, r0 : r0 + R_sub2] * W2^T
+//       write Y_acc to GM                         <- once per (m0, h0)
+//
+// THREE-LEVEL TILE DECOMPOSITION, which is what the sub-tile extents name:
+//   macro   the token tile in GM           M_tile x hidden, M_tile x inter
+//   sub     what is staged on chip         L1 / UB: the R_sub, K_sub, H_sub,
+//                                          R_sub2 blocks above
+//   micro   what one mmad consumes         the 16x16x16 fractal, kCubeFractal
+//
+// ZERO GM INTERMEDIATE. `act` never reaches GM, and neither does a
+// dequantized weight: every W1/W3/W2 sub-tile is decoded from MXFP4 at the
+// moment it is staged. The host scratch IS the modelled buffer set, so "no
+// global workspace" is a property of this file -- `moe_prefill_cube_2d_scratch_floats`
+// is the formula, and it grows with M_tile * inter (the `act` residency) and
+// with the sub-tile extents, and with NOTHING else.
+//
+// WHAT IS MODELLED, AND WHAT IS DELIBERATELY NOT
+//
+// Modelled, because each one can change the answer or the feasibility:
+//   * the 1-D token-tile grid and the fact that tiles share NOTHING -- the
+//     visit order is a parameter precisely so a test can prove it does not
+//     matter;
+//   * the FP32 accumulator, written to GM exactly once per (m0, h0) block;
+//   * the three-level reduction (fractal C0 = 16, then the sub-tile block,
+//     then the axis), each level accumulating in FP32;
+//   * on-the-fly dequantization into per-sub-tile fragments;
+//   * the BF16 dtypes the budget is charged at, including the UB residency of
+//     `act`, even though the host holds those fragments in float.
+//
+// NOT modelled, stated because a golden that pretends otherwise stops being
+// one:
+//   * the order of the 16 products inside one mmad. The ISA does not specify
+//     it; natural order is one admissible choice, and the error bound the
+//     suite derives covers any of them.
+//   * MTE1/MTE2 timing, BufferID ownership, double-buffer ping-pong. Buffer
+//     depth enters only as a multiplier on the footprint budget, which is the
+//     one way it can make a geometry infeasible.
+//   * WHICH on-chip buffer holds the level-2 subtotal. The schedule above
+//     writes it L0C-resident; a kernel driven through the high-level Matmul
+//     API with a per-sub-tile B must instead accumulate the subtotals in an
+//     FP32 UB buffer, because L0C does not survive between separately driven
+//     single-core GEMMs. The ARITHMETIC is the same either way -- an FP32 sum
+//     of per-sub-tile subtotals -- and that is all this file claims.
+//   * the device's `Silu`. It is a vector intrinsic over the hardware's
+//     exp/reciprocal, not std::exp, and its error is not derivable from the
+//     format -- the one term a device comparison must measure rather than
+//     derive.
+//
+// THE SCHEDULE'S RESIDUAL COST, recorded here because it is the price of
+// removing the 64x recompute and the kernel author must see it before writing
+// the kernel rather than after: with r outer and k inner, the X macro-tile is
+// re-read from GM once per r0 step, i.e. ceil(inter / R_sub) times per token
+// tile. That is a DMA cost and not a MAC cost -- gate and up are still
+// evaluated exactly once -- and `CubeTileTrace::x_fragment_reads` reports it
+// as an observed number.
 //
 // FIVE PROPERTIES THIS MODEL EXISTS TO PIN DOWN, each checked in
 // tests/emu/test_dsv4_moe_prefill_cube_2d_emu.cpp rather than asserted here:
 //
-//   1. SPATIAL INDEPENDENCE, operationally. Output tiles share no state, so
+//   1. SPATIAL INDEPENDENCE, operationally. Token tiles share no state, so
 //      the VISIT ORDER cannot change the answer. `CubeTileGeometry::visit`
-//      exists for exactly that test: row-major, column-major, reversed and
-//      shuffled must agree BIT FOR BIT. An implementation that leaked a
-//      scratchpad or an accumulator between tiles would fail it, which is a
-//      stronger statement than "the source contains no barrier".
+//      exists for exactly that test: all four traversals must agree BIT FOR
+//      BIT. An implementation that leaked a scratchpad or an accumulator
+//      between tiles would fail it, which is a stronger statement than "the
+//      source contains no barrier".
 //   2. WRITE-ONCE COVERAGE. The tiles partition the output exactly: the trace
 //      counts the elements written and the suite poisons the destination
-//      first, so neither a gap nor an overlap can pass.
+//      first, so neither a gap nor an overlap can pass. `act` is covered the
+//      same way, which is what makes the 1.0x multiplier an observation.
 //   3. THE BUFFER BUDGET IS A HARD CONSTRAINT, not a comment. The footprint
-//      of every fragment actually loaded is computed during the run and
+//      of every fragment actually staged is computed during the run and
 //      reported through `CubeTileTrace`, so the suite asserts an OBSERVED
-//      peak against the platform's L0A/L0B/L0C sizes.
+//      peak against the platform's L0A/L0B/L0C/L1 sizes AND against UB, which
+//      the resident `act` plane now puts in the budget.
 //   4. THE REDUCTION HIERARCHY IS THREE-LEVEL, and that is what separates this
 //      model from the 1D one numerically. See the note on `CubeTileGeometry`.
-//   5. THE COST OF THE SCHEDULE IS VISIBLE. Computing gate/up inside the
-//      (m, h) tile loop recomputes the whole intermediate once per H tile:
-//      the trace reports that redundancy as a number instead of leaving it to
-//      be discovered on hardware.
+//   5. ZERO REDUNDANT COMPUTATION, as the two identities above.
 //
 // W4A16 semantics are unchanged from the rest of the family: X rounded to
 // BF16 (once -- the rounding is idempotent, so doing it per fragment is the
 // same function), exact power-of-two E8M0 scaling, lossless E2M1 -> BF16, and
 // FP32 accumulation.
 
-// DaVinci v3 per-AI-core Cube buffer capacities, from the toolkit's own
-// platform configs (x86_64-linux/data/platform_config/Ascend950PR_*.ini:
-// l0_a/l0_b = 65536, l0_c_size = 262144, l1_size = 524288) and matching the
+// DaVinci v3 per-AI-core capacities, from the toolkit's own platform configs
+// (x86_64-linux/data/platform_config/Ascend950PR_*.ini: l0_a/l0_b = 65536,
+// l0_c_size = 262144, l1_size = 524288, ub_size = 253952) and matching the
 // whitepaper's Table in ascend_950PR_950DT_specs.markdown. The ini is the
 // authority: its UB figure (253,952 B) is the one the whitepaper's
 // per-subsystem "512 KB UB" contradicts, so the two are not interchangeable
-// as sources even where they agree on the L0 sizes.
+// as sources even where they agree on the L0 sizes. UB is PER VECTOR CORE and
+// a subsystem holds two of them, which is the factor of two the paper hides.
 inline constexpr std::size_t kCubeL0ABytes = 65536;   // 64 KiB
 inline constexpr std::size_t kCubeL0BBytes = 65536;   // 64 KiB
 inline constexpr std::size_t kCubeL0CBytes = 262144;  // 256 KiB
 inline constexpr std::size_t kCubeL1Bytes = 524288;   // 512 KiB
+inline constexpr std::size_t kCubeUbBytes = 253952;   // 248 KiB, per AIV
 
 // The fractal unit. C0 for BF16 is 16 ELEMENTS (32 B) -- 64 is the C0 of the
 // b4 family, which does not apply here because this path dequantizes to BF16
 // before the Cube sees anything. The MAC array's K depth is the same 16, so
-// one `mmad` reduces 16 products and L0C accumulates between fractals: that
-// is where the three-level reduction below comes from.
+// one `mmad` reduces 16 products and the accumulator accumulates between
+// fractals: that is where the three-level reduction below comes from.
 inline constexpr int kCubeFractal = 16;
 
-// How the grid walks the output tiles. Scheduling only: a correct
-// implementation must give the same answer for all four, and the suite checks
-// that rather than taking it on trust.
+// How the grid walks the work. Scheduling only: a correct implementation must
+// give the same answer for all four, and the suite checks that rather than
+// taking it on trust.
+//
+// The grid's only independent axis is the TOKEN TILE, so these permute the
+// token tiles. Phase 2's h0 loop is inside a tile body and cannot be a grid
+// axis -- `act` must exist before any of it runs -- but its DIRECTION is just
+// as irrelevant to the answer, so the enum carries that too and no two of the
+// four name the same traversal:
+//
+//   kRowMajor      token tiles ascending,  phase-2 h blocks ascending
+//   kColumnMajor   token tiles ascending,  phase-2 h blocks DESCENDING
+//   kReversed      token tiles descending, phase-2 h blocks descending
+//   kShuffled      token tiles permuted,   phase-2 h blocks ascending
 enum class CubeTileVisit {
-  kRowMajor,     // m outer, h inner
-  kColumnMajor,  // h outer, m inner
-  kReversed,     // row-major, backwards
-  kShuffled,     // permuted from `visit_seed`
+  kRowMajor,
+  kColumnMajor,
+  kReversed,
+  kShuffled,
 };
 
 // THE REDUCTION HIERARCHY, because it is the whole numerical difference
 // between this model and the flat 1D one:
 //
 //   level 0   one mmad, C0 = 16 products, summed in natural order
-//   level 1   one K_tile (or R_tile) block, the fractals accumulated in L0C
-//   level 2   the whole contraction axis, the blocks accumulated in L0C
+//   level 1   one sub-tile block (K_sub for gate/up, R_sub2 for down), the
+//             fractals accumulated in FP32
+//   level 2   the whole contraction axis, the blocks accumulated in FP32
 //
 // The monolithic oracle sums the same products FLAT. So the two differ by
 // FP32 reassociation on every GEMM -- bounded, and bounded by the depth of
 // the trees rather than by anything measured. Level 0's internal order is NOT
 // specified by the ISA; natural order is one admissible choice and the bound
 // the suite derives covers any of them.
+//
+// WHICH EXTENT BLOCKS WHICH REDUCTION, since the two phases no longer share
+// one: gate and up reduce over `hidden` in blocks of `k_tile` (K_sub), and
+// the down projection reduces over `inter` in blocks of `r_tile_down`
+// (R_sub2). `r_tile` and `h_tile` are OUTPUT extents and enter no reduction,
+// so they cannot change the answer -- which is claim 1 of the suite.
 //
 // One consequence is worth stating because a tolerance that ignores it is
 // wrong: the gate/up reassociation is amplified by the BF16 store of `act`.
@@ -638,105 +731,171 @@ enum class CubeTileVisit {
 // FP32 reassociation that caused it. The suite measures that flip set and
 // bounds its contribution separately instead of hiding it in one number.
 struct CubeTileGeometry {
-  int m_tile = 16;   // tokens per output tile      {16, 32}
-  int h_tile = 64;   // hidden columns per tile     {64, 128}
-  int r_tile = 64;   // contraction along `inter`   {64, 128}
-  int k_tile = 64;   // contraction along `hidden`  {64, 128}
+  // The grid: tokens per token tile. 16 at the production geometry, which is
+  // what keeps `act[16, inter]` at exactly 64 KiB there (16 * 2048 * 2 B).
+  //
+  // Stated without overclaiming: M_tile = 32 doubles BOTH the `act` plane
+  // (to 128 KiB) and the FP32 accumulators, and at R_sub = 128 this model's
+  // budget still admits it -- the 64 KiB saved by the smaller sub-tiles is
+  // what buys the room. It is not admitted because it is a good idea: a real
+  // kernel also carries the Matmul framework's own UB and the queue depths
+  // this model does not charge, so 32 is close enough to the ceiling that the
+  // production geometry does not take it.
+  int m_tile = 16;
+  // PHASE 1. r_tile is the inter-axis OUTPUT sub-tile (R_sub); k_tile is the
+  // hidden-axis CONTRACTION sub-tile (K_sub).
+  int r_tile = 128;
+  int k_tile = 128;
+  // PHASE 2. h_tile is the hidden-axis OUTPUT sub-tile (H_sub); r_tile_down
+  // is the inter-axis CONTRACTION sub-tile (R_sub2). They are separate knobs
+  // from phase 1's because the two phases are separated in time and share no
+  // buffer except `act`, so there is no reason to tie them -- and the down
+  // GEMM's B fragment is W2[H_sub, R_sub2], a different shape from
+  // W1[R_sub, K_sub].
+  int h_tile = 64;
+  int r_tile_down = 256;
   // Buffer slots per operand: 1 for a serial loop, 2 for the double buffering
-  // a real kernel needs to overlap MTE1 with the Cube. The budget is charged
-  // for all of them, which is why it is part of the geometry and not an
-  // implementation detail.
+  // a real kernel needs to overlap MTE1/MTE2 with the Cube. The budget is
+  // charged for all of them, which is why it is part of the geometry and not
+  // an implementation detail. `act` is charged at depth 1 whatever this says:
+  // it is a single resident plane, not a streamed fragment.
   int buffer_depth = 2;
   CubeTileVisit visit = CubeTileVisit::kRowMajor;
   std::uint64_t visit_seed = 0;
 };
 
-// Bytes resident in each Cube buffer, charged at the hardware's dtypes: the
-// A/B fragments are BF16 (2 B) even though this host model holds them in
+// Bytes resident in each on-chip buffer, charged at the hardware's dtypes:
+// the A/B fragments are BF16 (2 B) even though this host model holds them in
 // float, and the accumulators are FP32 (4 B).
 //
-//   L0A   max(X[M, K], act[M, R]) * 2 B * depth      the two phases' A matrices
-//   L0B   max(W1/W3[R, K], W2[H, R]) * 2 B * depth   ditto for B; W1 and W3
-//                                                    reuse one slot, since
-//                                                    they feed the Cube one
-//                                                    after the other
-//   L0C   (Y_acc[M, H] + gate[M, R] + up[M, R]) * 4 B
-//         charged TOGETHER, not as a max: Y_acc is resident across the whole
-//         r loop while gate and up are being produced inside it.
-//   L1    every block streamed for one r step, at BF16, plus the X block
+// THE TWO PHASES ARE SEPARATED IN TIME, so each buffer is charged the LARGER
+// of the two phases and not their sum. That is the one modelling decision in
+// here that could let an infeasible geometry look feasible, so it is stated:
+// it is sound only because phase 2 does not start until the last `act` column
+// is stored, which is exactly what makes the schedule non-redundant.
+//
+//   L0A   phase 1  X[M, K_sub] * 2 B * depth
+//         phase 2  act[M, R_sub2] * 2 B * depth
+//   L0B   phase 1  W1/W3[R_sub, K_sub] * 2 B * depth   (one slot: W1 then W3)
+//         phase 2  W2[H_sub, R_sub2] * 2 B * depth
+//   L0C   phase 1  (gate[M, R_sub] + up[M, R_sub]) * 4 B    together, not max
+//         phase 2  Y_acc[M, H_sub] * 4 B
+//   L1    phase 1  (2 * R_sub * K_sub + M * K_sub) * 2 B * depth
+//         phase 2  (H_sub * R_sub2) * 2 B * depth
+//   UB    BOTH     act[M_tile, inter] * 2 B, at depth 1, plus the phase's own
+//                  FP32 accumulators, plus the phase's dequant staging (the
+//                  weight sub-tile as packed nibbles and as BF16, since the
+//                  expansion is a VECTOR operation and happens in UB before
+//                  anything reaches L1) -- the resident plane is why `inter`
+//                  is a parameter of the budget at all.
 struct CubeBufferFootprint {
   std::size_t l0a_bytes = 0;
   std::size_t l0b_bytes = 0;
   std::size_t l0c_bytes = 0;
   std::size_t l1_bytes = 0;
+  std::size_t ub_bytes = 0;
 
   bool Fits() const {
     return l0a_bytes <= kCubeL0ABytes && l0b_bytes <= kCubeL0BBytes &&
-           l0c_bytes <= kCubeL0CBytes && l1_bytes <= kCubeL1Bytes;
+           l0c_bytes <= kCubeL0CBytes && l1_bytes <= kCubeL1Bytes &&
+           ub_bytes <= kCubeUbBytes;
   }
 };
 
-// The footprint of a FULL tile of this geometry, and of one actual (possibly
-// ragged) fragment set. A ragged tile is a strict subset of a full one, so the
-// full-tile figure is the peak -- which the trace's observed peak confirms
-// rather than assumes.
-CubeBufferFootprint moe_prefill_cube_tile_footprint(const CubeTileGeometry& geometry) noexcept;
-CubeBufferFootprint moe_prefill_cube_fragment_footprint(int m_extent, int h_extent,
-                                                        int r_extent, int k_extent,
-                                                        int buffer_depth) noexcept;
+// The footprint of ONE phase's fragment set. Separate entry points rather
+// than one with a mode flag, because the two phases stage different shapes
+// and a caller that passed the wrong extents to a merged function would get a
+// plausible number back.
+//
+// `m_extent` and the contraction extents are the ACTUAL (possibly ragged)
+// ones; `inter` is the problem's, since `act` is allocated for the whole axis
+// whatever the ragged tail does. A ragged fragment is a strict subset of a
+// full one, so the full-sub-tile figure is the peak -- which the trace's
+// observed peak confirms rather than assumes.
+CubeBufferFootprint moe_prefill_cube_phase1_footprint(int m_extent, int r_extent,
+                                                      int k_extent, int inter,
+                                                      int buffer_depth) noexcept;
+CubeBufferFootprint moe_prefill_cube_phase2_footprint(int m_extent, int h_extent,
+                                                      int r_down_extent, int inter,
+                                                      int buffer_depth) noexcept;
 
-// Is this geometry one the hardware can run? Three separate conditions, kept
-// separate because they fail for different reasons:
-//   * every tile extent positive and a whole multiple of the 16x16x16 fractal;
+// The elementwise maximum of the two phases at FULL sub-tile extents: the
+// peak the geometry must fit. Takes `inter` because the `act` residency does.
+CubeBufferFootprint moe_prefill_cube_tile_footprint(const CubeTileGeometry& geometry,
+                                                    int inter) noexcept;
+
+// Is this geometry one the hardware can run at this `inter`? Three separate
+// conditions, kept separate because they fail for different reasons:
+//   * every sub-tile extent positive and a whole multiple of the 16x16x16
+//     fractal;
 //   * buffer_depth in 1..2;
-//   * the full-tile footprint inside L0A/L0B/L0C/L1.
-// The enumerated tile sets {16,32} x {64,128} x {64,128} x {64,128} all pass;
-// one step past them does not, and the suite exhibits that rather than
-// claiming it.
-bool moe_prefill_cube_tile_geometry_admissible(const CubeTileGeometry& geometry) noexcept;
+//   * the full-sub-tile peak inside L0A/L0B/L0C/L1 AND inside UB, the last of
+//     which is the constraint the resident `act` plane adds and the one that
+//     fixes M_tile at 16 for the production geometry.
+bool moe_prefill_cube_tile_geometry_admissible(const CubeTileGeometry& geometry,
+                                               int inter) noexcept;
 
 // Scratch, in floats: the host mirror of the modelled buffer set, which is
-// what makes "no global workspace" checkable. Sized by the TILE only -- it
-// does not grow with `hidden`, `inter` or the token count.
-std::size_t moe_prefill_cube_2d_scratch_floats(const CubeTileGeometry& geometry) noexcept;
+// what makes "no global workspace" checkable. Sized by the SUB-TILE extents
+// plus the one term that is deliberately not sub-tile sized -- act[M_tile,
+// inter], the resident plane the whole schedule is built around. It does not
+// grow with `hidden` or the token count, and it grows with `inter` LINEARLY
+// IN M_TILE and not in M: that difference is the claim.
+std::size_t moe_prefill_cube_2d_scratch_floats(const CubeTileGeometry& geometry,
+                                               int inter) noexcept;
 
 // What the run actually did. Everything here is OBSERVED during the loop, not
 // recomputed from the geometry afterwards, so the suite's assertions are about
 // the execution and not about the formula.
 struct CubeTileTrace {
-  // The largest footprint any single fragment set reached.
+  // The largest footprint any single fragment set reached, per phase and
+  // overall. Kept per phase as well as merged because the two phases load
+  // different shapes and a single peak would not say which one is tight.
   CubeBufferFootprint peak;
+  CubeBufferFootprint phase1_peak;
+  CubeBufferFootprint phase2_peak;
   // Grid shape and coverage.
-  std::uint64_t output_tiles = 0;
-  std::uint64_t output_elements_written = 0;  // must equal M * hidden exactly
-  // The largest actual fragment extents seen, so a ragged run can be told
-  // apart from a run that quietly skipped its tails.
+  std::uint64_t token_tiles = 0;               // the grid's extent
+  std::uint64_t output_tiles = 0;              // (m0, h0) GM writes
+  std::uint64_t output_elements_written = 0;   // must equal M * hidden exactly
+  // `act` stores. The TWO-PHASE schedule's defining property: each of the
+  // M * inter activations is computed and stored EXACTLY ONCE. The previous
+  // (m, h)-grid schedule would report M * inter * ceil(hidden / H_tile) here,
+  // so this counter is the redundancy check in its sharpest form.
+  std::uint64_t act_elements_written = 0;      // must equal M * inter exactly
+  // The largest and smallest actual fragment extents seen, so a ragged run
+  // can be told apart from a run that quietly skipped its tails.
   int max_m_extent = 0;
   int max_h_extent = 0;
   int max_r_extent = 0;
   int max_k_extent = 0;
+  int max_r_down_extent = 0;
   int min_m_extent = 0;
   int min_h_extent = 0;
   int min_r_extent = 0;
   int min_k_extent = 0;
-  // Multiply-accumulates issued, by phase. The gate/up figure is the one that
-  // carries the schedule's cost: computing the intermediate inside the (m, h)
-  // tile loop repeats it once per H tile.
+  int min_r_down_extent = 0;
+  // Multiply-accumulates issued, by phase. gate_up_macs must now be EXACTLY
+  // 2 * M * inter * hidden -- the single-pass work, multiplier 1.0x -- and
+  // down_macs exactly M * hidden * inter.
   std::uint64_t gate_up_macs = 0;
   std::uint64_t down_macs = 0;
-  std::uint64_t intermediate_recompute_factor = 0;  // ceil(hidden / H_tile)
-  // How many times a weight BLOCK was dequantized into its L0B slot. This is
-  // the B-fragment reuse the Cube exists for, as a number: a token tile whose
-  // tokens share one expert stages each block ONCE and reduces all M rows
-  // against it, while a tile straddling an expert boundary must restage. The
-  // golden stays per-token correct either way -- it does not assume the
+  // The X macro-tile is re-read once per phase-1 r0 step, which is this
+  // schedule's residual cost. Observed, so the suite asserts the factor
+  // instead of the comment above being the only record of it.
+  std::uint64_t x_fragment_reads = 0;
+  // How many times a weight SUB-TILE was dequantized into its L0B slot. This
+  // is the B-fragment reuse the Cube exists for, as a number: a token tile
+  // whose tokens share one expert stages each sub-tile ONCE and reduces all M
+  // rows against it, while a tile straddling an expert boundary must restage.
+  // The golden stays per-token correct either way -- it does not assume the
   // dispatch grouped the tokens -- and this counter is how the suite shows
   // what that assumption would have bought.
   std::uint64_t gate_up_fragment_stagings = 0;
   std::uint64_t down_fragment_stagings = 0;
 };
 
-// The 2D block-tiled Cube golden. Same token-to-expert contract as
+// The two-phase Cube golden. Same token-to-expert contract as
 // `moe_prefill_batched_mxfp4_w4a16_cpu`, so a suite can run both over one
 // fixture and attribute the whole difference to the reduction hierarchy.
 // `trace` may be null. Throws std::invalid_argument on a null operand, a

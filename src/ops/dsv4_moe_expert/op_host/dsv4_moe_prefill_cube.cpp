@@ -8,13 +8,13 @@
 // there is no host-visible phase boundary to order and no second enqueue.
 //
 // THIS WRAPPER HAS A WORKSPACE, unlike the AIV block wrappers, and it is
-// caller-owned. Two reasons stack:
-//   * REGIST_MATMUL_OBJ puts the KFC message queue at the head of it, so a
-//     MIX Matmul kernel cannot run without one at all;
-//   * the dequantized BF16 weight planes live there too, because one expert's
-//     W1 in BF16 is 16 MiB at the production geometry against 512 KiB of L1.
-// Both are explained where they are sized, on
-// Dsv4MoePrefillCubeWorkspaceBytes().
+// caller-owned -- but for ONE reason now, not two. REGIST_MATMUL_OBJ puts the
+// KFC message queue at the head of it, so a MIX Matmul kernel cannot run
+// without one at all. The second reason is gone: the dequantized BF16 weight
+// planes used to live there because a TPosition::TSCM B operand must be the
+// whole single-core B and one expert's W1 is 16 MiB in BF16. The two-phase
+// kernel dequantizes per SUB-TILE into UB and pushes UB -> L1 instead, so
+// nothing dequantized reaches GM. See Dsv4MoePrefillCubeWorkspaceBytes().
 // -----------------------------------------------------------------------------
 
 #include "kernel_operator.h"
@@ -51,14 +51,20 @@ Status LaunchDsv4MoePrefillCube(
       y_tokens_gm == nullptr || workspace_gm == nullptr || stream == nullptr) {
     return Status::invalid_argument;
   }
-  // Each token's output row is written while its input row is still being read
-  // through the workspace's BF16 copy, so in-place is not supported.
+  // Y ALIASING X IS STILL REJECTED, and the reason changed with the schedule,
+  // so it is restated rather than left to read as stale. There is no longer a
+  // BF16 copy of X in the workspace -- X is cast per sub-tile in UB -- but
+  // phase 2 writes y[row0 .. row0+rows] while phase 1 of a LATER r0 step on
+  // the same core has already finished reading x for those rows and a later
+  // TILE has not. In-place would therefore let one core's output land on
+  // another core's unread input, with no ordering between them.
   if (static_cast<const void*>(y_tokens_gm) ==
       static_cast<const void*>(x_tokens_gm)) {
     return Status::invalid_argument;
   }
-  // The workspace holds the BF16 copy of X and the dequantized weights; an
-  // overlap with either operand is a self-corrupting launch.
+  // The workspace is the Matmul KFC message queue. An overlap with either
+  // operand is a self-corrupting launch -- the queue is written by both the
+  // AIV client and the AIC server throughout.
   if (workspace_gm == static_cast<const void*>(x_tokens_gm) ||
       workspace_gm == static_cast<const void*>(y_tokens_gm)) {
     return Status::invalid_argument;

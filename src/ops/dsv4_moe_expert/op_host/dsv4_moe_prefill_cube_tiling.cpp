@@ -26,16 +26,43 @@ Status MakeDsv4MoePrefillCubeTiling(std::uint32_t hidden, std::uint32_t inter,
   if (!Dsv4MoePrefillCubeAdmissible(hidden, inter)) {
     return Status::unsupported_shape;
   }
-  // The Cube N chunks must divide their axes: a ragged final chunk would need
-  // SetTail() before Iterate, which this version does not drive.
-  if (inter % kPrefillCubeInterTile != 0u ||
-      hidden % kPrefillCubeHiddenTile != 0u) {
+  // EVERY sub-tile extent must divide its axis. Four conditions, not two,
+  // because the two-phase schedule splits both axes of both phases:
+  //
+  //   phase 1   inter  % R_SUB   output columns of `act` per pass
+  //             hidden % K_SUB   contraction blocks of the gate/up GEMMs
+  //   phase 2   hidden % H_SUB   output columns of Y per pass
+  //             inter  % R_SUB2  contraction blocks of the down GEMM
+  //
+  // A ragged sub-tile on any of them would need the burst extents and the
+  // Matmul tail recomputed per step, which this version does not drive -- the
+  // only raggedness it handles is the TOKEN tail, where SetTail(rows, ...)
+  // and the per-row burst block count already carry it.
+  if (inter % kPrefillCubeRSub != 0u || hidden % kPrefillCubeKSub != 0u ||
+      hidden % kPrefillCubeHSub != 0u || inter % kPrefillCubeRSub2 != 0u) {
     return Status::unsupported_shape;
   }
-  // The reduction axes must be whole MXFP4 groups, or a dequantized row would
-  // end mid-group and the scale index would run past the row.
+  // The reduction axes must be whole MXFP4 groups, or a dequantized sub-tile
+  // would end mid-group and the scale index would run past it.
   if (hidden % kPrefillCubeGroupSize != 0u ||
       inter % kPrefillCubeGroupSize != 0u) {
+    return Status::unsupported_shape;
+  }
+  // The strided bursts count their block length in 32-BYTE units, so each
+  // sub-tile row must be a whole number of them on both sides of every copy:
+  //
+  //   X      K_SUB floats                       (k_sub * 4) % 32
+  //   Y      H_SUB floats                       (h_sub * 4) % 32
+  //   W      half a row of K_SUB / R_SUB2 nibbles
+  //
+  // and the SOURCE strides likewise, which is what brings `hidden` and
+  // `inter` into these conditions rather than the sub-tile extents alone. The
+  // sub-tile halves are static_asserted in the header; these are the ones
+  // that depend on the caller's geometry.
+  if (((hidden - kPrefillCubeKSub) * 4u) % 32u != 0u ||
+      ((hidden - kPrefillCubeHSub) * 4u) % 32u != 0u ||
+      ((hidden - kPrefillCubeKSub) / 2u) % 32u != 0u ||
+      ((inter - kPrefillCubeRSub2) / 2u) % 32u != 0u) {
     return Status::unsupported_shape;
   }
 
@@ -60,23 +87,12 @@ Status MakeDsv4MoePrefillCubeTiling(std::uint32_t hidden, std::uint32_t inter,
     return Status::unsupported_shape;
   }
 
-  // The workspace is indexed with uint64 on device, but a single allocation
-  // this large is not addressable either, so decline it here rather than at
-  // the first wrong store.
-  //
-  // Spelled locally rather than calling Dsv4MoePrefillCubeWorkspaceBytes():
-  // that helper is public ABI in launch.hpp, which pulls in <acl/acl.h>, and
-  // this TU must stay ACL-free because the tiling header it implements is
-  // included by the device side (§2.4). Only the ORDER OF MAGNITUDE matters
-  // here -- the authoritative size, including the KFC reserve, is the public
-  // helper, and the caller allocates from that.
-  const std::uint64_t x_bf16 =
-      static_cast<std::uint64_t>(total_tokens) * hidden * 2u;
-  const std::uint64_t w_bf16 =
-      3ull * static_cast<std::uint64_t>(inter) * hidden * 2u;
-  if (x_bf16 + w_bf16 > (1ull << 40)) {
-    return Status::unsupported_shape;
-  }
+  // THERE IS NO WORKSPACE SIZE TO BOUND ANY MORE. The predecessor checked
+  // that its three dequantized planes stayed addressable, because at the
+  // production geometry they were 48 MiB and grew with the problem. The
+  // two-phase schedule has no planes: the workspace is the Matmul KFC message
+  // queue reserve, a constant. Recorded rather than silently deleted, because
+  // the absence of the check is now a property of the schedule.
 
   Dsv4MoePrefillCubeTilingData t{};
   t.abi_version = kTilingAbiVersion;
@@ -85,8 +101,10 @@ Status MakeDsv4MoePrefillCubeTiling(std::uint32_t hidden, std::uint32_t inter,
   t.num_experts = num_experts;
   t.total_tokens = total_tokens;
   t.m_tile = kPrefillCubeMTile;
-  t.inter_tile = kPrefillCubeInterTile;
-  t.hidden_tile = kPrefillCubeHiddenTile;
+  t.r_sub = kPrefillCubeRSub;
+  t.k_sub = kPrefillCubeKSub;
+  t.h_sub = kPrefillCubeHSub;
+  t.r_sub2 = kPrefillCubeRSub2;
   t.group_size = kPrefillCubeGroupSize;
   t.low_nibble_first = 1u;
   t.w13_packed_expert_stride = static_cast<std::uint32_t>(w13_packed_expert);

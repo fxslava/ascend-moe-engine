@@ -292,9 +292,11 @@ Status LaunchDsv4MoeDecodeTopk(
 // beats the memory system there. NEVER MEASURED on hardware (§5.7).
 //
 // `workspace_gm` is CALLER-OWNED and must be at least
-// Dsv4MoePrefillCubeWorkspaceBytes(total_tokens, hidden, inter). It carries
-// the Matmul KFC message queue AND the dequantized weight planes; it needs no
-// initialization and nothing in it outlives the call.
+// Dsv4MoePrefillCubeWorkspaceBytes(). It carries the Matmul KFC message queue
+// and NOTHING ELSE: the kernel dequantizes each weight sub-tile on the Vector
+// side straight into UB and pushes it to L1, so no dequantized weight and no
+// intermediate activation is ever written to GM. It needs no initialization
+// and nothing in it outlives the call.
 //
 // `x_tokens_gm` is expected ALREADY GROUPED BY EXPERT, as for the AIV prefill
 // entry point: that ordering is what lets one dequantization of an expert
@@ -311,19 +313,35 @@ Status LaunchDsv4MoePrefillCube(
 
 // The workspace size the caller must allocate for LaunchDsv4MoePrefillCube.
 // Public for the same reason the decode one is: the caller allocates it.
+//
+// IT NO LONGER DEPENDS ON THE PROBLEM, and the parameters are kept only so
+// existing callers keep compiling. It used to be
+//
+//     KFC reserve + X in BF16 + (W1 + W3) in BF16 + W2 in BF16
+//
+// which is 48 MiB of dequantized weights at 4096x2048 -- four times the MXFP4
+// bytes, written to GM and streamed back by the Cube -- because a
+// TPosition::TSCM B operand must be the whole single-core B and one expert's
+// W1 does not fit 512 KiB of L1. The two-phase kernel removed that
+// requirement rather than satisfying it: splitting the contraction makes each
+// step its own single-core GEMM whose B is one 32 KiB sub-tile, dequantized
+// into UB and pushed UB -> L1. So all that is left is the Matmul framework's
+// KFC message queue, which REGIST_MATMUL_OBJ puts at the head of the
+// workspace and without which a MIX Matmul kernel cannot run at all.
+//
+// The three arguments are therefore UNUSED. They are retained rather than
+// removed so that a caller sized for the old contract still compiles and
+// still over-allocates -- which is safe -- instead of failing to build and
+// tempting someone to pass a smaller number by hand.
 inline constexpr std::uint64_t Dsv4MoePrefillCubeWorkspaceBytes(
-    std::uint32_t total_tokens, std::uint32_t hidden,
-    std::uint32_t inter) noexcept {
-  // KFC message queue reserve, then X in BF16, then W1+W3, then W2. Widened
-  // before every multiply (§2.7): w13 alone is 32 MiB at 4096x2048.
-  const std::uint64_t kKfcReserve = 1ull << 20;
-  const std::uint64_t x_bf16 =
-      static_cast<std::uint64_t>(total_tokens) * hidden * 2u;
-  const std::uint64_t w13_bf16 =
-      2ull * static_cast<std::uint64_t>(inter) * hidden * 2u;
-  const std::uint64_t w2_bf16 =
-      static_cast<std::uint64_t>(hidden) * inter * 2u;
-  return kKfcReserve + x_bf16 + w13_bf16 + w2_bf16;
+    std::uint32_t /*total_tokens*/, std::uint32_t /*hidden*/,
+    std::uint32_t /*inter*/) noexcept {
+  // Mirrors kCubeKfcReserveBytes in the operator's private UB layout header.
+  // Two copies because that header is operator-private (§1.2) and this one is
+  // what the CALLER allocates from; the kernel static_asserts nothing across
+  // the boundary, so the two are kept identical by this comment and by the
+  // launch wrapper's own check below.
+  return 1ull << 20;
 }
 
 Status LaunchDsv4MoePrefillBatched(

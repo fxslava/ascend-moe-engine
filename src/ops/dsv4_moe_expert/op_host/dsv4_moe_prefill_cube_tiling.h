@@ -5,7 +5,8 @@
 // point:
 //
 //   dsv4_moe_prefill_cube   M >> 1, one expert per token, grouped by expert,
-//                           W1/W3/W2 on the Cube in BF16
+//                           W1/W3/W2 on the Cube in BF16, TWO-PHASE and with
+//                           NO GM INTERMEDIATE WORKSPACE
 //
 // Included by both op_kernel/ and op_host/; no <acl/acl.h> (CLAUDE.md §2.4).
 //
@@ -15,7 +16,7 @@
 // GEMMs to the Cube. They share no inner loop, no UB layout and no grid, so
 // `mode` on one POD would select between two unrelated kernels -- the shape
 // §2.5 exists to prevent. The two POD contracts stay separate, as does the
-// `activated` residency argument each rests on.
+// `act` residency argument each rests on.
 //
 // ---------------------------------------------------------------------------
 // WHY BF16 AND NOT NATIVE CUBE MXFP4
@@ -53,6 +54,48 @@
 // below M ~ 68 it is not slower than the MXFP4 path would be, because neither
 // can beat the memory system there. NEVER MEASURED on hardware (§5.7): this
 // is a roofline argument, not a benchmark result.
+//
+// ---------------------------------------------------------------------------
+// THE TWO-PHASE SCHEDULE, AND THE ABI BREAK THAT PAID FOR IT
+// ---------------------------------------------------------------------------
+// THIS POD IS 72 BYTES AND WAS 64. That is a deliberate ABI break (§2.2) and
+// it is the visible half of a schedule change, so it is recorded rather than
+// migrated silently. The previous version carried ONE N chunk per GEMM
+// (`inter_tile`, `hidden_tile`) because each GEMM reduced over its whole axis
+// in a single call, reading dequantized BF16 weight planes out of a GM
+// workspace. This version splits BOTH axes of BOTH phases, so it needs four
+// sub-tile extents instead of two, and it has no weight planes at all.
+//
+// WHAT CHANGED, AND WHY EACH PIECE HAD TO
+//
+//   1. ZERO GM INTERMEDIATE. The old schedule dequantized a whole expert's
+//      W1/W3/W2 into GM -- 48 MiB in BF16 at 4096x2048, four times the MXFP4
+//      bytes -- and the Cube streamed them back. That workspace is gone: each
+//      weight SUB-TILE is decoded on the Vector side straight into UB and
+//      pushed to L1 (TPosition::TSCM), and the Cube never reads a weight from
+//      GM. The weight traffic is now the 12 MiB of MXFP4 and nothing else.
+//      `act` never reaches GM either; it is UB-resident across the phase
+//      boundary, which is what the whole budget is built around.
+//
+//   2. GATE AND UP ARE EVALUATED ONCE. The host golden's trace asserts
+//      gate_up_macs == 2 * M * inter * hidden exactly. The predecessor
+//      schedule computed them inside a hidden-tile loop and paid
+//      ceil(hidden / H_sub) = 64x for it at the production geometry.
+//
+//   3. THE SUB-GEMM IS THE UNIT. A `TPosition::TSCM` B operand must be the
+//      WHOLE single-core B matrix, so splitting K means each (r0, k0) step is
+//      its own single-core GEMM. Hence four extents: phase 1 contracts
+//      `hidden` in K_SUB blocks to produce R_SUB columns of `act`; phase 2
+//      contracts `inter` in R_SUB2 blocks to produce H_SUB columns of Y.
+//
+//   4. CONSEQUENCE, STATED BECAUSE IT IS A DEVIATION FROM THE IDEALIZED
+//      SCHEDULE: L0C cannot hold the level-2 subtotal. It does not survive
+//      between separately driven single-core GEMMs, and `IterateAll`'s
+//      accumulating form is GM-atomic, which rule 1 forbids. The subtotals
+//      are therefore summed in an FP32 UB accumulator. The ARITHMETIC is
+//      unchanged -- fractal, then sub-tile block, then axis, FP32 at every
+//      level -- which is exactly what the emu golden models, so the oracle
+//      comparison is unaffected. Only the buffer differs.
 
 #include "moe/kernels/arch35/status.hpp"
 #include "moe/kernels/arch35/tiling_abi.hpp"
@@ -66,13 +109,13 @@ inline constexpr std::uint32_t kPrefillCubeGroupSize = 32;
 inline constexpr float kPrefillCubeSwigluLimit = 10.0F;
 
 // ---------------------------------------------------------------------------
-// Cube tile shape, and the budget that fixes it
+// Sub-tile shape, and the budget that fixes it
 // ---------------------------------------------------------------------------
 // DaVinci v3 per-core capacities, from the toolkit's own platform configs
 // (x86_64-linux/data/platform_config/Ascend950PR_*.ini), not from the
 // whitepaper's per-subsystem figures:
 //
-//     L1          524,288 B   (512 KiB)
+//     L1          524,288 B   (512 KiB)   shared with the paired Cube
 //     L0A / L0B    65,536 B   (64 KiB each)
 //     L0C         262,144 B   (256 KiB)
 //     UB          253,952 B   (248 KiB)  <-- PER VECTOR CORE
@@ -80,29 +123,36 @@ inline constexpr float kPrefillCubeSwigluLimit = 10.0F;
 // The whitepaper's "512 KB Unified Buffer" is per AI subsystem, and a
 // subsystem holds TWO vector cores. Budgeting 512 KiB of UB per AIV would
 // over-commit it by 2x. The repo's kUsableUbBytes (221,184 B) already encodes
-// the smaller figure and this header budgets against that.
+// the smaller figure, further less the compiler reserve and the minimum SIMT
+// DataCache, and this operator budgets against that.
 //
-// M_TILE = 16 TOKENS, and the UB budget is what picks it. Per token tile the
-// Vector side holds, at the production geometry:
-//
-//     gate chunk   FP32  [16, 512]  =  32,768 B   Cube output at VECIN
-//     up   chunk   FP32  [16, 512]  =  32,768 B   Cube output at VECIN
-//     activated    BF16  [16, 2048] =  65,536 B   SwiGLU result, feeds W2
-//                                      ---------
-//                                      131,072 B   of 221,184 B
-//
-// At M_TILE = 32 that triples to 262,144 B and does not fit. X is NOT in this
-// budget: it is cast to BF16 once into a workspace plane and read by the Cube
-// from GM, which is what buys the room for `activated` to stay resident
-// between the gate/up and down GEMMs.
+// M_TILE = 16 TOKENS, because act[16, 2048] in BF16 is EXACTLY 64 KiB and it
+// has to stay resident from the last gate/up GEMM to the first down GEMM. At
+// M_TILE = 32 it is 128 KiB, and with the FP32 accumulators and the dequant
+// staging also doubling or staying put the layout no longer leaves the Matmul
+// framework room. The full table is in
+// op_kernel/dsv4_moe_prefill_cube_arch35.h, which is where it belongs (§1.2);
+// what the host needs is the extents it validates and declares.
 inline constexpr std::uint32_t kPrefillCubeMTile = 16;
 
-// The gate/up GEMM's N chunk. Chosen so one gate and one up chunk together
-// are a quarter of the UB budget, leaving `activated` resident.
-inline constexpr std::uint32_t kPrefillCubeInterTile = 512;
+// PHASE 1. R_SUB is the `inter`-axis OUTPUT sub-tile -- how many columns of
+// `act` one pass produces; K_SUB is the `hidden`-axis CONTRACTION sub-tile.
+// Their product is what L0B charges, and at 128 x 128 BF16 with double
+// buffering that is exactly 64 KiB -- the maximum, not merely a fit.
+inline constexpr std::uint32_t kPrefillCubeRSub = 128;
+inline constexpr std::uint32_t kPrefillCubeKSub = 128;
 
-// The down GEMM's N chunk, same reasoning on the hidden axis.
-inline constexpr std::uint32_t kPrefillCubeHiddenTile = 512;
+// PHASE 2. H_SUB is the `hidden`-axis OUTPUT sub-tile; R_SUB2 is the
+// `inter`-axis CONTRACTION sub-tile. 64 x 256 is the same 16,384 elements as
+// phase 1's sub-tile, which is why one UB staging buffer serves both phases.
+inline constexpr std::uint32_t kPrefillCubeHSub = 64;
+inline constexpr std::uint32_t kPrefillCubeRSub2 = 256;
+
+static_assert(kPrefillCubeRSub * kPrefillCubeKSub ==
+                  kPrefillCubeHSub * kPrefillCubeRSub2,
+              "the two phases' weight sub-tiles must hold the same number of "
+              "elements, or they cannot share one dequantization staging "
+              "buffer and the UB table in the kernel's layout header is wrong");
 
 // C0 for BF16 is 16 ELEMENTS (32 B), not 64.
 //
@@ -114,13 +164,27 @@ inline constexpr std::uint32_t kPrefillCubeHiddenTile = 512;
 // family is 64.
 inline constexpr std::uint32_t kPrefillCubeC0Bf16 = 16;
 
-static_assert(kPrefillCubeInterTile % kPrefillCubeC0Bf16 == 0,
-              "the gate/up N chunk must be a whole number of BF16 C0 blocks");
-static_assert(kPrefillCubeHiddenTile % kPrefillCubeC0Bf16 == 0,
-              "the down N chunk must be a whole number of BF16 C0 blocks");
-// C at VECIN in ND requires a 32-byte-aligned last axis; FP32 x 512 is 2 KiB.
-static_assert((kPrefillCubeInterTile * 4u) % 32u == 0,
+static_assert(kPrefillCubeRSub % kPrefillCubeC0Bf16 == 0 &&
+                  kPrefillCubeKSub % kPrefillCubeC0Bf16 == 0 &&
+                  kPrefillCubeHSub % kPrefillCubeC0Bf16 == 0 &&
+                  kPrefillCubeRSub2 % kPrefillCubeC0Bf16 == 0,
+              "every sub-tile extent must be a whole number of BF16 C0 blocks");
+// C at VECIN in ND requires a 32-byte-aligned last axis; FP32 x 64 is 256 B.
+static_assert((kPrefillCubeRSub * 4u) % 32u == 0 &&
+                  (kPrefillCubeHSub * 4u) % 32u == 0,
               "a VECIN ND C tile needs its last axis 32-byte aligned");
+// The packed-nibble sub-tile is read as a STRIDED BURST whose block length is
+// counted in 32-byte units, so half a row of K_SUB nibbles must be a whole
+// number of them. K_SUB = 128 gives 64 B = 2 blocks.
+static_assert((kPrefillCubeKSub / 2u) % 32u == 0 &&
+                  (kPrefillCubeRSub2 / 2u) % 32u == 0,
+              "half a sub-tile row of packed nibbles must be a whole number of "
+              "32-byte burst blocks");
+// Both contraction sub-tiles must be whole MXFP4 groups, or a staged sub-tile
+// would end mid-group and the scale index would run past it.
+static_assert(kPrefillCubeKSub % kPrefillCubeGroupSize == 0 &&
+                  kPrefillCubeRSub2 % kPrefillCubeGroupSize == 0,
+              "a contraction sub-tile must be a whole number of MXFP4 groups");
 
 // Grid: one token tile per core, grid-striding. The AIV count comes from the
 // runtime (detail::QueryAivCoreCount), never a literal -- 950PR ships 56-, 64-
@@ -134,6 +198,12 @@ inline constexpr std::uint32_t kPrefillCubeAivMax = 256;
 // Macro plus two same-name wrappers, for the reason recorded on
 // Dsv4MoeBlockGeometryAdmissible: BiSheng partitions functions into __host__
 // and __aicore__ and will not let one definition serve both.
+//
+// The test override admits any multiple of 512 on both axes. 512 is the
+// smallest value that is a whole multiple of every sub-tile extent above
+// (R_SUB 128, K_SUB 128, H_SUB 64, R_SUB2 256), which is what keeps the
+// kernel's sub-GEMM loops square on the reduced geometries the CAModel gate
+// can afford to simulate.
 #if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
 #define MOE_DSV4_PREFILL_CUBE_ADMISSIBLE(hidden, inter)                      \
   ((hidden) >= 512u && (inter) >= 512u && (hidden) % 512u == 0u &&            \
@@ -156,8 +226,13 @@ __aicore__ inline bool Dsv4MoePrefillCubeAdmissible(std::uint32_t hidden,
 #endif
 
 // ---------------------------------------------------------------------------
-// sizeof == 64
+// sizeof == 72
 // ---------------------------------------------------------------------------
+// WAS 64. See the ABI note at the head of this header: the four sub-tile
+// extents replaced two N chunks, which is +8 bytes, and the change is
+// deliberate rather than a field snuck into padding. There is no `reserved`
+// word to grow into and none is added -- a reserved field that exists only to
+// absorb the next break invites breaking the layout quietly.
 struct Dsv4MoePrefillCubeTilingData {
   std::uint32_t abi_version;               // 1
   std::uint32_t block_dim;                 // token tiles in flight; <= aiv
@@ -166,8 +241,10 @@ struct Dsv4MoePrefillCubeTilingData {
   std::uint32_t num_experts;               // total experts in the buffers
   std::uint32_t total_tokens;              // M
   std::uint32_t m_tile;                    // kPrefillCubeMTile
-  std::uint32_t inter_tile;                // kPrefillCubeInterTile
-  std::uint32_t hidden_tile;               // kPrefillCubeHiddenTile
+  std::uint32_t r_sub;                     // phase 1 inter OUTPUT sub-tile
+  std::uint32_t k_sub;                     // phase 1 hidden CONTRACTION
+  std::uint32_t h_sub;                     // phase 2 hidden OUTPUT sub-tile
+  std::uint32_t r_sub2;                    // phase 2 inter CONTRACTION
   std::uint32_t group_size;                // 32
   std::uint32_t low_nibble_first;          // 1; reject 0
   std::uint32_t w13_packed_expert_stride;  // inter * hidden/2 bytes
@@ -177,46 +254,36 @@ struct Dsv4MoePrefillCubeTilingData {
   float swiglu_limit;                      // 10.0
 };
 
-MOE_ARCH35_ASSERT_TILING_POD(Dsv4MoePrefillCubeTilingData, 64);
+MOE_ARCH35_ASSERT_TILING_POD(Dsv4MoePrefillCubeTilingData, 72);
 
 // ---------------------------------------------------------------------------
-// Workspace -- CALLER-OWNED, and larger than the operand data
+// Workspace -- CALLER-OWNED, and now only the KFC message queue
 // ---------------------------------------------------------------------------
-// Three planes, and the reason each exists:
+// It used to carry three data planes: X cast to BF16, then W1+W3 of the
+// expert being processed, then W2 -- 48 MiB of dequantized weights at the
+// production geometry, because the whole single-core B matrix a
+// `TPosition::TSCM` operand requires could not fit 512 KiB of L1.
 //
-//   x_bf16     total_tokens * hidden * 2      X cast once, read by the Cube
-//   w13_bf16   2 * inter * hidden * 2         W1 and W3 of ONE expert
-//   w2_bf16    hidden * inter * 2             W2 of ONE expert
+// THE SUB-GEMM REMOVED THAT REQUIREMENT RATHER THAN SATISFYING IT. Splitting
+// K makes each (r0, k0) step its own single-core GEMM, whose B is one
+// [R_SUB, K_SUB] sub-tile -- 32 KiB in BF16, which L1 holds comfortably. So
+// the weights are dequantized per sub-tile into UB, pushed UB -> L1, and the
+// Cube reads them from there. Nothing dequantized is ever written to GM, and
+// X is cast per sub-tile in UB rather than into a plane.
 //
-// THE DEQUANTIZED WEIGHTS GO TO GM, NOT L1, AND THAT IS A REAL CONCESSION.
-// The intent was to dequantize into L1 and stream L1 -> UB on the direct
-// Cube-Vector path with no GM hop. At the production geometry one expert's W1
-// alone is inter * hidden * 2 = 16 MiB in BF16, against 512 KiB of L1 and
-// 248 KiB of UB, so the whole single-core B matrix cannot be resident -- and
-// `TPosition::VECOUT` and TSCM both require exactly that. Reaching the direct
-// path needs the GEMM re-driven per staged B tile (a [baseK, baseN] chunk
-// dequantized into UB, singleCoreK/N set to match), which is a different
-// Matmul driver, not a different buffer position. Recorded here rather than
-// implied, because the cost is visible: BF16 weights are 4x the MXFP4 bytes,
-// so the weight stream from GM grows 4x.
+// What is LEFT is the Matmul framework's own requirement:
+// REGIST_MATMUL_OBJ stands up a KfcServer whose message queue lives at the
+// head of the workspace, so a MIX Matmul kernel cannot run without one at
+// all. That is the entire remaining size.
 //
-// It is amortized by the batch, which is the point of the prefill path: the
-// dequantization is O(weights) and runs ONCE per expert, while the GEMM is
-// O(weights * tokens_in_that_expert). With tokens grouped by expert -- the
-// caller's arrangement, as for the AIV prefill kernel -- one dequantization
-// serves the whole group.
 // THE SIZE HELPER IS PUBLIC, AND DELIBERATELY NOT HERE.
 // Dsv4MoePrefillCubeWorkspaceBytes() lives in
 // include/moe/kernels/arch35/launch.hpp because the CALLER allocates this
 // buffer. This header is operator-private (§1.2) and is not on the npu or
 // bench include path, so a definition here is unreachable by exactly the
 // callers that must allocate -- the build break 85f7e06 fixed for the decode
-// workspace, not repeated here.
-//
-// The public helper also adds the KFC message-queue reserve that this
-// operator's MIX Matmul needs at the head of the workspace; the kernel's own
-// copy of that constant is kCubeKfcReserveBytes in
-// op_kernel/dsv4_moe_prefill_cube_arch35.h.
+// workspace, not repeated here. The kernel's own copy of the reserve constant
+// is kCubeKfcReserveBytes in op_kernel/dsv4_moe_prefill_cube_arch35.h.
 Status MakeDsv4MoePrefillCubeTiling(std::uint32_t hidden, std::uint32_t inter,
                                     std::uint32_t num_experts,
                                     std::uint32_t total_tokens,

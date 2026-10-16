@@ -207,7 +207,13 @@ void HeaderBlockLatency(const char* kernel) {
 // p50 drives the derived rates, not the mean: the bandwidth and FLOP columns
 // are meant to describe a typical iteration, and the mean is the one
 // statistic here a single stall can move arbitrarily far.
-void RowBlockLatency(const std::string& geometry, const Timing& t,
+//
+// [[maybe_unused]]: every call site is a DEVICE bench, so all of them sit
+// inside the MOE_KERNEL_LAUNCH_LAYER_AVAILABLE region below. In a host-emu
+// build this definition is orphaned and -Wunused-function would make the TU an
+// error. Kept out here rather than moved inside the guard so the row and
+// header printers stay adjacent -- they are one output format.
+[[maybe_unused]] void RowBlockLatency(const std::string& geometry, const Timing& t,
                      double bytes, double flops) {
   const double secs = t.p50_us * 1e-6;
   const double gbs = secs > 0.0 ? bytes / secs / 1e9 : 0.0;
@@ -230,7 +236,9 @@ void HeaderBlockThroughput(const char* kernel) {
 // FLOP/B here is the intensity of the problem, not of the execution. The
 // prefill section says below why the executed traffic can be a multiple of
 // it and why that multiple is not knowable from the host.
-void RowBlockThroughput(const std::string& geometry, const Timing& t,
+//
+// [[maybe_unused]] for the same reason as RowBlockLatency above.
+[[maybe_unused]] void RowBlockThroughput(const std::string& geometry, const Timing& t,
                         double tokens, double bytes, double flops) {
   const double secs = t.p50_us * 1e-6;
   const double toks = secs > 0.0 ? tokens / secs : 0.0;

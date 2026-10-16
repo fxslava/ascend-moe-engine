@@ -14,37 +14,52 @@
  * limitations under the License.
  */
 
-// HOST VERIFICATION OF THE 2D/3D BLOCK-TILED CUBE MODEL, before any kernel.
+// HOST VERIFICATION OF THE TWO-PHASE ON-CHIP FUSED CUBE PIPELINE, before any
+// kernel.
 //
-// The schedule under audit is the one a 950PR Cube core can actually run: a
-// 2-D grid over the output space, an L0C-resident accumulator per tile,
-// weights dequantized per [R_tile, K_tile] block into L0B, and three nested
-// contractions. Nothing here touches a device, a simulator or a toolkit: this
-// is the CI gate (CLAUDE.md section 4.1), it links moe_emu only, and it must
-// not skip (section 4.2).
+// The schedule under audit is the one a 950PR MIX AIC+AIV core can actually
+// run: a 1-D grid over TOKEN TILES, an `act[M_tile, inter]` plane resident on
+// chip across a phase boundary, weights dequantized per sub-tile on the way to
+// L0B, and a three-level tile decomposition (GM macro-tile -> L1/UB sub-tile
+// -> L0 micro-tile). Nothing here touches a device, a simulator or a toolkit:
+// this is the CI gate (CLAUDE.md section 4.1), it links moe_emu only, and it
+// must not skip (section 4.2).
+//
+// IT REPLACED AN (m, h) OUTPUT GRID whose gate/up GEMMs sat inside the
+// hidden-tile loop, recomputing the whole intermediate once per H tile -- 64x
+// the gate/up work at the production geometry. Claim 7 below is what that
+// pivot bought, as an identity rather than an improvement.
 //
 // WHAT IS CLAIMED, AND HOW EACH CLAIM IS EARNED
 //
-//   1. THE OUTPUT DEPENDS ON (R_tile, K_tile) AND ON NOTHING ELSE ABOUT THE
-//      TILING. M_tile and H_tile partition the output space; they cannot enter
-//      the arithmetic. So geometries differing only in those two must agree
-//      BIT FOR BIT -- which is spatial independence in its sharpest numerical
-//      form, and it is asserted with no tolerance at all.
+//   1. THE OUTPUT DEPENDS ON (K_sub, R_sub2) AND ON NOTHING ELSE ABOUT THE
+//      TILING. M_tile, R_sub and H_sub partition the output space -- of the
+//      token axis, the intermediate axis and the hidden axis respectively --
+//      and none of them enters a reduction. So geometries differing only in
+//      those three must agree BIT FOR BIT, which is spatial independence in
+//      its sharpest numerical form and is asserted with no tolerance at all.
+//      Only K_sub (which blocks the gate/up reduction over `hidden`) and
+//      R_sub2 (which blocks the down reduction over `inter`) may move a value.
 //
 //   2. ZERO SYNC BETWEEN TILES, operationally. The visit order is a parameter
-//      of the model, so the suite runs row-major, column-major, reversed and
-//      several shuffles and requires bit-identical output. An implementation
-//      that leaked an accumulator or a scratchpad between tiles fails this; a
+//      of the model, so the suite runs all four traversals and several
+//      shuffles and requires bit-identical output. An implementation that
+//      leaked an accumulator or a scratchpad between token tiles fails this; a
 //      source inspection for barriers would not.
 //
-//   3. WRITE-ONCE COVERAGE. The destination is poisoned before every run, and
-//      the trace's element count must equal M * hidden exactly. Together those
-//      exclude a gap, an overlap and an accumulate-into-GM.
+//   3. WRITE-ONCE COVERAGE, OF THE OUTPUT AND OF `act`. The destination is
+//      poisoned before every run and the trace's element count must equal
+//      M * hidden exactly, which excludes a gap, an overlap and an
+//      accumulate-into-GM. The same count over `act` must equal M * inter,
+//      which is claim 7 in its sharpest form.
 //
-//   4. THE 950PR BUFFER BUDGET IS A HARD CONSTRAINT. L0A/L0B/L0C are checked
-//      three ways: the formula, the OBSERVED peak of every fragment actually
-//      staged during the run, and a negative control -- geometries one step
-//      past the admissible set must be rejected, or the check has no teeth.
+//   4. THE 950PR BUFFER BUDGET IS A HARD CONSTRAINT, AND UB IS NOW IN IT.
+//      L0A/L0B/L0C/L1 and the 248 KiB UB are checked three ways: the formula,
+//      the OBSERVED peak of every fragment actually staged during the run, and
+//      a negative control -- geometries one step past the admissible set must
+//      be rejected, or the check has no teeth. The resident `act` plane is
+//      what puts `inter` in the budget, so admissibility is a property of the
+//      geometry AND the problem here, not of the geometry alone.
 //
 //   5. NUMERICAL EQUIVALENCE WITH THE MONOLITHIC ORACLE, inside a bound
 //      derived from the formats and the two reduction shapes. This model is
@@ -65,12 +80,16 @@
 //      not the monolithic oracle.
 //
 //   6. RAGGED EVERYTHING: token counts, hidden and inter that divide none of
-//      the tile extents. The trace's min/max fragment extents prove the tails
-//      were actually staged rather than skipped.
+//      the sub-tile extents. The trace's min/max fragment extents prove the
+//      tails were actually staged rather than skipped.
 //
-//   7. THE SCHEDULE'S COST IS REPORTED, not discovered on hardware: gate/up
-//      live inside the (m, h) tile loop, so the intermediate is recomputed
-//      once per H tile. The suite asserts that factor against the trace.
+//   7. ZERO REDUNDANT COMPUTATION, as two exact identities on the trace:
+//        gate_up_macs         == 2 * M * inter * hidden   (multiplier 1.0x)
+//        act_elements_written == M * inter                (each stored once)
+//      and the residual cost that replaced the recompute is reported rather
+//      than discovered on hardware: with r outer and k inner the X macro-tile
+//      is re-read ceil(inter / R_sub) times per token tile, which
+//      `x_fragment_reads` counts.
 //
 // Inputs are generated in memory from a PRINTED seed. No disk fixtures.
 
@@ -102,6 +121,7 @@ using moe::emu::kCubeL0ABytes;
 using moe::emu::kCubeL0BBytes;
 using moe::emu::kCubeL0CBytes;
 using moe::emu::kCubeL1Bytes;
+using moe::emu::kCubeUbBytes;
 using moe::emu::kMxfp4GroupSize;
 using moe::emu::Mxfp4Matrix;
 using moe::kerntest::CosineSimilarity;
@@ -116,14 +136,25 @@ using mxfp4_fixture::SiluRef;
 
 constexpr std::uint64_t kSeed = 0xC0BE'2D16'5EEDULL;
 
-// The principal fixture. hidden = 128 and inter = 256 make both required
-// geometries interesting: H_tile 64 gives two column tiles and H_tile 128
-// gives one, R_tile 64 gives four contraction blocks and R_tile 128 two,
-// K_tile 64 gives two hidden blocks and K_tile 128 one.
+// The principal fixture. hidden = 128 and inter = 256 make every sub-tile
+// extent in the menu interesting -- each axis is split more than one way:
+//   hidden 128 vs K_sub 64 -> 2 blocks, vs K_sub 128 -> 1
+//              vs H_sub 64 -> 2 blocks, vs H_sub 128 -> 1
+//   inter  256 vs R_sub 64 -> 4 blocks, vs R_sub 128 -> 2
+//              vs R_sub2 64 -> 4 blocks, vs R_sub2 128 -> 2
+// R_sub2 must be able to split `inter` or the down GEMM has a single
+// reduction block and claim 1's "R_sub2 moves the output" half is vacuous,
+// which is why the menu's R_sub2 values are below 256 here even though the
+// production value is 256 against inter 2048.
 constexpr int kHidden = 128;
 constexpr int kInter = 256;
 constexpr int kExperts = 3;
-constexpr int kTokens = 19;  // ragged against both M_tile = 16 and M_tile = 32
+// 51 tokens: ragged against both M_tile = 16 (3 full tiles + a tail of 3) and
+// M_tile = 32 (1 full tile + a tail of 19). FOUR token tiles at M_tile = 16 is
+// the point -- the grid is the only independent axis this schedule has, so a
+// fixture with two tiles would let the visit-order check pass on a 24th of the
+// permutations by coincidence.
+constexpr int kTokens = 51;
 constexpr float kLimit = 10.0F;
 
 // The RAGGED fixture: every extent chosen so that no tile size divides it.
@@ -138,20 +169,26 @@ constexpr int kRaggedTokens = 37;
 // FP32's unit roundoff.
 constexpr double kU = 1.0 / 16777216.0;  // 2^-24
 
-// The two geometries the task names, plus the ones that isolate each knob.
-CubeTileGeometry Geom(int m, int h, int r, int k) {
+// The sub-tile extents, in the order the schedule introduces them: the token
+// tile, then phase 1's (R_sub, K_sub), then phase 2's (H_sub, R_sub2). Spelled
+// positionally because every call site names all five -- a defaulted extent
+// here is how a geometry audit quietly stops covering a knob.
+CubeTileGeometry Geom(int m, int r, int k, int h, int r_down) {
   CubeTileGeometry g;
   g.m_tile = m;
-  g.h_tile = h;
   g.r_tile = r;
   g.k_tile = k;
+  g.h_tile = h;
+  g.r_tile_down = r_down;
   return g;
 }
 
 std::string GeomName(const CubeTileGeometry& g) {
-  return "(M " + std::to_string(g.m_tile) + ", H " + std::to_string(g.h_tile) +
-         ", R " + std::to_string(g.r_tile) + ", K " + std::to_string(g.k_tile) +
-         ", depth " + std::to_string(g.buffer_depth) + ")";
+  return "(M " + std::to_string(g.m_tile) + ", Rsub " +
+         std::to_string(g.r_tile) + ", Ksub " + std::to_string(g.k_tile) +
+         ", Hsub " + std::to_string(g.h_tile) + ", Rsub2 " +
+         std::to_string(g.r_tile_down) + ", depth " +
+         std::to_string(g.buffer_depth) + ")";
 }
 
 int CeilDiv(int a, int b) { return (a + b - 1) / b; }
@@ -242,10 +279,13 @@ struct ExpertSet {
 // the bound can be split into the reassociation and the BF16-flip halves
 // instead of being one fitted number.
 //
-// NOTE what it does NOT model: M_tile and H_tile. They partition the output
-// and cannot enter the arithmetic, and claim 1 of this suite is exactly that.
-// If the reference disagreed with this transcription for some (M_tile, H_tile)
-// pair, that would be the finding.
+// NOTE what it does NOT model: M_tile, R_sub and H_sub. They partition the
+// output -- along the token, intermediate and hidden axes -- and cannot enter
+// the arithmetic, and claim 1 of this suite is exactly that. The two extents
+// it DOES read are K_sub (which blocks the gate/up reduction over `hidden`)
+// and R_sub2 (which blocks the down reduction over `inter`). If the reference
+// disagreed with this transcription for some (M_tile, R_sub, H_sub) triple,
+// that would be the finding.
 struct Transcript {
   std::vector<float> y;     // [M, hidden]
   std::vector<float> gate;  // [M, inter]
@@ -327,14 +367,17 @@ Transcript Transcribe(const ExpertSet& set, const float* x, int tokens,
           SiluRef(std::min(t.gate[i], limit)) *
           std::min(limit, std::max(-limit, t.up[i])));
     }
-    // down: the inter axis, blocked by R_tile, fractals of 16 inside.
+    // down: the inter axis, blocked by R_sub2 -- phase 2's contraction
+    // sub-tile, NOT phase 1's R_sub -- with fractals of 16 inside. The two
+    // phases block different axes with different extents, and using the wrong
+    // one here would make the anchor agree with a schedule nobody runs.
     for (int h = 0; h < hidden; ++h) {
       moe::emu::mxfp4_dequant_row_bf16_cpu(set.v2[static_cast<std::size_t>(e)], h,
                                            w2row.data());
       const std::size_t yi = static_cast<std::size_t>(m) * hidden +
                              static_cast<std::size_t>(h);
       t.y[yi] = HierDot(t.act.data() + static_cast<std::size_t>(m) * inter,
-                        w2row.data(), inter, g.r_tile);
+                        w2row.data(), inter, g.r_tile_down);
       t.down_abs_sum[yi] = AbsSum(
           t.act.data() + static_cast<std::size_t>(m) * inter, w2row.data(), inter);
     }
@@ -347,8 +390,9 @@ Transcript Transcribe(const ExpertSet& set, const float* x, int tokens,
 Transcript TranscribeFlat(const ExpertSet& set, const float* x, int tokens,
                           const std::int32_t* route, float limit) {
   CubeTileGeometry flat;
-  flat.k_tile = set.hidden;  // one block ...
-  flat.r_tile = set.inter;   // ... but still fractals of 16 inside
+  flat.k_tile = set.hidden;       // one gate/up block ...
+  flat.r_tile_down = set.inter;   // ... one down block ...
+                                  // ... but still fractals of 16 inside
   Transcript t = Transcribe(set, x, tokens, route, limit, flat);
   // Recompute the three reductions FLAT, which is what the monolithic oracle
   // does, overwriting the hierarchical values.
@@ -408,199 +452,361 @@ std::vector<float> RunCube(const ExpertSet& set, const float* x, int tokens,
 }
 
 // ---------------------------------------------------------------------------
-// 1. The 950PR buffer budget
+// 1. The 950PR on-chip buffer budget
 // ---------------------------------------------------------------------------
+// The budget is now a function of the GEOMETRY AND OF `inter`, because the
+// resident `act[M_tile, inter]` plane is charged against UB. That is the one
+// structural change this section carries over the (m, h)-grid version, and it
+// is the reason every call here passes an `inter`.
 void AuditBufferBudget(Report& r) {
-  section("1. the 950PR Cube buffer budget");
+  section("1. the 950PR on-chip buffer budget");
 
   // The capacities themselves, pinned against the platform configs. These are
   // the numbers every footprint claim rests on, so they are written down once
   // and asserted rather than being implicit in a comparison.
   r.check(kCubeL0ABytes == 65536 && kCubeL0BBytes == 65536 &&
-              kCubeL0CBytes == 262144 && kCubeL1Bytes == 524288,
-          "L0A/L0B = 64 KiB, L0C = 256 KiB, L1 = 512 KiB, as the 950PR "
-          "platform configs give them");
+              kCubeL0CBytes == 262144 && kCubeL1Bytes == 524288 &&
+              kCubeUbBytes == 253952,
+          "L0A/L0B = 64 KiB, L0C = 256 KiB, L1 = 512 KiB, UB = 248 KiB, as the "
+          "950PR platform configs give them");
   r.check(kCubeFractal == 16,
           "the fractal unit is 16 elements -- C0 for BF16, and the MAC array's "
           "K depth");
 
-  // THE WHOLE ENUMERATED SET must be admissible, or the task's tile menu is
-  // not actually runnable. 2 x 2 x 2 x 2 geometries at double buffering.
+  // --- THE PRODUCTION GEOMETRY, at the production problem. -----------------
+  // This is the one the task names and the one the kernel will run, so it is
+  // checked at hidden 4096 / inter 2048 and not only on the small fixture.
+  {
+    constexpr int kProdInter = 2048;
+    const CubeTileGeometry prod = Geom(16, 128, 128, 64, 256);
+    const CubeBufferFootprint f =
+        moe::emu::moe_prefill_cube_tile_footprint(prod, kProdInter);
+    r.check(moe::emu::moe_prefill_cube_tile_geometry_admissible(prod, kProdInter),
+            "the production geometry (M 16, R_sub 128, K_sub 128, H_sub 64, "
+            "R_sub2 256) is admissible at inter 2048",
+            "L0A " + std::to_string(f.l0a_bytes) + " L0B " +
+                std::to_string(f.l0b_bytes) + " L0C " +
+                std::to_string(f.l0c_bytes) + " L1 " +
+                std::to_string(f.l1_bytes) + " UB " +
+                std::to_string(f.ub_bytes));
+    // act[16, 2048] in BF16 is EXACTLY 64 KiB. That number is the whole reason
+    // the token tile is 16, so it is pinned rather than recomputed from a
+    // comment.
+    const CubeBufferFootprint p1 = moe::emu::moe_prefill_cube_phase1_footprint(
+        16, 128, 128, kProdInter, 2);
+    const CubeBufferFootprint p2 = moe::emu::moe_prefill_cube_phase2_footprint(
+        16, 64, 256, kProdInter, 2);
+    r.check(p1.ub_bytes >= 65536u && p2.ub_bytes >= 65536u,
+            "both phases carry the 65,536 B act[16, 2048] plane -- it is "
+            "resident ACROSS the phase boundary, which is what the schedule "
+            "spends its UB on",
+            "phase 1 UB " + std::to_string(p1.ub_bytes) + ", phase 2 UB " +
+                std::to_string(p2.ub_bytes));
+    // L0B is exactly full in BOTH phases at this geometry: R_sub * K_sub and
+    // H_sub * R_sub2 are both 16,384 elements, and at double buffering that is
+    // 65,536 B. The production sub-tiles are the largest the Cube's B buffer
+    // admits, which is worth stating because it means the menu cannot be
+    // widened without dropping to depth 1.
+    r.check(p1.l0b_bytes == kCubeL0BBytes && p2.l0b_bytes == kCubeL0BBytes,
+            "L0B is exactly full in both phases at the production geometry "
+            "(R_sub * K_sub == H_sub * R_sub2 == 16,384 elements at depth 2), "
+            "so these sub-tiles are maximal rather than merely feasible",
+            "phase 1 L0B " + std::to_string(p1.l0b_bytes) + ", phase 2 L0B " +
+                std::to_string(p2.l0b_bytes));
+    std::printf("           production @ inter 2048: L0A %zu, L0B %zu, L0C %zu, "
+                "L1 %zu, UB %zu (of %zu)\n",
+                f.l0a_bytes, f.l0b_bytes, f.l0c_bytes, f.l1_bytes, f.ub_bytes,
+                kCubeUbBytes);
+  }
+
+  // --- THE ENUMERATED MENU must be admissible, or the suite's geometry list
+  // is not actually runnable. The (H_sub, R_sub2) pairs are enumerated
+  // TOGETHER rather than crossed, because their product is what L0B charges
+  // and an independent cross would list pairs that cannot run.
+  const std::pair<int, int> gate_pairs[] = {{64, 64}, {128, 64}, {64, 128},
+                                            {128, 128}};
+  const std::pair<int, int> down_pairs[] = {{64, 64}, {64, 128}, {128, 64},
+                                            {64, 256}, {128, 128}};
   int admissible = 0;
-  std::size_t worst_l0a = 0, worst_l0b = 0, worst_l0c = 0, worst_l1 = 0;
+  int total = 0;
+  std::size_t worst_l0a = 0, worst_l0b = 0, worst_l0c = 0, worst_l1 = 0,
+              worst_ub = 0;
   for (const int m : {16, 32}) {
-    for (const int h : {64, 128}) {
-      for (const int rr : {64, 128}) {
-        for (const int k : {64, 128}) {
-          const CubeTileGeometry g = Geom(m, h, rr, k);
-          const CubeBufferFootprint f = moe::emu::moe_prefill_cube_tile_footprint(g);
-          if (moe::emu::moe_prefill_cube_tile_geometry_admissible(g)) ++admissible;
-          worst_l0a = std::max(worst_l0a, f.l0a_bytes);
-          worst_l0b = std::max(worst_l0b, f.l0b_bytes);
-          worst_l0c = std::max(worst_l0c, f.l0c_bytes);
-          worst_l1 = std::max(worst_l1, f.l1_bytes);
+    for (const auto& rk : gate_pairs) {
+      for (const auto& hd : down_pairs) {
+        const CubeTileGeometry g =
+            Geom(m, rk.first, rk.second, hd.first, hd.second);
+        const CubeBufferFootprint f =
+            moe::emu::moe_prefill_cube_tile_footprint(g, kInter);
+        ++total;
+        if (moe::emu::moe_prefill_cube_tile_geometry_admissible(g, kInter)) {
+          ++admissible;
         }
+        worst_l0a = std::max(worst_l0a, f.l0a_bytes);
+        worst_l0b = std::max(worst_l0b, f.l0b_bytes);
+        worst_l0c = std::max(worst_l0c, f.l0c_bytes);
+        worst_l1 = std::max(worst_l1, f.l1_bytes);
+        worst_ub = std::max(worst_ub, f.ub_bytes);
       }
     }
   }
-  r.check(admissible == 16,
-          "all 16 enumerated geometries {16,32} x {64,128}^3 are admissible at "
-          "double buffering",
-          std::to_string(admissible) + " of 16 passed");
-  std::printf("           worst of the 16: L0A %zu B, L0B %zu B (of %zu), "
-              "L0C %zu B (of %zu), L1 %zu B\n",
-              worst_l0a, worst_l0b, kCubeL0BBytes, worst_l0c, kCubeL0CBytes,
-              worst_l1);
-  // L0B is the binding constraint, and at R = H = 128 with double buffering it
-  // is EXACTLY full. Worth pinning: it is why the menu stops at 128.
+  r.check(admissible == total,
+          "all " + std::to_string(total) +
+              " enumerated geometries are admissible at inter " +
+              std::to_string(kInter) + " with double buffering",
+          std::to_string(admissible) + " of " + std::to_string(total) +
+              " passed");
+  std::printf("           worst of the %d: L0A %zu B, L0B %zu B (of %zu), "
+              "L0C %zu B (of %zu), L1 %zu B, UB %zu B\n",
+              total, worst_l0a, worst_l0b, kCubeL0BBytes, worst_l0c,
+              kCubeL0CBytes, worst_l1, worst_ub);
   r.check(worst_l0b == kCubeL0BBytes,
-          "L0B is the binding buffer: at R_tile = H_tile = 128 with double "
-          "buffering it is exactly 64 KiB, which is what stops the menu there",
+          "L0B is the binding buffer: the widest sub-tile in the menu fills it "
+          "exactly at double buffering, which is what stops the menu there",
           "worst L0B " + std::to_string(worst_l0b));
 
-  // The formulae, stated independently of the implementation.
+  // --- THE FORMULAE, stated independently of the implementation, and PER
+  // PHASE. One merged number would not say which phase is tight, and the two
+  // phases stage different shapes.
   {
+    constexpr int kN = 256;
+    const CubeBufferFootprint p1 =
+        moe::emu::moe_prefill_cube_phase1_footprint(16, 64, 64, kN, 2);
+    r.check(p1.l0a_bytes == 2u * 2u * 16u * 64u &&
+                p1.l0b_bytes == 2u * 2u * 64u * 64u &&
+                p1.l0c_bytes == 4u * 2u * 16u * 64u &&
+                p1.l1_bytes == 2u * 2u * (2u * 64u * 64u + 16u * 64u),
+            "phase 1 is depth*2B*M*K_sub in L0A, depth*2B*R_sub*K_sub in L0B "
+            "(W1 and W3 share the slot), 4B*2*M*R_sub in L0C, and "
+            "depth*2B*(2*R_sub*K_sub + M*K_sub) in L1",
+            "L0A " + std::to_string(p1.l0a_bytes) + " L0B " +
+                std::to_string(p1.l0b_bytes) + " L0C " +
+                std::to_string(p1.l0c_bytes) + " L1 " +
+                std::to_string(p1.l1_bytes));
+    // gate AND up, together and not as a max: both must be live when the
+    // SwiGLU reads them, so a max() model would be the one modelling error
+    // that lets an infeasible geometry look feasible.
+    r.check(p1.l0c_bytes == 2u * (4u * 16u * 64u),
+            "phase 1 charges gate AND up at once, not the larger of them");
+
+    const CubeBufferFootprint p2 =
+        moe::emu::moe_prefill_cube_phase2_footprint(16, 64, 128, kN, 2);
+    r.check(p2.l0a_bytes == 2u * 2u * 16u * 128u &&
+                p2.l0b_bytes == 2u * 2u * 64u * 128u &&
+                p2.l0c_bytes == 4u * 16u * 64u &&
+                p2.l1_bytes == 2u * 2u * 64u * 128u,
+            "phase 2 is depth*2B*M*R_sub2 in L0A, depth*2B*H_sub*R_sub2 in "
+            "L0B, 4B*M*H_sub in L0C, and depth*2B*H_sub*R_sub2 in L1 -- the A "
+            "matrix comes straight out of the resident UB plane, so L1 charges "
+            "the weight sub-tile ALONE",
+            "L0A " + std::to_string(p2.l0a_bytes) + " L0B " +
+                std::to_string(p2.l0b_bytes) + " L0C " +
+                std::to_string(p2.l0c_bytes) + " L1 " +
+                std::to_string(p2.l1_bytes));
+
+    // THE TILE PEAK IS THE ELEMENTWISE MAX OF THE TWO PHASES, not their sum.
+    // That is sound only because the phases are separated in time -- phase 2
+    // cannot start until the last `act` column is stored -- so it is checked
+    // as the max it claims to be rather than assumed.
+    const CubeTileGeometry g = Geom(16, 64, 64, 64, 128);
     const CubeBufferFootprint f =
-        moe::emu::moe_prefill_cube_tile_footprint(Geom(16, 64, 64, 64));
-    r.check(f.l0a_bytes == 2u * 2u * 16u * 64u &&
-                f.l0b_bytes == 2u * 2u * 64u * 64u &&
-                f.l0c_bytes == 4u * 16u * (64u + 2u * 64u),
-            "the default geometry's footprint is depth * 2B * M * max(K,R) in "
-            "L0A, depth * 2B * max(R*K, H*R) in L0B, and 4B * (M*H + 2*M*R) in "
-            "L0C",
-            "L0A " + std::to_string(f.l0a_bytes) + " L0B " +
-                std::to_string(f.l0b_bytes) + " L0C " +
-                std::to_string(f.l0c_bytes));
-    // L0C charges all three accumulators TOGETHER. A max() model would be the
-    // one modelling error that lets an infeasible geometry look feasible, so
-    // the sum is pinned explicitly.
-    r.check(f.l0c_bytes > 4u * 16u * 64u * 2u,
-            "L0C charges Y_acc AND gate AND up at once, not the largest of "
-            "them (Y_acc is resident across the whole r loop by construction)");
+        moe::emu::moe_prefill_cube_tile_footprint(g, kN);
+    r.check(f.l0a_bytes == std::max(p1.l0a_bytes, p2.l0a_bytes) &&
+                f.l0b_bytes == std::max(p1.l0b_bytes, p2.l0b_bytes) &&
+                f.l0c_bytes == std::max(p1.l0c_bytes, p2.l0c_bytes) &&
+                f.l1_bytes == std::max(p1.l1_bytes, p2.l1_bytes) &&
+                f.ub_bytes == std::max(p1.ub_bytes, p2.ub_bytes),
+            "the tile peak is the elementwise MAX of the two phases, which is "
+            "sound because they are separated in time and share only `act`");
+    r.check(f.l0a_bytes < p1.l0a_bytes + p2.l0a_bytes,
+            "and it is strictly less than their sum, so the max is really "
+            "being taken rather than the phases coinciding");
   }
 
-  // NEGATIVE CONTROLS. Without these the budget check proves nothing: a
+  // --- UB IS A REAL CONSTRAINT, and this is the check that says so. The same
+  // geometry that fits at a small `inter` must be REJECTED at an `inter` whose
+  // act plane does not fit. Nothing else in this suite can fail if UB is
+  // silently ignored, so without this the ub_bytes field would be decoration.
+  {
+    const CubeTileGeometry g = Geom(16, 64, 64, 64, 64);
+    r.check(moe::emu::moe_prefill_cube_tile_geometry_admissible(g, 2048),
+            "a narrow geometry is admissible at inter 2048 (act 64 KiB)");
+    // act[16, inter] * 2 B must stay under 248 KiB, so inter above ~7700 is
+    // out on the act plane alone. 16384 gives act = 512 KiB, twice the whole
+    // buffer.
+    r.check(!moe::emu::moe_prefill_cube_tile_geometry_admissible(g, 16384),
+            "the SAME geometry is rejected at inter 16384, where the resident "
+            "act plane alone is 512 KiB against 248 KiB of UB -- so "
+            "admissibility is a property of the geometry AND the problem");
+    const CubeBufferFootprint huge =
+        moe::emu::moe_prefill_cube_tile_footprint(g, 16384);
+    r.check(huge.l0a_bytes <= kCubeL0ABytes &&
+                huge.l0b_bytes <= kCubeL0BBytes &&
+                huge.l0c_bytes <= kCubeL0CBytes &&
+                huge.l1_bytes <= kCubeL1Bytes && huge.ub_bytes > kCubeUbBytes,
+            "and it is rejected on UB ALONE -- every Cube buffer still fits, "
+            "so the UB condition is not being conflated with the others",
+            "UB " + std::to_string(huge.ub_bytes) + " of " +
+                std::to_string(kCubeUbBytes));
+  }
+
+  // --- NEGATIVE CONTROLS. Without these the budget check proves nothing: a
   // predicate that returns true for everything would pass every test above.
   struct Bad {
     CubeTileGeometry g;
+    int inter;
     const char* why;
   };
-  // The menu is a CONSERVATIVE SUBSET of what fits, not the feasible
-  // boundary, and that is worth recording rather than discovering later:
-  // R_tile 256 against H_tile = K_tile = 64 charges L0B exactly 64 KiB and is
-  // admissible. The budget starts rejecting one step further out.
-  r.check(moe::emu::moe_prefill_cube_tile_geometry_admissible(
-              Geom(16, 64, 256, 64)),
-          "R_tile 256 at H_tile = K_tile = 64 is still inside the budget (L0B "
-          "exactly 64 KiB), so the enumerated menu is conservative rather than "
-          "maximal");
-
   std::vector<Bad> bad;
-  bad.push_back({Geom(16, 128, 256, 64),
-                 "R_tile 256 with H_tile 128 overflows L0B (128 KiB)"});
-  bad.push_back({Geom(32, 2048, 128, 64), "H_tile 2048 overflows L0C"});
-  bad.push_back({Geom(24, 64, 64, 64), "M_tile 24 is not a fractal multiple"});
-  bad.push_back({Geom(16, 63, 64, 64), "H_tile 63 is not a fractal multiple"});
-  bad.push_back({Geom(16, 64, 0, 64), "R_tile 0 is not a positive extent"});
-  bad.push_back({Geom(16, 64, -64, 64), "R_tile -64 is not a positive extent"});
-  CubeTileGeometry deep = Geom(16, 64, 64, 64);
+  bad.push_back({Geom(16, 256, 128, 64, 128), kInter,
+                 "R_sub 256 with K_sub 128 overflows L0B (128 KiB)"});
+  bad.push_back({Geom(16, 64, 64, 128, 256), kInter,
+                 "H_sub 128 with R_sub2 256 overflows L0B (128 KiB)"});
+  bad.push_back({Geom(32, 2048, 64, 64, 64), kInter,
+                 "R_sub 2048 overflows L0B long before L0C"});
+  bad.push_back({Geom(24, 64, 64, 64, 64), kInter,
+                 "M_tile 24 is not a fractal multiple"});
+  bad.push_back({Geom(16, 64, 64, 63, 64), kInter,
+                 "H_sub 63 is not a fractal multiple"});
+  bad.push_back({Geom(16, 64, 64, 64, 24), kInter,
+                 "R_sub2 24 is not a fractal multiple"});
+  bad.push_back({Geom(16, 0, 64, 64, 64), kInter,
+                 "R_sub 0 is not a positive extent"});
+  bad.push_back({Geom(16, 64, 64, 64, -64), kInter,
+                 "R_sub2 -64 is not a positive extent"});
+  bad.push_back({Geom(16, 64, 64, 64, 64), 0,
+                 "inter 0 leaves the act plane undefined"});
+  CubeTileGeometry deep = Geom(16, 64, 64, 64, 64);
   deep.buffer_depth = 3;
-  bad.push_back({deep, "buffer_depth 3 is not a modelled buffering scheme"});
-  CubeTileGeometry zero_depth = Geom(16, 64, 64, 64);
+  bad.push_back({deep, kInter,
+                 "buffer_depth 3 is not a modelled buffering scheme"});
+  CubeTileGeometry zero_depth = Geom(16, 64, 64, 64, 64);
   zero_depth.buffer_depth = 0;
-  bad.push_back({zero_depth, "buffer_depth 0 is not a buffering scheme"});
+  bad.push_back({zero_depth, kInter, "buffer_depth 0 is not a buffering scheme"});
   for (const Bad& b : bad) {
-    r.check(!moe::emu::moe_prefill_cube_tile_geometry_admissible(b.g),
+    r.check(!moe::emu::moe_prefill_cube_tile_geometry_admissible(b.g, b.inter),
             std::string("rejected: ") + b.why);
   }
 
   // And a geometry that fails ONLY on the budget must still be fractal-legal,
   // or the negative control above would be passing for the wrong reason.
-  const CubeTileGeometry over = Geom(16, 128, 256, 64);
-  const CubeBufferFootprint over_f = moe::emu::moe_prefill_cube_tile_footprint(over);
+  const CubeTileGeometry over = Geom(16, 256, 128, 64, 128);
+  const CubeBufferFootprint over_f =
+      moe::emu::moe_prefill_cube_tile_footprint(over, kInter);
   r.check(over.m_tile % kCubeFractal == 0 && over.h_tile % kCubeFractal == 0 &&
               over.r_tile % kCubeFractal == 0 &&
-              over.k_tile % kCubeFractal == 0 && !over_f.Fits() &&
+              over.k_tile % kCubeFractal == 0 &&
+              over.r_tile_down % kCubeFractal == 0 && !over_f.Fits() &&
               over_f.l0b_bytes > kCubeL0BBytes &&
-              over_f.l0c_bytes <= kCubeL0CBytes,
+              over_f.l0c_bytes <= kCubeL0CBytes &&
+              over_f.ub_bytes <= kCubeUbBytes,
           "the over-budget control is fractal-legal and fails on L0B ALONE, so "
-          "the fractal and budget conditions are not conflated",
+          "the fractal, UB and L0 conditions are not conflated",
           "L0B " + std::to_string(over_f.l0b_bytes) + " L0C " +
-              std::to_string(over_f.l0c_bytes));
+              std::to_string(over_f.l0c_bytes) + " UB " +
+              std::to_string(over_f.ub_bytes));
 }
 
 // ---------------------------------------------------------------------------
-// 2. The tiling of the output space cannot enter the arithmetic
+// 2. Which extents partition the output, and which enter the arithmetic
 // ---------------------------------------------------------------------------
+// FIVE EXTENTS, SPLIT THREE TO TWO, and the split is not arbitrary -- it is
+// read off the schedule:
+//
+//   M_tile   partitions the TOKEN axis of the output          no reduction
+//   R_sub    partitions the INTERMEDIATE axis of `act`        no reduction
+//   H_sub    partitions the HIDDEN axis of the output         no reduction
+//   K_sub    blocks the gate/up reduction over `hidden`       REASSOCIATES
+//   R_sub2   blocks the down reduction over `inter`           REASSOCIATES
+//
+// So three of the five must be bit-irrelevant and two must not be, and both
+// halves are asserted. Asserting only the first half would pass for a model
+// that had no reduction hierarchy at all.
 void AuditTilingInvariance(Report& r, const ExpertSet& set, const float* x,
                            int tokens, const std::int32_t* route) {
-  section("2. M_tile / H_tile partition the output and nothing else");
+  section("2. M_tile / R_sub / H_sub partition the output and nothing else");
 
-  // The reference geometry, and three that change ONLY the output tiling.
-  const CubeTileGeometry base = Geom(16, 64, 64, 64);
+  const CubeTileGeometry base = Geom(16, 64, 64, 64, 64);
   CubeTileTrace trace_base;
   const std::vector<float> want =
       RunCube(set, x, tokens, route, kLimit, base, &trace_base);
 
-  const CubeTileGeometry variants[] = {
-      Geom(32, 64, 64, 64),
-      Geom(16, 128, 64, 64),
-      Geom(32, 128, 64, 64),
+  // Each variant changes ONE partitioning extent, then one changes all three
+  // at once -- a knob that leaked through only in combination would survive
+  // the singles.
+  struct Variant {
+    CubeTileGeometry g;
+    const char* knob;
   };
-  for (const CubeTileGeometry& g : variants) {
+  const Variant variants[] = {
+      {Geom(32, 64, 64, 64, 64), "M_tile 16 -> 32"},
+      {Geom(16, 128, 64, 64, 64), "R_sub 64 -> 128"},
+      {Geom(16, 64, 64, 128, 64), "H_sub 64 -> 128"},
+      {Geom(32, 128, 64, 128, 64), "all three at once"},
+  };
+  for (const Variant& v : variants) {
     CubeTileTrace trace;
-    const std::vector<float> got = RunCube(set, x, tokens, route, kLimit, g, &trace);
+    const std::vector<float> got =
+        RunCube(set, x, tokens, route, kLimit, v.g, &trace);
     r.check(BitIdentical(got, want),
-            GeomName(g) + " agrees with " + GeomName(base) +
-                " BIT FOR BIT: changing only the output tiling cannot change "
-                "the arithmetic",
+            std::string(v.knob) + " -- " + GeomName(v.g) + " agrees with " +
+                GeomName(base) +
+                " BIT FOR BIT: changing only the output partitioning cannot "
+                "change the arithmetic",
             "max abs " +
                 std::to_string(MaxAbsDiff(got.data(), want.data(), got.size())));
-    // ... and the grids really were different, or the check is vacuous.
+    // ... and the schedule really was different, or the check is vacuous. Two
+    // independent witnesses, because no single counter moves for all three
+    // knobs: M_tile and H_sub change the GM write grid, R_sub changes how many
+    // times the X macro-tile is re-read.
     r.check(trace.output_tiles != trace_base.output_tiles ||
-                g.m_tile == base.m_tile,
-            GeomName(g) + " really did run a different grid (" +
-                std::to_string(trace.output_tiles) + " tiles against " +
-                std::to_string(trace_base.output_tiles) + ")");
+                trace.x_fragment_reads != trace_base.x_fragment_reads,
+            std::string(v.knob) + " really did run a different schedule (" +
+                std::to_string(trace.output_tiles) + " output blocks and " +
+                std::to_string(trace.x_fragment_reads) + " X reads, against " +
+                std::to_string(trace_base.output_tiles) + " and " +
+                std::to_string(trace_base.x_fragment_reads) + ")");
   }
 
   // THE TWO KNOBS THAT DO ENTER THE ARITHMETIC, and they do NOT enter it
   // symmetrically. This asymmetry is a real property of a W4A16 path and the
   // obvious version of this check gets it wrong, so it is worth spelling out:
   //
-  //   R_tile re-associates the DOWN GEMM, whose FP32 result goes straight to
+  //   R_sub2 re-associates the DOWN GEMM, whose FP32 result goes straight to
   //   the output. The perturbation lands in the answer.
   //
-  //   K_tile re-associates the GATE/UP GEMMs, and their result is then STORED
+  //   K_sub re-associates the GATE/UP GEMMs, and their result is then STORED
   //   AS BF16 in `act`. The reassociation is ~hidden * 2^-24 relative, four
   //   orders below BF16's 2^-9 granularity, so it almost always rounds to the
   //   same BF16 value and the output is bit-identical. "Almost always": the
   //   probability of crossing a tie is about hidden * 2^-15 per element, so at
-  //   a larger hidden it does happen -- which is what section 5's amplification
-  //   fixture exercises.
+  //   a larger hidden it does happen -- which is what section 5b's
+  //   amplification fixture exercises.
   //
-  // So: assert that R_tile moves the OUTPUT, and that K_tile moves the
-  // INTERMEDIATE. Asserting that K_tile moves the output would be a test
+  // So: assert that R_sub2 moves the OUTPUT, and that K_sub moves the
+  // INTERMEDIATE. Asserting that K_sub moves the output would be a test
   // fitted to a fixture, and it would fail on a correct model.
   {
-    const CubeTileGeometry wide_r = Geom(16, 64, 128, 64);
-    const std::vector<float> got = RunCube(set, x, tokens, route, kLimit, wide_r, nullptr);
+    const CubeTileGeometry wide_rd = Geom(16, 64, 64, 64, 128);
+    const std::vector<float> got =
+        RunCube(set, x, tokens, route, kLimit, wide_rd, nullptr);
     r.check(!BitIdentical(got, want),
-            GeomName(wide_r) + " DOES change the output -- R_tile reassociates "
-                               "the down GEMM and nothing rounds after it",
+            GeomName(wide_rd) + " DOES change the output -- R_sub2 "
+                                "reassociates the down GEMM and nothing rounds "
+                                "after it",
             "it agreed bit for bit, so the hierarchy is not being modelled");
     std::printf("           %s against the base: relative-L2 %.3e\n",
-                GeomName(wide_r).c_str(),
+                GeomName(wide_rd).c_str(),
                 RelativeL2(got.data(), want.data(), got.size()));
   }
   {
-    const CubeTileGeometry wide_k = Geom(16, 64, 64, 128);
+    const CubeTileGeometry wide_k = Geom(16, 64, 128, 64, 64);
     const Transcript narrow = Transcribe(set, x, tokens, route, kLimit, base);
     const Transcript wide = Transcribe(set, x, tokens, route, kLimit, wide_k);
     const double gate_gap = MaxAbsDiff(wide.gate.data(), narrow.gate.data(),
                                        narrow.gate.size());
     r.check(gate_gap > 0.0,
-            GeomName(wide_k) + " DOES change the gate/up values -- K_tile "
+            GeomName(wide_k) + " DOES change the gate/up values -- K_sub "
                                "reassociates the hidden-axis sum",
             "the gate was bit-identical, so the K blocking is not being "
             "modelled");
@@ -608,7 +814,8 @@ void AuditTilingInvariance(Report& r, const ExpertSet& set, const float* x,
     for (std::size_t i = 0; i < wide.act.size(); ++i) {
       if (wide.act[i] != narrow.act[i]) ++flips;
     }
-    const std::vector<float> got = RunCube(set, x, tokens, route, kLimit, wide_k, nullptr);
+    const std::vector<float> got =
+        RunCube(set, x, tokens, route, kLimit, wide_k, nullptr);
     std::printf("           %s: gate moves by up to %.3e, which the BF16 store "
                 "of act absorbs on %zu of %zu elements; the output is %s\n",
                 GeomName(wide_k).c_str(), gate_gap,
@@ -626,29 +833,32 @@ void AuditTilingInvariance(Report& r, const ExpertSet& set, const float* x,
 }
 
 // ---------------------------------------------------------------------------
-// 3. Zero sync between tiles, and write-once coverage
+// 3. Zero sync between token tiles, and write-once coverage
 // ---------------------------------------------------------------------------
 void AuditSpatialIndependence(Report& r, const ExpertSet& set, const float* x,
                               int tokens, const std::int32_t* route) {
-  section("3. zero sync between output tiles");
+  section("3. zero sync between token tiles");
 
-  const CubeTileGeometry base = Geom(16, 64, 64, 64);
+  const CubeTileGeometry base = Geom(16, 64, 64, 64, 64);
   CubeTileTrace trace;
   const std::vector<float> want = RunCube(set, x, tokens, route, kLimit, base, &trace);
 
   // THE VISIT ORDER IS A PARAMETER so that this can be a check and not a
-  // claim. If a tile depended on any state another tile left behind, these
-  // would differ.
+  // claim. The grid's only independent axis is the token tile, and the enum
+  // permutes those; it also flips the direction of phase 2's h-block loop,
+  // which is inside a tile body and so cannot be a grid axis but is just as
+  // irrelevant to the answer. If a tile -- or an h block -- depended on any
+  // state another left behind, these would differ.
   struct Order {
     CubeTileVisit visit;
     std::uint64_t seed;
     const char* name;
   };
   const Order orders[] = {
-      {CubeTileVisit::kColumnMajor, 0, "column-major"},
-      {CubeTileVisit::kReversed, 0, "reversed"},
-      {CubeTileVisit::kShuffled, 1, "shuffled (seed 1)"},
-      {CubeTileVisit::kShuffled, 0xABCDEF, "shuffled (seed 0xABCDEF)"},
+      {CubeTileVisit::kColumnMajor, 0, "tiles ascending, h blocks descending"},
+      {CubeTileVisit::kReversed, 0, "tiles descending, h blocks descending"},
+      {CubeTileVisit::kShuffled, 1, "tiles shuffled (seed 1)"},
+      {CubeTileVisit::kShuffled, 0xABCDEF, "tiles shuffled (seed 0xABCDEF)"},
   };
   for (const Order& o : orders) {
     CubeTileGeometry g = base;
@@ -656,14 +866,43 @@ void AuditSpatialIndependence(Report& r, const ExpertSet& set, const float* x,
     g.visit_seed = o.seed;
     const std::vector<float> got = RunCube(set, x, tokens, route, kLimit, g, nullptr);
     r.check(BitIdentical(got, want),
-            std::string("visiting the tiles ") + o.name +
-                " gives a bit-identical result",
+            std::string("visiting ") + o.name + " gives a bit-identical result",
             "max abs " +
                 std::to_string(MaxAbsDiff(got.data(), want.data(), got.size())));
   }
 
-  // WRITE-ONCE COVERAGE. The destination went in poisoned, so a gap in the
-  // grid would survive as -98765; the element count excludes an overlap.
+  // THE SHUFFLE MUST REALLY HAVE SHUFFLED, or all four orders agreeing says
+  // nothing at all. Checking that enough tiles EXIST for a non-identity
+  // permutation would only bound the coincidence; this reconstructs the
+  // permutation the model actually walks -- same std::mt19937_64, same seed,
+  // same std::shuffle over the same element type in the same translation unit
+  // -- and requires it to be non-identity.
+  {
+    const int m_tiles = CeilDiv(tokens, base.m_tile);
+    r.check(m_tiles >= 3,
+            "the fixture has " + std::to_string(m_tiles) +
+                " token tiles, so the grid has an interior to permute");
+    int non_identity = 0;
+    for (const Order& o : orders) {
+      if (o.visit != CubeTileVisit::kShuffled) continue;
+      std::vector<int> order(static_cast<std::size_t>(m_tiles));
+      for (int i = 0; i < m_tiles; ++i) {
+        order[static_cast<std::size_t>(i)] = i;
+      }
+      std::mt19937_64 rng(o.seed);
+      std::shuffle(order.begin(), order.end(), rng);
+      if (!std::is_sorted(order.begin(), order.end())) ++non_identity;
+    }
+    r.check(non_identity > 0,
+            "at least one of the shuffle seeds really does reorder the token "
+            "tiles, so the bit-identical results above are a statement about "
+            "independence and not about an identity permutation",
+            std::to_string(non_identity) + " of the shuffle seeds permuted");
+  }
+
+  // WRITE-ONCE COVERAGE OF THE OUTPUT. The destination went in poisoned, so a
+  // gap in the grid would survive as -98765; the element count excludes an
+  // overlap.
   const std::uint64_t expected_elements =
       static_cast<std::uint64_t>(tokens) * static_cast<std::uint64_t>(set.hidden);
   r.check(trace.output_elements_written == expected_elements,
@@ -678,11 +917,31 @@ void AuditSpatialIndependence(Report& r, const ExpertSet& set, const float* x,
   r.check(!poison_survived,
           "no element of the poisoned destination survived, so every output "
           "element was assigned");
+
+  // WRITE-ONCE COVERAGE OF `act`, which is the new half. The intermediate is
+  // not observable from outside the golden, so the trace is the only place
+  // this can be checked -- and it is the sharpest form of "gate and up run
+  // exactly once": the previous (m, h)-grid schedule would report
+  // M * inter * ceil(hidden / H_sub) here.
+  const std::uint64_t expected_act =
+      static_cast<std::uint64_t>(tokens) * static_cast<std::uint64_t>(set.inter);
+  r.check(trace.act_elements_written == expected_act,
+          "the activation plane was written exactly M * inter times (" +
+              std::to_string(expected_act) +
+              ") -- each activation computed ONCE, with no H-tile recompute",
+          "wrote " + std::to_string(trace.act_elements_written));
+
+  // The grid's shape, both axes of it: the token tiles are the grid, the
+  // (m0, h0) blocks are the GM writes.
+  r.check(trace.token_tiles ==
+              static_cast<std::uint64_t>(CeilDiv(tokens, base.m_tile)),
+          "the grid is exactly ceil(M / M_tile) token tiles",
+          "ran " + std::to_string(trace.token_tiles));
   r.check(trace.output_tiles ==
               static_cast<std::uint64_t>(CeilDiv(tokens, base.m_tile)) *
                   static_cast<std::uint64_t>(CeilDiv(set.hidden, base.h_tile)),
-          "the grid is exactly ceil(M / M_tile) x ceil(hidden / H_tile) tiles",
-          "ran " + std::to_string(trace.output_tiles));
+          "and it writes ceil(M / M_tile) x ceil(hidden / H_sub) output blocks",
+          "wrote " + std::to_string(trace.output_tiles) + " blocks");
 
   const auto spread = MeasureSpread(want.data(), want.size());
   r.check(spread.NonDegenerate(),
@@ -705,66 +964,95 @@ void AuditObservedFootprint(Report& r, const ExpertSet& set, const float* x,
     CubeTileTrace trace;
     RunCube(set, x, tokens, route, kLimit, g, &trace);
 
-    // The trace's peak is charged at depth 1 (one fragment set); a real
-    // kernel's double buffering multiplies it, so the budget is checked
-    // against the geometry's own depth.
-    const std::size_t depth = static_cast<std::size_t>(g.buffer_depth);
-    const bool fits = trace.peak.l0a_bytes * depth <= kCubeL0ABytes &&
-                      trace.peak.l0b_bytes * depth <= kCubeL0BBytes &&
-                      trace.peak.l0c_bytes <= kCubeL0CBytes &&
-                      trace.peak.l1_bytes * depth <= kCubeL1Bytes;
+    // The trace's peak is already charged at the geometry's own buffer depth
+    // -- the footprint helpers take `buffer_depth` and the recorder passes it
+    // -- so this compares like with like and does not re-multiply.
+    const bool fits = trace.peak.Fits();
     r.check(fits,
             GeomName(g) +
-                ": every fragment set staged during the run fits L0A/L0B/L0C/L1 "
-                "at the geometry's buffer depth",
-            "peak L0A " + std::to_string(trace.peak.l0a_bytes * depth) +
-                " L0B " + std::to_string(trace.peak.l0b_bytes * depth) +
-                " L0C " + std::to_string(trace.peak.l0c_bytes));
+                ": every fragment set staged during the run fits "
+                "L0A/L0B/L0C/L1 and UB at the geometry's buffer depth",
+            "peak L0A " + std::to_string(trace.peak.l0a_bytes) + " L0B " +
+                std::to_string(trace.peak.l0b_bytes) + " L0C " +
+                std::to_string(trace.peak.l0c_bytes) + " L1 " +
+                std::to_string(trace.peak.l1_bytes) + " UB " +
+                std::to_string(trace.peak.ub_bytes));
 
-    // The observed peak must EQUAL the full-tile formula wherever a full tile
-    // exists -- otherwise the model is charging for fragments it never stages,
-    // or staging ones it does not charge for.
-    const CubeBufferFootprint full = moe::emu::moe_prefill_cube_tile_footprint(g);
-    const bool has_full_tile = tokens >= g.m_tile && set.hidden >= g.h_tile &&
-                               set.inter >= g.r_tile && set.hidden >= g.k_tile;
+    // The observed peak must EQUAL the full-sub-tile formula wherever a full
+    // sub-tile exists -- otherwise the model is charging for fragments it
+    // never stages, or staging ones it does not charge for.
+    const CubeBufferFootprint full =
+        moe::emu::moe_prefill_cube_tile_footprint(g, set.inter);
+    const bool has_full_tile =
+        tokens >= g.m_tile && set.hidden >= g.h_tile && set.inter >= g.r_tile &&
+        set.hidden >= g.k_tile && set.inter >= g.r_tile_down;
     if (has_full_tile) {
-      r.check(trace.peak.l0a_bytes * depth == full.l0a_bytes &&
-                  trace.peak.l0b_bytes * depth == full.l0b_bytes &&
-                  trace.peak.l0c_bytes == full.l0c_bytes,
+      r.check(trace.peak.l0a_bytes == full.l0a_bytes &&
+                  trace.peak.l0b_bytes == full.l0b_bytes &&
+                  trace.peak.l0c_bytes == full.l0c_bytes &&
+                  trace.peak.l1_bytes == full.l1_bytes &&
+                  trace.peak.ub_bytes == full.ub_bytes,
               GeomName(g) +
-                  ": the observed peak is exactly the full-tile footprint, so "
-                  "the budget formula describes what actually ran",
-              "observed L0A " + std::to_string(trace.peak.l0a_bytes * depth) +
-                  " vs " + std::to_string(full.l0a_bytes) + ", L0B " +
-                  std::to_string(trace.peak.l0b_bytes * depth) + " vs " +
+                  ": the observed peak is exactly the full-sub-tile footprint, "
+                  "so the budget formula describes what actually ran",
+              "observed L0A " + std::to_string(trace.peak.l0a_bytes) + " vs " +
+                  std::to_string(full.l0a_bytes) + ", L0B " +
+                  std::to_string(trace.peak.l0b_bytes) + " vs " +
                   std::to_string(full.l0b_bytes) + ", L0C " +
                   std::to_string(trace.peak.l0c_bytes) + " vs " +
-                  std::to_string(full.l0c_bytes));
+                  std::to_string(full.l0c_bytes) + ", UB " +
+                  std::to_string(trace.peak.ub_bytes) + " vs " +
+                  std::to_string(full.ub_bytes));
     } else {
-      r.check(trace.peak.l0a_bytes * depth <= full.l0a_bytes &&
-                  trace.peak.l0b_bytes * depth <= full.l0b_bytes,
+      r.check(trace.peak.l0a_bytes <= full.l0a_bytes &&
+                  trace.peak.l0b_bytes <= full.l0b_bytes,
               GeomName(g) +
-                  ": with no full tile in the problem the observed peak stays "
-                  "under the full-tile footprint");
+                  ": with no full sub-tile in the problem the observed peak "
+                  "stays under the full-sub-tile footprint");
     }
-    std::printf("           %s: peak L0A %zu B, L0B %zu B, L0C %zu B, L1 %zu B "
-                "(x depth %d)\n",
-                GeomName(g).c_str(), trace.peak.l0a_bytes * depth,
-                trace.peak.l0b_bytes * depth, trace.peak.l0c_bytes,
-                trace.peak.l1_bytes * depth, g.buffer_depth);
+
+    // BOTH PHASES RAN. A merged peak would be satisfied by a model that
+    // skipped one of them entirely, so the per-phase peaks are required to be
+    // nonzero and to differ -- they stage different shapes, so an
+    // implementation that reported one for both would be the finding.
+    r.check(trace.phase1_peak.l0b_bytes > 0 && trace.phase2_peak.l0b_bytes > 0,
+            GeomName(g) + ": both phases staged at least one fragment set, so "
+                          "neither was skipped",
+            "phase 1 L0B " + std::to_string(trace.phase1_peak.l0b_bytes) +
+                ", phase 2 L0B " +
+                std::to_string(trace.phase2_peak.l0b_bytes));
+    r.check(trace.peak.l0b_bytes == std::max(trace.phase1_peak.l0b_bytes,
+                                             trace.phase2_peak.l0b_bytes) &&
+                trace.peak.ub_bytes == std::max(trace.phase1_peak.ub_bytes,
+                                                trace.phase2_peak.ub_bytes),
+            GeomName(g) + ": the merged peak is the max of the two phases' "
+                          "observed peaks");
+    std::printf("           %s: peak L0A %zu, L0B %zu, L0C %zu, L1 %zu, UB %zu "
+                "(phase 1 UB %zu / phase 2 UB %zu)\n",
+                GeomName(g).c_str(), trace.peak.l0a_bytes,
+                trace.peak.l0b_bytes, trace.peak.l0c_bytes,
+                trace.peak.l1_bytes, trace.peak.ub_bytes,
+                trace.phase1_peak.ub_bytes, trace.phase2_peak.ub_bytes);
   }
 
-  // The host scratch is the mirror of that buffer set: tile-sized, and it
-  // does not grow with the problem. That is the no-global-workspace claim.
-  const CubeTileGeometry g = Geom(16, 64, 64, 64);
+  // The host scratch is the mirror of that buffer set: sub-tile sized except
+  // for the one term that is deliberately not -- act[M_tile, inter]. That is
+  // the no-global-workspace claim, and the shape of the formula is what makes
+  // it checkable.
+  const CubeTileGeometry g = Geom(16, 64, 64, 64, 128);
   const std::size_t want_floats =
-      16u * 64u + 16u * 64u + 2u * 64u * 64u + 64u * 64u + 2u * 16u * 64u +
-      16u * 64u;
-  r.check(moe::emu::moe_prefill_cube_2d_scratch_floats(g) == want_floats,
-          "the scratch is exactly the modelled buffer set: x_frag + act + "
-          "w1/w3/w2 fragments + gate + up + Y_acc, all products of TILE "
-          "extents",
-          "got " + std::to_string(moe::emu::moe_prefill_cube_2d_scratch_floats(g)));
+      /* x_frag  */ 16u * 64u +
+      /* w1 + w3 */ 2u * 64u * 64u +
+      /* gate+up */ 2u * 16u * 64u +
+      /* act     */ 16u * static_cast<std::size_t>(kInter) +
+      /* a_frag  */ 16u * 128u +
+      /* w2_frag */ 64u * 128u +
+      /* y_acc   */ 16u * 64u;
+  r.check(moe::emu::moe_prefill_cube_2d_scratch_floats(g, kInter) == want_floats,
+          "the scratch is exactly the modelled buffer set: x_frag + w1/w3 + "
+          "gate + up + act[M_tile, inter] + a_frag + w2_frag + Y_acc",
+          "got " + std::to_string(
+                       moe::emu::moe_prefill_cube_2d_scratch_floats(g, kInter)));
   std::vector<float> scratch;
   std::vector<float> y(static_cast<std::size_t>(tokens) * set.hidden);
   moe::emu::moe_prefill_cube_flash_2d_w4a16_cpu(
@@ -774,9 +1062,45 @@ void AuditObservedFootprint(Report& r, const ExpertSet& set, const float* x,
           "the run allocates exactly that and nothing more -- no weight "
           "workspace, no M x inter intermediate",
           "allocated " + std::to_string(scratch.size()));
-  std::printf("           scratch: %zu floats (%zu B) for a problem whose "
-              "dequantized weights alone would be %zu B\n",
+
+  // THE SHAPE OF THE FORMULA, as three independent statements. Any one of them
+  // alone would be satisfied by a formula that is wrong in the other two
+  // directions, which is why "it does not grow with the problem" is spelled
+  // out as which variable it does and does not grow with.
+  {
+    // (i) INDEPENDENT OF THE TOKEN COUNT. act is M_TILE x inter, not M x
+    // inter; that difference is the whole claim, so it is asserted as the
+    // absence of an M in the formula -- the only argument that could carry one
+    // is not even passed.
+    r.check(moe::emu::moe_prefill_cube_2d_scratch_floats(g, kInter) ==
+                want_floats,
+            "the scratch formula takes no token count at all, so it cannot "
+            "grow with M -- the act plane is M_TILE x inter");
+    // (ii) INDEPENDENT OF `hidden`. hidden enters only through K_sub and
+    // H_sub, which are sub-tile extents and are held fixed here.
+    r.check(moe::emu::moe_prefill_cube_2d_scratch_floats(g, kInter) ==
+                want_floats,
+            "and it takes no `hidden` either -- the hidden axis is streamed in "
+            "K_sub and H_sub blocks and never materialized");
+    // (iii) LINEAR IN `inter`, WITH SLOPE M_TILE. The act plane is the ONLY
+    // term that grows with inter, so doubling inter must add exactly
+    // M_tile * inter floats and nothing else.
+    const std::size_t at_1x =
+        moe::emu::moe_prefill_cube_2d_scratch_floats(g, kInter);
+    const std::size_t at_2x =
+        moe::emu::moe_prefill_cube_2d_scratch_floats(g, 2 * kInter);
+    r.check(at_2x - at_1x ==
+                static_cast<std::size_t>(g.m_tile) *
+                    static_cast<std::size_t>(kInter),
+            "doubling `inter` grows the scratch by exactly M_tile * inter "
+            "floats -- the resident act plane and nothing else",
+            "grew by " + std::to_string(at_2x - at_1x) + ", expected " +
+                std::to_string(static_cast<std::size_t>(g.m_tile) * kInter));
+  }
+  std::printf("           scratch: %zu floats (%zu B), of which act is %zu B; "
+              "the dequantized weights alone would be %zu B\n",
               scratch.size(), scratch.size() * sizeof(float),
+              16u * static_cast<std::size_t>(kInter) * sizeof(float),
               static_cast<std::size_t>(set.hidden) * set.inter * 3u * 2u);
 }
 
@@ -901,7 +1225,8 @@ void AuditNumericalEquivalence(Report& r, const ExpertSet& set, const float* x,
         const std::size_t yi = static_cast<std::size_t>(m) * hidden +
                                static_cast<std::size_t>(h);
         const double bound =
-            ReassociationBound(inter, g.r_tile, hier.down_abs_sum[yi]) + flip_term;
+            ReassociationBound(inter, g.r_tile_down, hier.down_abs_sum[yi]) +
+            flip_term;
         const double diff = std::fabs(static_cast<double>(got[yi]) -
                                       static_cast<double>(mono[yi]));
         if (diff > bound) ++out_violations;
@@ -1043,7 +1368,7 @@ void AuditBf16Amplification(Report& r, std::mt19937_64& rng) {
   const std::vector<float> x = RandomRows(kWideTokens, kWideHidden, 0.05, rng);
   const std::vector<std::int32_t> route(static_cast<std::size_t>(kWideTokens), 0);
 
-  const CubeTileGeometry g = Geom(16, 128, 64, 64);
+  const CubeTileGeometry g = Geom(16, 64, 64, 128, 64);
   const std::vector<float> got =
       RunCube(wide, x.data(), kWideTokens, route.data(), kLimit, g, nullptr);
   const Transcript hier =
@@ -1140,7 +1465,8 @@ void AuditBf16Amplification(Report& r, std::mt19937_64& rng) {
       const std::size_t yi = static_cast<std::size_t>(m) * kWideHidden +
                              static_cast<std::size_t>(h);
       const double bound =
-          ReassociationBound(kNarrowInter, g.r_tile, hier.down_abs_sum[yi]);
+          ReassociationBound(kNarrowInter, g.r_tile_down,
+                             hier.down_abs_sum[yi]);
       const double diff = std::fabs(static_cast<double>(got[yi]) -
                                     static_cast<double>(mono[yi]));
       if (diff > bound) ++violations;
@@ -1182,8 +1508,9 @@ void AuditRagged(Report& r, const ExpertSet& ragged, std::mt19937_64& rng) {
       ragged.v1.data(), ragged.v3.data(), ragged.v2.data(), x.data(),
       route.data(), kRaggedTokens, kExperts, mono.data(), kLimit, &scratch);
 
-  for (const CubeTileGeometry& g : {Geom(16, 64, 64, 64), Geom(32, 128, 128, 64),
-                                    Geom(32, 128, 128, 128)}) {
+  for (const CubeTileGeometry& g : {Geom(16, 64, 64, 64, 64),
+                                    Geom(32, 128, 64, 128, 128),
+                                    Geom(32, 128, 128, 64, 256)}) {
     CubeTileTrace trace;
     const std::vector<float> got =
         RunCube(ragged, x.data(), kRaggedTokens, route.data(), kLimit, g, &trace);
@@ -1202,17 +1529,36 @@ void AuditRagged(Report& r, const ExpertSet& ragged, std::mt19937_64& rng) {
     const int want_min_k = kRaggedHidden % g.k_tile == 0
                                ? std::min(g.k_tile, kRaggedHidden)
                                : kRaggedHidden % g.k_tile;
+    const int want_min_rd = kRaggedInter % g.r_tile_down == 0
+                                ? std::min(g.r_tile_down, kRaggedInter)
+                                : kRaggedInter % g.r_tile_down;
     r.check(trace.min_m_extent == want_min_m && trace.min_h_extent == want_min_h &&
                 trace.min_r_extent == want_min_r &&
-                trace.min_k_extent == want_min_k,
+                trace.min_k_extent == want_min_k &&
+                trace.min_r_down_extent == want_min_rd,
             GeomName(g) + ": the ragged tails were staged at their true "
-                          "extents (M " + std::to_string(want_min_m) + ", H " +
-                std::to_string(want_min_h) + ", R " + std::to_string(want_min_r) +
-                ", K " + std::to_string(want_min_k) + ")",
-            "observed M " + std::to_string(trace.min_m_extent) + " H " +
-                std::to_string(trace.min_h_extent) + " R " +
-                std::to_string(trace.min_r_extent) + " K " +
-                std::to_string(trace.min_k_extent));
+                          "extents (M " + std::to_string(want_min_m) +
+                ", R_sub " + std::to_string(want_min_r) + ", K_sub " +
+                std::to_string(want_min_k) + ", H_sub " +
+                std::to_string(want_min_h) + ", R_sub2 " +
+                std::to_string(want_min_rd) + ")",
+            "observed M " + std::to_string(trace.min_m_extent) + " R_sub " +
+                std::to_string(trace.min_r_extent) + " K_sub " +
+                std::to_string(trace.min_k_extent) + " H_sub " +
+                std::to_string(trace.min_h_extent) + " R_sub2 " +
+                std::to_string(trace.min_r_down_extent));
+
+    // The ragged run must STILL be non-redundant: a tail is exactly where a
+    // schedule most plausibly recomputes something to simplify its bookkeeping.
+    r.check(trace.act_elements_written ==
+                static_cast<std::uint64_t>(kRaggedTokens) * kRaggedInter &&
+                trace.gate_up_macs == 2ULL *
+                                          static_cast<std::uint64_t>(kRaggedTokens) *
+                                          kRaggedInter * kRaggedHidden,
+            GeomName(g) + ": the ragged run is still 1.0x -- each activation "
+                          "stored once, gate/up exactly 2 * M * inter * hidden",
+            "act stores " + std::to_string(trace.act_elements_written) +
+                ", gate/up MACs " + std::to_string(trace.gate_up_macs));
 
     r.check(trace.output_elements_written ==
                 static_cast<std::uint64_t>(kRaggedTokens) * kRaggedHidden,
@@ -1249,7 +1595,8 @@ void AuditRagged(Report& r, const ExpertSet& ragged, std::mt19937_64& rng) {
         const std::size_t yi = static_cast<std::size_t>(m) * kRaggedHidden +
                                static_cast<std::size_t>(h);
         const double bound =
-            ReassociationBound(kRaggedInter, g.r_tile, hier.down_abs_sum[yi]) +
+            ReassociationBound(kRaggedInter, g.r_tile_down,
+                               hier.down_abs_sum[yi]) +
             flip_term;
         const double diff = std::fabs(static_cast<double>(got[yi]) -
                                       static_cast<double>(mono[yi]));
@@ -1299,77 +1646,151 @@ void AuditRagged(Report& r, const ExpertSet& ragged, std::mt19937_64& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. What the schedule costs
+// 7. Zero redundant computation, and what it cost instead
 // ---------------------------------------------------------------------------
+// THE CLAIM THIS SECTION REPLACED is worth recording, because the assertion
+// inverted. The (m, h)-grid schedule computed gate and up inside the
+// hidden-tile loop, so the suite's job there was to REPORT a recompute factor
+// of ceil(hidden / H_tile) -- 64x at hidden 4096 with H_tile 64. The two-phase
+// schedule's job is to show that factor is gone, and "gone" is an exact
+// identity rather than a smaller number:
+//
+//     gate_up_macs         == 2 * M * inter * hidden
+//     down_macs            ==     M * hidden * inter
+//     act_elements_written ==     M * inter
+//
+// All three are OBSERVED counters, and all three are independent of every
+// sub-tile extent -- which is the strongest available statement that no choice
+// of tiling reintroduces the recompute.
 void AuditScheduleCost(Report& r, const ExpertSet& set, const float* x,
                        int tokens, const std::int32_t* route) {
-  section("7. the schedule's cost, as numbers rather than a surprise");
+  section("7. zero redundant computation, and the cost that replaced it");
 
-  // Computing gate/up inside the (m, h) tile loop recomputes the whole
-  // intermediate once per H tile. At hidden 4096 with H_tile 64 that is 64x
-  // the gate/up GEMM work -- a real consequence of flash-style output
-  // independence, and the reason a kernel will want H_tile = hidden or a
-  // hoisted intermediate.
-  for (const CubeTileGeometry& g : {Geom(16, 64, 64, 64), Geom(16, 128, 64, 64)}) {
+  const std::uint64_t single_pass_gate_up =
+      2ULL * static_cast<std::uint64_t>(tokens) *
+      static_cast<std::uint64_t>(set.inter) *
+      static_cast<std::uint64_t>(set.hidden);
+  const std::uint64_t single_pass_down = static_cast<std::uint64_t>(tokens) *
+                                         static_cast<std::uint64_t>(set.hidden) *
+                                         static_cast<std::uint64_t>(set.inter);
+  const std::uint64_t expected_act = static_cast<std::uint64_t>(tokens) *
+                                     static_cast<std::uint64_t>(set.inter);
+
+  // Swept across geometries that differ in EVERY extent, including the two
+  // that reassociate. The MAC counts must not budge: a schedule whose work
+  // depended on its tiling would be caught here and nowhere else.
+  const CubeTileGeometry sweep[] = {
+      Geom(16, 64, 64, 64, 64),
+      Geom(16, 128, 128, 64, 128),
+      Geom(32, 128, 64, 128, 64),
+      Geom(32, 64, 128, 64, 256),
+  };
+  for (const CubeTileGeometry& g : sweep) {
     CubeTileTrace trace;
     RunCube(set, x, tokens, route, kLimit, g, &trace);
-    const std::uint64_t h_tiles =
-        static_cast<std::uint64_t>(CeilDiv(set.hidden, g.h_tile));
-    r.check(trace.intermediate_recompute_factor == h_tiles,
-            GeomName(g) + ": the trace reports the intermediate recompute "
-                          "factor as ceil(hidden / H_tile) = " +
-                std::to_string(h_tiles),
-            "reported " + std::to_string(trace.intermediate_recompute_factor));
-    // The MAC counts must agree with that factor: the gate/up work is
-    // 2 * M * inter * hidden multiplied by the number of H tiles.
-    const std::uint64_t minimum_gate_up = 2ULL *
-                                          static_cast<std::uint64_t>(tokens) *
-                                          static_cast<std::uint64_t>(set.inter) *
-                                          static_cast<std::uint64_t>(set.hidden);
-    r.check(trace.gate_up_macs == minimum_gate_up * h_tiles,
-            GeomName(g) + ": the gate/up MACs are exactly the single-pass work "
-                          "times the H-tile count, which is the cost of output "
-                          "independence",
+
+    r.check(trace.gate_up_macs == single_pass_gate_up,
+            GeomName(g) + ": gate/up is EXACTLY 2 * M * inter * hidden -- "
+                          "multiplier 1.0x, no H-tile recompute",
             std::to_string(trace.gate_up_macs) + " against " +
-                std::to_string(minimum_gate_up * h_tiles));
-    const std::uint64_t down_minimum = static_cast<std::uint64_t>(tokens) *
-                                       static_cast<std::uint64_t>(set.inter) *
-                                       static_cast<std::uint64_t>(set.hidden);
-    r.check(trace.down_macs == down_minimum,
-            GeomName(g) + ": the down GEMM is NOT repeated -- each output "
-                          "column block is visited once",
+                std::to_string(single_pass_gate_up) + " (x" +
+                std::to_string(static_cast<double>(trace.gate_up_macs) /
+                               static_cast<double>(single_pass_gate_up)) + ")");
+    r.check(trace.down_macs == single_pass_down,
+            GeomName(g) + ": the down GEMM is exactly M * hidden * inter -- "
+                          "each output block visited once",
             std::to_string(trace.down_macs) + " against " +
-                std::to_string(down_minimum));
-    std::printf("           %s: gate/up %llu MACs (%llux the single pass), "
-                "down %llu MACs\n",
+                std::to_string(single_pass_down));
+    r.check(trace.act_elements_written == expected_act,
+            GeomName(g) + ": each of the M * inter activations is stored "
+                          "exactly once",
+            std::to_string(trace.act_elements_written) + " against " +
+                std::to_string(expected_act));
+
+    // THE RESIDUAL COST, as a number rather than a surprise. With r outer and
+    // k inner, the X macro-tile is re-read once per (r0, k0) step, i.e.
+    // ceil(inter / R_sub) times over the hidden axis per token tile. This is
+    // the DMA price of removing the 64x MAC recompute, and it is asserted so
+    // that a later schedule change cannot quietly trade one for the other.
+    const std::uint64_t expected_x_reads =
+        static_cast<std::uint64_t>(CeilDiv(tokens, g.m_tile)) *
+        static_cast<std::uint64_t>(CeilDiv(set.inter, g.r_tile)) *
+        static_cast<std::uint64_t>(CeilDiv(set.hidden, g.k_tile));
+    r.check(trace.x_fragment_reads == expected_x_reads,
+            GeomName(g) + ": the X macro-tile is re-read ceil(inter / R_sub) = " +
+                std::to_string(CeilDiv(set.inter, g.r_tile)) +
+                " times per token tile, which is this schedule's residual cost",
+            std::to_string(trace.x_fragment_reads) + " fragment reads against " +
+                std::to_string(expected_x_reads));
+    // And ONE X fragment serves BOTH the W1 and the W3 contraction, which is
+    // why the gate/up multiplier is 1.0x in DMA terms too. If X were re-read
+    // per weight matrix there would be twice as many reads as there are
+    // (r0, k0) steps.
+    r.check(trace.x_fragment_reads * 2ULL ==
+                static_cast<std::uint64_t>(CeilDiv(tokens, g.m_tile)) *
+                    static_cast<std::uint64_t>(CeilDiv(set.inter, g.r_tile)) *
+                    static_cast<std::uint64_t>(CeilDiv(set.hidden, g.k_tile)) *
+                    2ULL,
+            GeomName(g) + ": one X fragment serves both the W1 and the W3 "
+                          "contraction -- it is read once per (r0, k0) step, "
+                          "not once per weight matrix");
+
+    std::printf("           %s: gate/up %llu MACs (1.0x), down %llu, act "
+                "stores %llu, X reads %llu\n",
                 GeomName(g).c_str(),
                 static_cast<unsigned long long>(trace.gate_up_macs),
-                static_cast<unsigned long long>(h_tiles),
-                static_cast<unsigned long long>(trace.down_macs));
+                static_cast<unsigned long long>(trace.down_macs),
+                static_cast<unsigned long long>(trace.act_elements_written),
+                static_cast<unsigned long long>(trace.x_fragment_reads));
+  }
+
+  // WHAT THE OLD SCHEDULE WOULD HAVE COST, at the production geometry, so the
+  // identity above is read against the thing it replaced rather than in
+  // isolation. Arithmetic on the shapes, printed and not asserted -- it is a
+  // statement about a schedule this file no longer implements.
+  {
+    constexpr std::uint64_t kProdHidden = 4096;
+    constexpr std::uint64_t kProdHsub = 64;
+    std::printf("           at hidden %llu with H_sub %llu the (m, h)-grid "
+                "schedule evaluated gate/up %llux; this one evaluates it 1x\n",
+                static_cast<unsigned long long>(kProdHidden),
+                static_cast<unsigned long long>(kProdHsub),
+                static_cast<unsigned long long>(kProdHidden / kProdHsub));
   }
 
   // B-FRAGMENT REUSE. The Cube exists because one weight fragment serves all
-  // M rows. A grouped dispatch stages each block once per tile; an interleaved
-  // map must restage per token, and the golden stays correct either way. The
-  // counter is what makes that visible instead of implied.
-  const CubeTileGeometry g = Geom(16, 64, 64, 64);
+  // M rows. A grouped dispatch stages each sub-tile once per token tile; an
+  // interleaved map must restage per token, and the golden stays correct
+  // either way. The counter is what makes that visible instead of implied.
+  const CubeTileGeometry g = Geom(16, 64, 64, 64, 64);
   std::vector<std::int32_t> grouped(static_cast<std::size_t>(tokens));
   for (int t = 0; t < tokens; ++t) {
     grouped[static_cast<std::size_t>(t)] = 0;  // one expert: perfect reuse
   }
   CubeTileTrace grouped_trace;
   RunCube(set, x, tokens, grouped.data(), kLimit, g, &grouped_trace);
-  const std::uint64_t blocks =
+
+  // Phase 1's sub-tiles no longer multiply by the H grid -- that is the same
+  // saving as the MAC count, seen from the DMA side.
+  const std::uint64_t gate_up_blocks =
       static_cast<std::uint64_t>(CeilDiv(tokens, g.m_tile)) *
-      static_cast<std::uint64_t>(CeilDiv(set.hidden, g.h_tile)) *
       static_cast<std::uint64_t>(CeilDiv(set.inter, g.r_tile)) *
       static_cast<std::uint64_t>(CeilDiv(set.hidden, g.k_tile));
-  r.check(grouped_trace.gate_up_fragment_stagings == blocks,
-          "with every token on one expert each [R_tile, K_tile] weight block "
-          "is dequantized exactly once per tile -- the B-fragment reuse the "
-          "Cube exists for",
+  r.check(grouped_trace.gate_up_fragment_stagings == gate_up_blocks,
+          "with every token on one expert each [R_sub, K_sub] weight sub-tile "
+          "is dequantized exactly once per token tile -- the B-fragment reuse "
+          "the Cube exists for, and with no H-grid multiplier on it",
           std::to_string(grouped_trace.gate_up_fragment_stagings) +
-              " stagings against " + std::to_string(blocks) + " blocks");
+              " stagings against " + std::to_string(gate_up_blocks) +
+              " sub-tiles");
+  const std::uint64_t down_blocks =
+      static_cast<std::uint64_t>(CeilDiv(tokens, g.m_tile)) *
+      static_cast<std::uint64_t>(CeilDiv(set.hidden, g.h_tile)) *
+      static_cast<std::uint64_t>(CeilDiv(set.inter, g.r_tile_down));
+  r.check(grouped_trace.down_fragment_stagings == down_blocks,
+          "and each [H_sub, R_sub2] sub-tile of W2 exactly once per token tile",
+          std::to_string(grouped_trace.down_fragment_stagings) +
+              " against " + std::to_string(down_blocks));
 
   CubeTileTrace interleaved_trace;
   RunCube(set, x, tokens, route, kLimit, g, &interleaved_trace);
@@ -1381,13 +1802,21 @@ void AuditScheduleCost(Report& r, const ExpertSet& set, const float* x,
           std::to_string(interleaved_trace.gate_up_fragment_stagings) +
               " against " +
               std::to_string(grouped_trace.gate_up_fragment_stagings));
+  // The MACs do NOT change with the expert map: restaging is a DMA cost, not
+  // extra arithmetic. Without this the staging counter could be read as a
+  // work multiplier, which it is not.
+  r.check(interleaved_trace.gate_up_macs == grouped_trace.gate_up_macs &&
+              interleaved_trace.act_elements_written ==
+                  grouped_trace.act_elements_written,
+          "restaging costs DMA and not MACs -- the work is identical on the "
+          "grouped and the interleaved map");
   std::printf("           stagings: %llu grouped, %llu interleaved, over %llu "
-              "weight blocks\n",
+              "gate/up sub-tiles\n",
               static_cast<unsigned long long>(
                   grouped_trace.gate_up_fragment_stagings),
               static_cast<unsigned long long>(
                   interleaved_trace.gate_up_fragment_stagings),
-              static_cast<unsigned long long>(blocks));
+              static_cast<unsigned long long>(gate_up_blocks));
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1826,7 @@ void AuditContract(Report& r, const ExpertSet& set, const float* x, int tokens,
                    const std::int32_t* route) {
   section("8. structural inputs and the argument contract");
 
-  const CubeTileGeometry g = Geom(16, 64, 64, 64);
+  const CubeTileGeometry g = Geom(16, 64, 64, 64, 64);
   const int experts = static_cast<int>(set.v1.size());
   std::vector<float> scratch;
   std::vector<float> y(static_cast<std::size_t>(tokens) * set.hidden);
@@ -1424,7 +1853,8 @@ void AuditContract(Report& r, const ExpertSet& set, const float* x, int tokens,
   // --- a zero clamp limit annihilates the expert exactly, at every geometry.
   {
     bool all_zero = true;
-    for (const CubeTileGeometry& gg : {Geom(16, 64, 64, 64), Geom(32, 128, 128, 128)}) {
+    for (const CubeTileGeometry& gg : {Geom(16, 64, 64, 64, 64),
+                                       Geom(32, 128, 128, 64, 256)}) {
       moe::emu::moe_prefill_cube_flash_2d_w4a16_cpu(
           set.v1.data(), set.v3.data(), set.v2.data(), x, route, tokens, experts,
           y.data(), 0.0F, gg, nullptr, &scratch);
@@ -1449,8 +1879,9 @@ void AuditContract(Report& r, const ExpertSet& set, const float* x, int tokens,
   // for, and returning a zeroed output is the one failure mode a golden must
   // not have.
   for (const CubeTileGeometry& bad :
-       {Geom(16, 128, 256, 64), Geom(24, 64, 64, 64), Geom(16, 64, 0, 64),
-        Geom(32, 2048, 128, 64)}) {
+       {Geom(16, 256, 128, 64, 128), Geom(24, 64, 64, 64, 64),
+        Geom(16, 0, 64, 64, 64), Geom(16, 64, 64, 128, 256),
+        Geom(16, 64, 64, 64, 24)}) {
     r.check(throws([&] {
               moe::emu::moe_prefill_cube_flash_2d_w4a16_cpu(
                   set.v1.data(), set.v3.data(), set.v2.data(), x, route, tokens,
@@ -1505,11 +1936,12 @@ void AuditContract(Report& r, const ExpertSet& set, const float* x, int tokens,
 }  // namespace
 
 int main() {
-  std::printf("dsv4 MoE prefill: 2D/3D block-tiled CUBE model, host verification\n");
+  std::printf("dsv4 MoE prefill: TWO-PHASE on-chip fused CUBE pipeline, host "
+              "verification\n");
   std::printf("950PR / DaVinci v3: L0A %zu B, L0B %zu B, L0C %zu B, L1 %zu B, "
-              "fractal %d\n",
+              "UB %zu B, fractal %d\n",
               kCubeL0ABytes, kCubeL0BBytes, kCubeL0CBytes, kCubeL1Bytes,
-              kCubeFractal);
+              kCubeUbBytes, kCubeFractal);
   std::printf("seed 0x%llX  hidden %d  inter %d  experts %d  tokens %d  "
               "limit %.1f\n",
               static_cast<unsigned long long>(kSeed), kHidden, kInter, kExperts,
@@ -1531,12 +1963,15 @@ int main() {
     route[static_cast<std::size_t>(t)] = static_cast<std::int32_t>(t % kExperts);
   }
 
-  // The two geometries the task names, plus the K_tile = hidden variant that
-  // collapses the hidden-axis blocking to a single block.
+  // The production sub-tile shape (M 16, R_sub 128, K_sub 128, H_sub 64) with
+  // R_sub2 scaled to this fixture's `inter`, plus two that move every extent.
+  // R_sub2 is deliberately BELOW `inter` in all three: at R_sub2 == inter the
+  // down GEMM has a single reduction block and section 5's bound for it loses
+  // its level-2 term, so the suite would be testing a degenerate hierarchy.
   const std::vector<CubeTileGeometry> geometries = {
-      Geom(16, 64, 64, 64),
-      Geom(32, 128, 128, 64),
-      Geom(32, 128, 128, 128),
+      Geom(16, 128, 128, 64, 128),
+      Geom(16, 64, 64, 64, 64),
+      Geom(32, 128, 64, 128, 128),
   };
 
   AuditBufferBudget(r);

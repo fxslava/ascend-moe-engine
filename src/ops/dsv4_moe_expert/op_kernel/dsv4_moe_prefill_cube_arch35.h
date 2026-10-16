@@ -1,13 +1,13 @@
-// dsv4_moe_prefill_cube_arch35.h -- UB budget and event plan for the
+// dsv4_moe_prefill_cube_arch35.h -- UB / L1 budget and event plan for the
 // Cube-accelerated batched prefill entry point (Ascend 950PR, arch35 /
-// dav-3510, MIX AIC+AIV).
+// dav-3510, MIX AIC+AIV), TWO-PHASE and with no GM intermediate workspace.
 //
 // op_kernel/ is PRIVATE (CLAUDE.md §1.2): nothing outside this operator may
-// depend on these numbers. The tile extents the HOST must also know -- because
-// it declares dyn_ub_size at the chevron and validates the geometry -- live in
+// depend on these numbers. The sub-tile extents the HOST must also know --
+// because it validates the geometry and the tiling POD carries them -- live in
 // op_host/dsv4_moe_prefill_cube_tiling.h instead, and the kernel TU
 // static_asserts the two copies against each other so a drift is a compile
-// error rather than an under-declared dynamic region.
+// error rather than a silently wrong buffer.
 //
 // PER-CORE CAPACITIES, from the toolkit's platform configs rather than the
 // whitepaper's per-subsystem figures:
@@ -20,8 +20,8 @@
 //
 // L0A/L0B/L0C are not budgeted here: the Matmul template owns them, and its
 // compile-time tiling (GetMatmulApiTiling) is what sizes them from the
-// declared operand types. What this file budgets is the UB the VECTOR side
-// holds while the Cube runs.
+// declared operand types and the per-sub-GEMM shape. What this file budgets is
+// the UB the VECTOR side holds and the L1 it stages weights through.
 
 #ifndef MOE_KERNELS_ARCH35_DSV4_MOE_PREFILL_CUBE_UB_LAYOUT_HPP
 #define MOE_KERNELS_ARCH35_DSV4_MOE_PREFILL_CUBE_UB_LAYOUT_HPP
@@ -32,69 +32,167 @@
 
 namespace moe::kernels::arch35::dsv4_moe_prefill_cube {
 
-inline constexpr std::uint32_t kCubeMTile = 16;       // tokens per Cube pass
-inline constexpr std::uint32_t kCubeInterTile = 512;  // gate/up N chunk
-inline constexpr std::uint32_t kCubeHiddenTile = 512; // down N chunk
+inline constexpr std::uint32_t kCubeMTile = 16;    // tokens per token tile
+inline constexpr std::uint32_t kCubeRSub = 128;    // phase 1 inter OUTPUT
+inline constexpr std::uint32_t kCubeKSub = 128;    // phase 1 hidden CONTRACT
+inline constexpr std::uint32_t kCubeHSub = 64;     // phase 2 hidden OUTPUT
+inline constexpr std::uint32_t kCubeRSub2 = 256;   // phase 2 inter CONTRACT
+inline constexpr std::uint32_t kCubeGroup = 32;    // MXFP4 group
 
 inline constexpr std::uint32_t kCubeHiddenMax = 4096;
 inline constexpr std::uint32_t kCubeInterMax = 2048;
 
-// --- the UB budget, and why M_TILE is 16 -----------------------------------
+// Both phases' weight sub-tiles hold the same number of elements, which is why
+// ONE staging pair (nibbles + BF16) serves both. Asserted rather than assumed:
+// the two shapes are chosen independently and this coincidence is load-bearing.
+inline constexpr std::uint32_t kCubeWeightSubElems = kCubeRSub * kCubeKSub;
+static_assert(kCubeWeightSubElems == kCubeHSub * kCubeRSub2,
+              "the phase 1 and phase 2 weight sub-tiles must hold the same "
+              "element count to share one dequant staging buffer");
+
+// ---------------------------------------------------------------------------
+// THE UB TABLE, AND WHY M_TILE IS 16
+// ---------------------------------------------------------------------------
+// Resident across BOTH phases:
 //
-//     gate chunk   FP32  [16, 512]   32,768 B   Cube output, at VECIN
-//     up   chunk   FP32  [16, 512]   32,768 B   Cube output, at VECIN
-//     activated    BF16  [16, 2048]  65,536 B   resident across the boundary
-//                                    ---------
-//                                    131,072 B  of 221,184 B usable
+//     act          BF16  [16, 2048]   65,536 B   the whole point of the
+//                                                schedule: it carries the
+//                                                intermediate from the last
+//                                                gate/up GEMM to the first
+//                                                down GEMM with no GM hop
 //
-// At M_TILE = 32 the same table is 262,144 B and does not fit, which is the
-// whole derivation: `activated` must survive from the gate/up GEMMs to the
-// down GEMM without a GM round trip, and on this part that residency is what
-// the token tile is sized around.
+// Phase 1 only:
 //
-// X is deliberately NOT in this budget. It is cast to BF16 into a workspace
-// plane and read by the Cube from GM, because holding [16, 4096] BF16 in UB
-// would cost another 131,072 B and leave no room for `activated`.
-inline constexpr std::uint32_t kCubeAccBytes = kCubeMTile * kCubeInterTile * 4u;
+//     gate_acc     FP32  [16, 128]     8,192 B   level-2 subtotal, summed
+//     up_acc       FP32  [16, 128]     8,192 B   over the K_SUB blocks
+//     c1           FP32  [16, 128]     8,192 B   one sub-GEMM's C, at VECIN
+//     x_f32        FP32  [16, 128]     8,192 B   X sub-tile as the caller has
+//                                                it, before the cast
+//     x_sub        BF16  [16, 128]     4,096 B   X sub-tile as the Cube reads
+//                                                it, at VECOUT
+//
+// Phase 2 only:
+//
+//     y_acc        FP32  [16, 64]      4,096 B   level-2 subtotal
+//     c2           FP32  [16, 64]      4,096 B   one sub-GEMM's C, at VECIN
+//     a_sub        BF16  [16, 256]     8,192 B   act's column slice, made
+//                                                contiguous for the Cube's A
+//
+// Shared by both phases (the sub-tile element counts coincide):
+//
+//     w_nib        4-bit [16384]       8,192 B   packed nibbles, as read
+//     w_wide       BF16  [16384]      32,768 B   expanded, before UB -> L1
+//     w_scale      u8    [128 x 32]    4,096 B   E8M0 bytes, one 32 B burst
+//                                                block per sub-tile row
+//                                     ---------
+//                                     163,840 B  of 221,184 B usable
+//
+// The phase-only segments are NOT overlaid even though the phases are disjoint
+// in time: TPipe allocates statically, and overlaying them would mean aliasing
+// two LocalTensors onto one TBuf, which is how a buffer-reuse bug becomes
+// invisible. There is 57,344 B of headroom, so the honest layout is affordable
+// and the clever one is not worth its failure mode.
+//
+// AT M_TILE = 32 every row of that table except the three weight-staging ones
+// doubles, since they are the only buffers whose extent does not carry M:
+// 163,840 + 65,536 + 16,384 + 8,192 + 8,192 + 4,096 + 4,096 + 4,096 + 8,192
+// = 282,624 B, which exceeds not just kUsableUbBytes but physical UB (262,144).
+// So 16 is forced, and the forcing term is the `act` residency -- the same
+// argument as before the two-phase rewrite, for the same reason.
 inline constexpr std::uint32_t kCubeActBytes = kCubeMTile * kCubeInterMax * 2u;
+inline constexpr std::uint32_t kCubeAcc1Bytes = kCubeMTile * kCubeRSub * 4u;
+inline constexpr std::uint32_t kCubeAcc2Bytes = kCubeMTile * kCubeHSub * 4u;
+inline constexpr std::uint32_t kCubeXF32Bytes = kCubeMTile * kCubeKSub * 4u;
+inline constexpr std::uint32_t kCubeXSubBytes = kCubeMTile * kCubeKSub * 2u;
+inline constexpr std::uint32_t kCubeASubBytes = kCubeMTile * kCubeRSub2 * 2u;
+inline constexpr std::uint32_t kCubeNibBytes = kCubeWeightSubElems / 2u;
+inline constexpr std::uint32_t kCubeWideBytes = kCubeWeightSubElems * 2u;
 
-static_assert(kCubeAccBytes == 32768, "gate/up chunk must be 32,768 B");
-static_assert(kCubeActBytes == 65536, "activated must be 65,536 B");
+// The scale burst lands one 32-byte block per sub-tile row, because a row
+// contributes only K_SUB / 32 = 4 scale bytes and a UB burst block is 32 B.
+// The row stride in the staging buffer is therefore 32 ENTRIES, not 4, and the
+// kernel indexes it that way.
+inline constexpr std::uint32_t kCubeScaleRowStride = 32;
+inline constexpr std::uint32_t kCubeScaleRowsMax =
+    kCubeRSub > kCubeHSub ? kCubeRSub : kCubeHSub;
+inline constexpr std::uint32_t kCubeScaleBytes =
+    kCubeScaleRowsMax * kCubeScaleRowStride;
 
-// Two accumulator slots (gate and up) plus the activated plane. The dequant
-// scratch below reuses these same two queues rather than adding segments, so
-// the peak is the larger of the two phases, not their sum.
+static_assert(kCubeActBytes == 65536, "act must be 65,536 B");
+static_assert(kCubeWideBytes == 32768, "the dequant staging must be 32,768 B");
+// A sub-tile row's scale bytes must fit the 32 B block the burst reserves for
+// it, in BOTH phases -- K_SUB / 32 = 4 and R_SUB2 / 32 = 8, so both do.
+static_assert(kCubeKSub / kCubeGroup <= kCubeScaleRowStride &&
+                  kCubeRSub2 / kCubeGroup <= kCubeScaleRowStride,
+              "a sub-tile row's E8M0 scales must fit one 32-byte burst block");
+
 inline constexpr std::uint32_t kCubeUbBytes =
-    2u * kCubeAccBytes + kCubeActBytes;
+    kCubeActBytes + 2u * kCubeAcc1Bytes + kCubeAcc1Bytes + kCubeXF32Bytes +
+    kCubeXSubBytes + kCubeAcc2Bytes + kCubeAcc2Bytes + kCubeASubBytes +
+    kCubeNibBytes + kCubeWideBytes + kCubeScaleBytes;
 
-static_assert(kCubeUbBytes == 131072,
-              "the Cube prefill UB budget must sum to 131,072 B");
+static_assert(kCubeUbBytes == 163840,
+              "the Cube prefill UB budget must sum to 163,840 B -- if this "
+              "fires, the table in the comment above is stale and the "
+              "M_TILE = 32 arithmetic with it");
 static_assert(kCubeUbBytes <= kUsableUbBytes,
               "the Cube prefill UB budget exceeds the arch35 usable ceiling");
 
-// The dequantization scratch must also fit the SAME two queues, since it
-// reuses them: one row of nibbles expanded to BF16 is the widest single
-// buffer, at hidden * 2 B.
-static_assert(kCubeHiddenMax * 2u <= kCubeActBytes,
-              "a dequantized weight row must fit the activated-sized buffer "
-              "the dequant phase borrows");
-static_assert(kCubeHiddenMax <= kCubeAccBytes,
-              "a packed nibble row must fit the accumulator-sized buffer the "
-              "dequant phase borrows");
+// ---------------------------------------------------------------------------
+// L1: the weight sub-tile staging the Cube reads B from
+// ---------------------------------------------------------------------------
+// TWO slots for phase 1 and ONE for phase 2, and what the second slot is for
+// needs stating precisely because the obvious reading is wrong TODAY.
+//
+// Phase 1 stages W1 and W3 for the SAME (r0, k0) step -- they reduce against
+// the same X sub-tile, which is the reuse the k-inner loop order exists for.
+// The slot count is sized for both being live, and the emu golden's L1 charge
+// (2 * R_SUB * K_SUB) assumes exactly that. But the driver as written
+// SERIALIZES them: dequant W1, GEMM, free, dequant W3, GEMM. So only one slot
+// is live at a time and the second is headroom, not a running overlap.
+//
+// It is not removed, for two reasons: the budget then stops matching the
+// golden's, and overlapping the W3 dequantization with the gate GEMM needs
+// only the asynchronous Iterate form rather than a new buffer -- which is the
+// obvious next optimization and should not have to re-widen L1 to land.
+// Phase 2's W2 sub-tile has no partner.
+//
+// 98,304 B of 524,288. The headroom is not slack: the Matmul framework stages
+// its own A1 copy of the A matrix in L1, and GetMatmulApiTiling sizes that
+// from the declared types without consulting this file.
+inline constexpr std::uint32_t kCubeB1SlotBytes = kCubeRSub * kCubeKSub * 2u;
+inline constexpr std::uint32_t kCubeB2SlotBytes = kCubeHSub * kCubeRSub2 * 2u;
+inline constexpr std::uint32_t kCubeL1Bytes = 2u * kCubeB1SlotBytes + kCubeB2SlotBytes;
+
+static_assert(kCubeB1SlotBytes == 32768 && kCubeB2SlotBytes == 32768,
+              "each L1 weight slot is 32,768 B");
+static_assert(kCubeL1Bytes <= 524288u / 2u,
+              "the operator's own L1 use must leave at least half of L1 to the "
+              "Matmul framework's A1 staging");
 
 // --- KFC queue reserve ----------------------------------------------------
 // REGIST_MATMUL_OBJ stands up a KfcServer whose message queue lives at the
-// head of the workspace, so the operator's own data planes must start past it.
-// 1 MiB is the toolkit's own conservative reserve for the mix message queue
-// plus its alignment; the planes that follow are tens of MiB, so rounding up
-// here costs nothing and a too-small reserve would corrupt the queue.
+// head of the workspace. It is now the ONLY thing in the workspace: the
+// dequantized weight planes are gone, which is what the two-phase schedule
+// bought. 1 MiB is the toolkit's own conservative reserve for the mix message
+// queue plus its alignment.
 inline constexpr std::uint64_t kCubeKfcReserveBytes = 1u << 20;
 
-// Event ids. EVENT_ID0..2 only, balanced 1:1 at every use so no token
-// outlives a loop iteration.
+// Event ids. EVENT_ID0..3 only -- EVENT_ID4..7 are physically absent on
+// arch35 -- and balanced 1:1 at every use so no token outlives a loop
+// iteration.
+//
+//   kEvCubeMte2ToV     a GM burst landed in UB; the Vector may read it
+//   kEvCubeVToMte3     the Vector finished w_wide; MTE3 may push it to L1
+//   kEvCubeMte3ToMte1  the L1 slot is written; the Cube's MTE1 may read it
+//   kEvCubeMte3ToV     the L1 push drained; the Vector may overwrite w_wide
 inline constexpr std::int32_t kEvCubeMte2ToV = 0;
 inline constexpr std::int32_t kEvCubeVToMte3 = 1;
-inline constexpr std::int32_t kEvCubeMte3ToV = 2;
+inline constexpr std::int32_t kEvCubeMte3ToMte1 = 2;
+inline constexpr std::int32_t kEvCubeMte3ToV = 3;
+
+static_assert(kEvCubeMte3ToV <= static_cast<std::int32_t>(kMaxEventId),
+              "arch35 has EVENT_ID0..3 only");
 
 }  // namespace moe::kernels::arch35::dsv4_moe_prefill_cube
 

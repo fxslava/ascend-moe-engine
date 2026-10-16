@@ -434,8 +434,12 @@ struct Diff {
   bool within_tolerance = true;
 };
 
-Diff Compare(const std::vector<float>& actual,
-             const std::vector<float>& expected) {
+// [[maybe_unused]]: a driver with its own derived tolerance (the Cube prefill
+// gate compares on a sampled subset, so it needs its own metric) does not call
+// this, and -Wunused-function would otherwise make including this fixture a
+// warning for that driver.
+[[maybe_unused]] Diff Compare(const std::vector<float>& actual,
+                              const std::vector<float>& expected) {
   Require(actual.size() == expected.size(), "comparison size mismatch");
   Diff diff;
   for (std::size_t i = 0; i < actual.size(); ++i) {
