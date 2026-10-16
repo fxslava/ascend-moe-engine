@@ -654,6 +654,97 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   endforeach()
 
   # ---------------------------------------------------------------------
+  # STEP 1 OF THE INDUCTIVE ASSEMBLY: DequantSubTileVector, alone
+  # ---------------------------------------------------------------------
+  # Same routine as the unit check above, but this is the GATE: it runs the
+  # primary [16, 64] sub-tile at the operator's forced M_TILE, poisons three
+  # canary bands (output guard tail, output tile, a UB sentinel behind
+  # scale_temporary), audits its own golden on the host before touching the
+  # device, and reports a named refusal through a status word instead of the
+  # zeroed output an early `return` would leave behind.
+  #
+  # It is AIV-only on purpose: no REGIST_MATMUL_OBJ, no KfcServer, no Cube. The
+  # end-to-end gate below has never completed a trip and floods pem_lsu with
+  # small-offset faults; a gate that shares none of that bring-up is what makes
+  # "the conversion is not the fault site" a statement rather than a guess.
+  set(_dsv4_dequant_micro_object
+      "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/test_dequant_micro_kernel.dav-3510.o")
+  add_custom_command(
+    OUTPUT "${_dsv4_dequant_micro_object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+            "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+            "${ASCEND_HOME_PATH}/bin/bisheng"
+            -O2 --npu-arch=dav-3510 --asc-aicore-lang
+            "-I${CMAKE_SOURCE_DIR}/include"
+            "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+            "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+            "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+            "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+            "-I${ASCEND_HOME_PATH}/include"
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_dequant_micro_kernel.cpp"
+            -o "${_dsv4_dequant_micro_object}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_dequant_micro_kernel.cpp"
+            ${_dsv4_asc_headers}
+            "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+    VERBATIM
+    COMMENT "Compiling SIM-ONLY test_dequant_micro_kernel.cpp for dav-3510 with BiSheng")
+  set_source_files_properties("${_dsv4_dequant_micro_object}"
+                              PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_executable(test_dequant_micro_sim
+    test_dequant_micro_sim.cpp "${_dsv4_dequant_micro_object}"
+    "${_dsv4_dequant_launch_common_object}")
+  add_dependencies(test_dequant_micro_sim
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dequant_micro_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include")
+  target_compile_options(test_dequant_micro_sim PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dequant_micro_sim PRIVATE -Werror)
+  endif()
+  target_link_libraries(test_dequant_micro_sim PRIVATE
+    moe_emu Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES})
+  set_target_properties(test_dequant_micro_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dequant_micro_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # MEASURED, 2026-10-16, first completed execution of any part of
+  # dsv4_moe_prefill_cube on anything: 274.6 s and 290.6 s wall over two runs
+  # of all three sub-tiles, 16x64 then 128x128 then 64x256, every word
+  # bit-exact both times and no pem_lsu diagnostic in either.
+  #
+  # Nearly all of that is FIXED cost -- simulator bring-up, binary load and
+  # teardown -- because the three launches together are only ~37 K simulated
+  # cycles. The practical consequence for whoever extends this: adding another
+  # sub-tile shape to this binary is close to free, while adding a second
+  # micro gate costs another ~290 s. Put Step 2 and Step 3 routine checks in
+  # here rather than in new executables.
+  #
+  # 900 s is ~3.1x the slower measurement. Generous enough for a loaded host,
+  # tight enough that a hang is a failure within minutes instead of hours.
+  add_test(NAME Dsv4PrefillCubeDequantMicroSim COMMAND test_dequant_micro_sim)
+  set_tests_properties(Dsv4PrefillCubeDequantMicroSim PROPERTIES
+    LABELS "sim;arch35;camodel;functional;vector;dequant"
+    TIMEOUT 900
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # ---------------------------------------------------------------------
   # THIS GATE DOES NOT PASS YET, AND THAT IS THE POINT OF REGISTERING IT.
   # ---------------------------------------------------------------------
   # MEASURED, 2026-10-15, first ever execution of dsv4_moe_prefill_cube on

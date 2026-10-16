@@ -25,6 +25,14 @@
 // hang watchdog, the exception-dump census, the output guard-band canary, the
 // Runtime/DeviceBuffer RAII pair, the MXFP4 expert-bank fixture builder, and
 // the diff/non-degeneracy metrics. The test BODIES stay in their own files.
+//
+// Every helper no single driver can be assumed to call is [[maybe_unused]].
+// These are non-inline functions in an anonymous namespace, so a driver that
+// needs its own fixture or its own tolerance -- the Cube prefill gates compare
+// BF16 bit patterns and build their own sub-tiles -- would otherwise pay a
+// -Wunused-function warning just for including this header, and could not be
+// built with -Werror at all. The attribute states that a partial use is
+// expected rather than suppressing something.
 
 #ifndef TESTS_SIM_DSV4_MOE_BLOCK_SIM_COMMON_HPP
 #define TESTS_SIM_DSV4_MOE_BLOCK_SIM_COMMON_HPP
@@ -186,7 +194,7 @@ struct DumpCensus {
   std::size_t non_empty = 0;
 };
 
-DumpCensus ExceptionDumps() {
+[[maybe_unused]] DumpCensus ExceptionDumps() {
   DumpCensus census;
   DIR* dir = opendir(".");
   if (dir == nullptr) return census;
@@ -330,7 +338,7 @@ void CopyFromDevice(std::vector<T>& destination, const DeviceBuffer& source) {
 
 // Allocates `logical + kGuardFloats` and fills the whole thing with the
 // canary, so the guard tail is poisoned before the launch.
-std::unique_ptr<DeviceBuffer> MakeGuardedOutput(std::size_t logical_floats) {
+[[maybe_unused]] std::unique_ptr<DeviceBuffer> MakeGuardedOutput(std::size_t logical_floats) {
   auto buffer = std::make_unique<DeviceBuffer>(
       (logical_floats + kGuardFloats) * sizeof(float));
   const std::vector<float> poison(logical_floats + kGuardFloats, CanaryFloat());
@@ -339,8 +347,8 @@ std::unique_ptr<DeviceBuffer> MakeGuardedOutput(std::size_t logical_floats) {
 }
 
 // Reads back only the guard tail and reports the first corrupted word.
-void RequireGuardIntact(const DeviceBuffer& buffer, std::size_t logical_floats,
-                        const char* what) {
+[[maybe_unused]] void RequireGuardIntact(const DeviceBuffer& buffer,
+                                         std::size_t logical_floats, const char* what) {
   std::vector<float> guard(kGuardFloats, 0.0F);
   const std::size_t offset_bytes = logical_floats * sizeof(float);
   RequireAcl(aclrtMemcpy(guard.data(), guard.size() * sizeof(float),
@@ -394,8 +402,8 @@ struct ExpertBank {
   }
 };
 
-ExpertBank MakeBank(std::uint32_t rows, std::uint32_t cols,
-                    std::uint32_t experts, std::mt19937_64& rng) {
+[[maybe_unused]] ExpertBank MakeBank(std::uint32_t rows, std::uint32_t cols,
+                                     std::uint32_t experts, std::mt19937_64& rng) {
   Require(cols % kGroup == 0, "MXFP4 width must be group aligned");
   ExpertBank bank;
   bank.rows = rows;
@@ -457,7 +465,7 @@ struct Diff {
   return diff;
 }
 
-bool NonDegenerate(const std::vector<float>& values) {
+[[maybe_unused]] bool NonDegenerate(const std::vector<float>& values) {
   if (values.empty()) return false;
   double sum = 0.0;
   double sum_sq = 0.0;
@@ -472,7 +480,7 @@ bool NonDegenerate(const std::vector<float>& values) {
   return std::sqrt(mean_sq) > 1.0e-6 && std::sqrt(variance) > 1.0e-6;
 }
 
-std::string LaunchFailure(const char* name, moe::kernels::arch35::Status st) {
+[[maybe_unused]] std::string LaunchFailure(const char* name, moe::kernels::arch35::Status st) {
   const auto& failure = moe::kernels::arch35::LastLaunchFailure();
   const char* call =
       failure.call != nullptr ? failure.call : "<no recorded ACL call>";
