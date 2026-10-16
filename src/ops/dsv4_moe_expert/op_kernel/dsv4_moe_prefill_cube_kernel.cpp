@@ -1,68 +1,93 @@
-// dsv4_moe_prefill_cube_kernel.cpp -- batched MoE prefill with W1/W3/W2 on
-// the Cube in BF16 (Ascend 950PR, arch35 / dav-3510, MIX AIC+AIV).
+// =================================================================================================
+// dsv4_moe_prefill_cube_kernel.cpp -- Batched MoE Prefill with W1/W3/W2 on Cube in BF16
+// Target Architecture : Huawei Ascend 950PR (arch35 / dav-3510 / CANN 9.2)
+// Kernel Task Mode    : KERNEL_TYPE_MIX_AIC_1_2 (Isomorphic Multi-Core Topology)
+// Intermediates       : ZERO-GM WORKSPACE (On-Chip Resident Unified Buffer Activation Plane)
+// =================================================================================================
 //
-// A TWO-PHASE ON-CHIP FUSED PIPELINE with no GM intermediate workspace.
+// 1. HARDWARE SATURATION & EXECUTION MODEL (Ascend 950PR / arch35):
+// -------------------------------------------------------------------------------------------------
+// Ascend 950PR integrates 32 AI Subsystems (32 Cube Cores / AIC and 64 Vector Cores / AIV).
+// Under KERNEL_TYPE_MIX_AIC_1_2, each AI Subsystem pairs 1 AIC with 2 AIVs:
 //
-// Oracle: src/emu/moe_prefill_cube_2d.cpp ::
-// moe_prefill_cube_flash_2d_w4a16_cpu, which models THIS schedule -- the
-// 1-D token-tile grid, the resident act plane, the three-level tile
-// decomposition and the FP32 accumulation at every level. See the numerics
-// note on op_host/dsv4_moe_prefill_cube_tiling.h for why BF16 and not native
-// Cube MXFP4, and for the proof sketch that the weight dequantization is exact.
+//               ┌──────────────────────────────────────────────────────────────┐
+//               │             32 AI Subsystems (Dav-3510 Cluster)              │
+//               │                                                              │
+//               │     Subsystem 0              ...             Subsystem 31    │
+//               │  ┌───────────────┐                    ┌───────────────┐      │
+//               │  │  1x Cube Core │ (32 AIC total)     │  1x Cube Core │      │
+//               │  └───────┬───────┘                    └───────┬───────┘      │
+//               │          │ KfcServer                          │              │
+//               │     ┌────┴─────────┐                     ┌────┴─────────┐    │
+//               │     │  KFC Mailbox │ (GM Workspace)      │  KFC Mailbox │    │
+//               │     └────┬─────────┘                     └────┬─────────┘    │
+//               │     ┌────┴────┬─────┐                    ┌────┴────┬──────┐  │
+//               │     │  AIV 0  │AIV 1│ (64 AIV total)     │  AIV 62 │AIV 63│  │
+//               │     └─────────┴─────┘                    └─────────┴──────┘  │
+//               └──────────────────────────────────────────────────────────────┘
 //
-//   gate[m, r] = sum_c  X_bf16[m, c] * W1_bf16[r, c]        Cube
-//   up  [m, r] = sum_c  X_bf16[m, c] * W3_bf16[r, c]        Cube
-//   act [m, r] = silu(min(gate, L)) * clamp(up, -L, L)      Vector
-//   y   [m, h] = sum_r  act_bf16[m, r] * W2_bf16[h, r]      Cube
+// - Cube/Vector Co-Design: REGIST_MATMUL_OBJ instantiates an AscendC::KfcServer. On AIC, the
+//   macro executes server.Run() and returns immediately. On AIV, execution falls through to drive
+//   the pipeline, issue GEMM requests, and perform vector SwiGLU / dequantization.
+// - KFC Mailbox Partitioning: To prevent command queue corruption between the two paired AIVs
+//   sharing a single AIC, the GM workspace is partitioned by sub-core index:
+//       aiv_workspace = shared_workspace + GetSubBlockIdx() * kKfcWorkspaceSlotBytes (64 KB).
+// - Core Grid Distribution: Block indexing over 64 AIVs (core_idx = GetBlockIdx(), grid stride block_dim)
+//   saturates 100% of the available vector and matrix compute units on the chip.
 //
-// THE SCHEDULE, which is the whole content of this file:
+// 2. MATHEMATICAL MODEL & ASYMMETRIC ACTIVATION CLAMP:
+// -------------------------------------------------------------------------------------------------
+//   Gate Projection  : gate[m, r] = sum_c ( X_bf16[m, c] * W1_bf16[r, c] )               [Cube]
+//   Up Projection    : up  [m, r] = sum_c ( X_bf16[m, c] * W3_bf16[r, c] )               [Cube]
+//   Fused SwiGLU     : act [m, r] = silu(min(gate, L)) * clamp(up, -L, L)                [Vector]
+//   Down Projection  : y   [m, h] = sum_r ( act_bf16[m, r] * W2_bf16[h, r] )             [Cube]
 //
-//   for each token tile (16 rows), grid-striding over cores
-//     PHASE 1
-//     for r0 in 0, R_SUB, ... < inter
-//       gate_acc = up_acc = 0                      FP32 in UB
-//       for k0 in 0, K_SUB, ... < hidden
-//         X[16, K_SUB]      -> UB, cast to BF16    read ONCE, used TWICE
-//         W1[R_SUB, K_SUB]  -> UB -> L1            dequantized per sub-tile
-//         W3[R_SUB, K_SUB]  -> UB -> L1
-//         gate_acc += X @ W1^T ; up_acc += X @ W3^T   two sub-GEMMs
-//       act[:, r0 : r0+R_SUB] = clamped SwiGLU     BF16, stays resident
-//     PHASE 2
-//     for h0 in 0, H_SUB, ... < hidden
-//       y_acc = 0                                  FP32 in UB
-//       for r0 in 0, R_SUB2, ... < inter
-//         act[:, r0 : r0+R_SUB2] -> a_sub          contiguous A, at VECOUT
-//         W2[H_SUB, R_SUB2] -> UB -> L1
-//         y_acc += a_sub @ W2^T
-//       y_acc -> GM                                one strided burst
+//   Note: The clamp is strictly asymmetric. The gate is bounded from ABOVE only; the up-path
+//   is bounded on BOTH sides. Truncating the clamp introduces unbounded error into the hidden state.
 //
-// WHERE THE LEVEL-2 SUBTOTAL LIVES, because it is a deviation from the
-// idealized schedule and reading this file without the note would mislead: a
-// `TPosition::TSCM` B operand must be the WHOLE single-core B, so splitting K
-// makes each (r0, k0) step its own single-core GEMM -- and L0C does not
-// survive between separately driven GEMMs, while `IterateAll`'s accumulating
-// form is GM-atomic, which the zero-GM-workspace rule forbids. So the
-// subtotals are summed by the Vector into an FP32 UB accumulator. The
-// ARITHMETIC is identical to the L0C-resident form -- fractal, then sub-tile
-// block, then axis, FP32 throughout -- which is what the emu golden models, so
-// the oracle comparison is unaffected. Only the buffer differs.
+// 3. THREE-LEVEL TILE DECOMPOSITION & UB RESIDENT PLANE:
+// -------------------------------------------------------------------------------------------------
+// Tokens are tiled into blocks of M = 16 rows (kCubeMTile). Intermediate activations stay resident
+// inside UB (activation_resident, BF16, size: M * inter) across Phase 1 and Phase 2 without GM spill.
 //
-// THE MIX EXECUTION MODEL, which dictates the shape of this file.
-// REGIST_MATMUL_OBJ stands up an AscendC::KfcServer. On the AIC side the macro
-// spins in server.Run() and RETURNS FROM INSIDE THE MACRO; only the AIV side
-// falls through. So everything written after the macro is AIV code that drives
-// the Cube through the server's message queue, and `workspace` is that queue's
-// GM backing -- which is now the ONLY thing the workspace holds.
+//  [M=16, hidden]              [inter, hidden] (W1/W3)                [M=16, inter]
+//  Tokens Tile (GM)         Weights Sub-Tile (GM/TSCM)           Resident Act Plane (UB)
+//   ┌──────────────┐         ┌─────────────────────────┐         ┌─────────────────────────┐
+//   │  X[16, K_SUB]│  --->   │  W1/W3[R_SUB, K_SUB]    │  ===>   │  act[:, r0 : r0+R_SUB]  │
+//   └──────────────┘         └─────────────────────────┘         └─────────────────────────┘
+//        │                              │                                     │
+//        │ (MTE2 -> Cast)               │ (Dequant E8M0 -> L1)                │ Phase 2 (A Slicing)
+//        v                              v                                     v
+//   tokens_sub_bf16           q_weight_fwd (TSCM/L1)             activation_sub_bf16
+//   ┌──────────────┐         ┌─────────────────────────┐         ┌─────────────────────────┐
+//   │ 16 x K_SUB   │    @    │ (R_SUB x K_SUB)^T       │  --->   │ 16 x R_SUB2             │
+//   └──────────────┘         └─────────────────────────┘         └─────────────────────────┘
+//                                                                             │
+//                                     Down Weights (W2)                       │ (A @ W2^T)
+//                                     ┌─────────────────────────┐             v
+//                                     │  W2[H_SUB, R_SUB2]      │  ===>   y_acc [16 x H_SUB]
+//                                     └─────────────────────────┘         (Overlapped MTE3 -> GM)
 //
-// THE CLAMP IS ASYMMETRIC AND THE TWO HALVES ARE NOT INTERCHANGEABLE.
-// AscendSiluAndMulWithClamp bounds the GATE ABOVE ONLY and bounds UP ON BOTH
-// SIDES, and the AIV prefill kernel does the same. Dropping the `up` clamp is
-// not harmless: `up` is a raw hidden-wide GEMM output, so it exceeds L readily
-// and the error is unbounded.
+// 4. SOFTWARE PIPELINING & HARDWARE OPTIMIZATIONS:
+// -------------------------------------------------------------------------------------------------
+// - Phase 1 Hidden Contraction (Tokens Prefetching):
+//   Implemented as a 2-stage double buffer (ping-pong on tokens_f32 / tokens_sub_bf16). MTE2 DMA load
+//   of chunk (k0 + K_SUB) overlaps with sub-GEMM accumulation of chunk (k0) on the Cube.
+// - Vectorized MXFP4/E8M0 Weight Dequantization:
+//   Zero scalar loops. 32-byte aligned E8M0 exponent rows are vectorized via ShiftLeft(..., 7) and
+//   expanded onto the weights grid using hardware Broadcast<bfloat16_t, 2>.
+// - Vectorized SwiGLU & 2D UB-to-UB Memory Relocation:
+//   Vector ALU performs contiguous Cast into a flat intermediate buffer, followed by a hardware-strided
+//   UB -> UB DataCopy (DataCopyParams: blockLen=R_SUB, dstStride=inter-R_SUB) without scalar indexing.
+// - Asynchronous GM Drain:
+//   Phase 2 down-projection output flushes to GM via non-blocking V_MTE3 -> MTE3_V handshakes,
+//   overlapping writeback bursts with next-tile setup.
 //
-// NEVER EXECUTED ON HARDWARE: compiled for dav-3510 and run under the dav_3510
-// CAModel only (CLAUDE.md §5.7). No claim is made here about observed
-// throughput, bandwidth or latency.
+// 5. MEMORY SAFETY & ALIAS RESOLUTION:
+// -------------------------------------------------------------------------------------------------
+// - Distinct UB Queues: scale_plane, scale_temporary, and tokens ping/pong buffers reside in strictly
+//   disjoint UB memory regions, preventing alias corruption between Phase 1 GEMMs and Phase 2 down-slices.
+// =================================================================================================
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"

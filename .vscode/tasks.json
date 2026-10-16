@@ -1,0 +1,30 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CANN: Clean",
+            "type": "shell",
+            "command": "wsl rm -rf build_cann",
+            "problemMatcher": []
+        },
+        {
+            "label": "CANN: Configure",
+            "type": "shell",
+            "command": "wsl cmake -S . -B build_cann -DENABLE_ARCH35_DEVICE_LAUNCH=ON -DCMAKE_BUILD_TYPE=Release",
+            "problemMatcher": [],
+            "dependsOn": ["CANN: Clean"]
+        },
+        {
+            "label": "CANN: Build (Ctrl+Shift+B)",
+            "type": "shell",
+            "command": "wsl cmake --build build_cann -j$(nproc)",
+            "problemMatcher": ["$gcc"],
+            "dependsOrder": "sequence",
+            "dependsOn": ["CANN: Configure"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}

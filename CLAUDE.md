@@ -192,13 +192,35 @@ What counts as verified, on a workstation with no NPU:
    faithfully into `tests/emu` and compared against `std::sort`. Any
    equivalent rewrite must come with the same kind of host simulation --
    "it compiles for dav-3510" is not evidence that a sort sorts.
-6. **Static analysis and simulation tools are out of scope for the current
-   phase** — `ascend-kernel-analyzer`, `PipeSim`. Their AST parsers and rules
-   predate the DaVinci v3 hybrid SIMD/SIMT primitives (`__simt_vf__`,
+6. **Static analysis and simulation tools must never rank kernel changes.**
+   `ascend-kernel-analyzer` remains out of scope entirely: its AST parser and
+   rules predate the DaVinci v3 hybrid SIMD/SIMT primitives (`__simt_vf__`,
    `asc_vf_call`, `asc_shfl_xor`, L1 DataCache bypass via `asc_ldca` /
-   `asc_ldcg`), so they produce false positives and pressure the kernels toward
-   scalar fallbacks. Do not run them or treat their output as a gate until the
-   rules are updated.
+   `asc_ldcg`), so it produces false positives and pressures the kernels
+   toward scalar fallbacks. Do not run it or treat its output as a gate.
+
+   `PipeSim` (at `C:\PipeSim`, **not** `D:\`) is narrower than that blanket
+   ban as of 2026-10-12, and may be run for **model characterisation**:
+   - It carries the correct `221,184 B` usable UB budget, and models
+     `asc_vf_call` boundaries (`vf_mode_switch_penalty_cycles` = 64, in a
+     30..80 window) as of its own 2026-10-11 fix, and `asc_shfl_xor` as
+     register-resident issue cycles. The old "predates the v3 primitives"
+     claim no longer holds for those.
+   - Its **absolute times are not usable**. Measured against hardware on
+     `fast_fp8_indexer_topk` it predicted ~163 ms against 10.6 ms observed, a
+     ~15x overestimate, because it fixes the SIMT DataCache at its 32 KiB
+     floor and applies a flat 87.5% miss rate to a working set that really
+     fits the true 128 KiB DataCache. Its own profile says to calibrate the
+     128 B/cycle channel rates before trusting absolute predictions.
+   - Its **qualitative verdict is useful**: it independently reached
+     `VECTOR_BOUND` / secondary `MTE2` for that kernel, matching the
+     source-derived cost model.
+   - It **cannot** see the static/dynamic UB region split (one pool, one
+     capacity), so it is structurally blind to the error-341 / 507035 class,
+     and it did not and could not have found the `gate_cur` GM aliasing bug.
+
+   So: PipeSim may characterise *which stage binds*. Optimizations are still
+   ranked by measured hardware latency only, per rule 7.
 7. Never claim hardware behaviour that has not been observed on hardware. If a
    path has only been compiled, say "compiles and links; never executed".
 

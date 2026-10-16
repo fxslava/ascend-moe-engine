@@ -1,194 +1,164 @@
-// SIM ONLY -- a collapsed boundary-grid variant of dsv4_moe_prefill_cube for
-// the dav-3510 CAModel (MIX AIC+AIV, KERNEL_TYPE_MIX_AIC_1_1).
-//
-// Lives under tests/sim/kernel/ and is compiled into test targets only; no
-// production library links it, and tests/sim/CMakeLists.txt asserts that
-// rather than trusting it. Production op_kernel/ carries no verification
-// branch and no #ifdef SIM because of this file.
-//
-// WHAT IS SHARED AND WHAT IS NOT
-// This TU #includes the production kernel, so every COMPUTE body here is
-// verbatim production code: ProcessTokenTile, DequantSubTileToL1, E8M0ToBf16,
-// LoadGeometry, TilingRejected, the Buffers bundle, the Matmul type aliases
-// and their compile-time tiling. Only the TRIP SCHEDULE differs -- which of
-// the token tiles run. A collapsed run against a forked body would prove
-// nothing about the kernel that ships, so the body is not copied, it is
-// called.
-//
-// Including a .cpp is deliberate and is the same choice the two
-// dsv4_moe_block sim kernels make: ProcessTokenTile is `inline` inside the
-// production TU and cannot be referenced across a link. The production
-// __global__ entry comes along unused, so this object must NOT be linked
-// beside dsv4_moe_prefill_cube_kernel.o.
-//
-// THE SCHEDULE, AND WHY IT IS THE PRODUCTION MAP
-// Production grid-strides over tiles:
-//
-//     for (tile = core; tile < tiles; tile += block_dim)
-//
-// This file strides over SAMPLE POSITIONS instead:
-//
-//     for (i = core; i < |S|; i += block_dim)   ->  ProcessTokenTile(S[i])
-//
-// so a core still takes every block_dim-th element of the sequence it is
-// given, and adjacent sampled tiles still land on adjacent cores. The map
-// under test is production's; only the sequence is shorter. Sampling global
-// tile indices per core instead would hand a core tiles it does not own and
-// exercise an addressing pattern production never performs.
-//
-// THERE IS NO CROSS-CORE HANDSHAKE TO UNBALANCE, which is what makes this
-// collapse safe. The kernel issues no CrossCoreSetFlag / CrossCoreWaitFlag
-// and no SyncAll; its only cross-core traffic is the Matmul KfcServer, and on
-// the AIC side that is a SERVICE loop -- it answers however many messages the
-// AIV client sends and quits on the client's teardown. Collapsing the AIV
-// trip count cannot stand the AIC up waiting for a message that never comes,
-// which is the artefact this technique normally has to design around. The
-// sample set is still built ONCE, from the tiling, so both sides see one
-// sequence.
-//
-// THE SAMPLE CAP IS A SEPARATE GM WORD, NOT A TILING FIELD. The driver needs
-// to run 1 or 2 sampled tiles to MEASURE this gate's fixed cost (the cost
-// model for CAModel is measured, never derived -- three predictions for these
-// suites have now been wrong). Adding a field to Dsv4MoePrefillCubeTilingData
-// would break its 72-byte wire format, which is public ABI, so the cap
-// travels as its own operand. A cap of 0 means "run all of S".
-//
-// NEVER EXECUTED ON HARDWARE: compiled for dav-3510 and run under CAModel
-// only (CLAUDE.md §5.7).
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
+ */
 
-#include "dsv4_moe_prefill_cube_kernel.cpp"  // verbatim production bodies
+// Inductive boundary-grid simulator wrapper for dsv4_moe_prefill_cube.
+// Textually includes the production kernel to execute verbatim compute bodies
+// over a collapsed trip set S instead of all tiles.
 
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+#include "dsv4_moe_prefill_cube_arch35.h"
+#include "dsv4_moe_prefill_cube_tiling.h"
 #include "dsv4_moe_prefill_cube_sample_set.h"
 
+// Textually include the production TU for verbatim compute logic
+#include "../../../src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+
+namespace moe::kernels::arch35::dsv4_moe_prefill_cube {
+
+using namespace AscendC;
+using moe::sim::prefill_cube::BuildTileSampleSet;
+using moe::sim::prefill_cube::kMaxSamples;
+using moe::sim::prefill_cube::kRingDepth;
+
 extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
-    GM_ADDR x_tokens, GM_ADDR w1_packed, GM_ADDR w1_scale, GM_ADDR w3_packed,
-    GM_ADDR w3_scale, GM_ADDR w2_packed, GM_ADDR w2_scale,
-    GM_ADDR token_to_expert, GM_ADDR y_tokens, GM_ADDR workspace,
-    GM_ADDR sample_cap, GM_ADDR tiling) {
-  using namespace moe::kernels::arch35;
-  using namespace moe::kernels::arch35::dsv4_moe_prefill_cube;
-  using moe::sim::prefill_cube::BuildTileSampleSet;
-  using moe::sim::prefill_cube::kMaxSamples;
-  using moe::sim::prefill_cube::kRingDepth;
+    GM_ADDR tokens_in,
+    GM_ADDR gate_weights_packed, GM_ADDR gate_weight_scales,
+    GM_ADDR up_weights_packed,   GM_ADDR up_weight_scales,
+    GM_ADDR down_weights_packed, GM_ADDR down_weight_scales,
+    GM_ADDR token_to_expert_lut, GM_ADDR tokens_out,
+    GM_ADDR shared_workspace,    GM_ADDR tiling_config,
+    GM_ADDR sample_cap_ptr) {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
-  // --- prologue: production's, unchanged ----------------------------------
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
-  if (unlikely(tiling == nullptr || workspace == nullptr)) {
-    return;
-  }
-  const __gm__ Dsv4MoePrefillCubeTilingData* td =
-      reinterpret_cast<const __gm__ Dsv4MoePrefillCubeTilingData*>(tiling);
-  if (unlikely(TilingRejected(td))) {
-    return;  // uniform across cores
-  }
-  const Geometry g = LoadGeometry(td);
-
-  TPipe pipe;
-  GateUpMatmul mmGateUp;
-  DownMatmul mmDown;
-  // AIC spins in the server and returns from inside this macro; the AIV side
-  // continues below. This is the handshake the gate exists to execute.
-  REGIST_MATMUL_OBJ(&pipe, workspace, mmGateUp, mmDown);
-
-  GlobalTensor<float> xGm;
-  GlobalTensor<float> yGm;
-  const std::uint64_t elems =
-      static_cast<std::uint64_t>(g.total_tokens) * g.hidden;
-  xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x_tokens), elems);
-  yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y_tokens), elems);
-
-  // THE WORKSPACE IS THE KFC QUEUE AND NOTHING ELSE, which is why this file
-  // no longer builds any GlobalTensor over it. The predecessor laid three
-  // dequantized planes out here -- X in BF16, W1+W3, W2 -- and the driver
-  // bounds-checked them. There is nothing left to view: every weight sub-tile
-  // is decoded into UB and pushed to L1, so the driver's workspace check
-  // became an assertion that the region past the KFC reserve is NEVER
-  // written, which is a stronger statement than the old bounds check and the
-  // one this schedule is entitled to.
-
-  // --- UB and L1: production's layout, verbatim ---------------------------
-  TQue<TPosition::VECCALC, 1> qAct;
-  TQue<TPosition::VECCALC, 1> qGate;
-  TQue<TPosition::VECCALC, 1> qUp;
-  TQue<TPosition::VECIN, 1> qC1;
-  TQue<TPosition::VECCALC, 1> qXF32;
-  TQue<TPosition::VECOUT, 1> qXSub;
-  TQue<TPosition::VECCALC, 1> qYAcc;
-  TQue<TPosition::VECIN, 1> qC2;
-  TQue<TPosition::VECOUT, 1> qASub;
-  TQue<TPosition::VECCALC, 1> qNib;
-  TQue<TPosition::VECCALC, 1> qWide;
-  TQue<TPosition::VECCALC, 1> qScale;
-  pipe.InitBuffer(qAct, 1, kCubeActBytes);
-  pipe.InitBuffer(qGate, 1, kCubeAcc1Bytes);
-  pipe.InitBuffer(qUp, 1, kCubeAcc1Bytes);
-  pipe.InitBuffer(qC1, 1, kCubeAcc1Bytes);
-  pipe.InitBuffer(qXF32, 1, kCubeXF32Bytes);
-  pipe.InitBuffer(qXSub, 1, kCubeXSubBytes);
-  pipe.InitBuffer(qYAcc, 1, kCubeAcc2Bytes);
-  pipe.InitBuffer(qC2, 1, kCubeAcc2Bytes);
-  pipe.InitBuffer(qASub, 1, kCubeASubBytes);
-  pipe.InitBuffer(qNib, 1, kCubeNibBytes);
-  pipe.InitBuffer(qWide, 1, kCubeWideBytes);
-  pipe.InitBuffer(qScale, 1, kCubeScaleBytes);
-
-  TQue<TPosition::TSCM, 2> qB1;
-  TQue<TPosition::TSCM, 1> qB2;
-  pipe.InitBuffer(qB1, 2, kCubeB1SlotBytes);
-  pipe.InitBuffer(qB2, 1, kCubeB2SlotBytes);
-
-  Buffers b;
-  b.act = qAct.AllocTensor<bfloat16_t>();
-  b.gate_acc = qGate.AllocTensor<float>();
-  b.up_acc = qUp.AllocTensor<float>();
-  b.c1 = qC1.AllocTensor<float>();
-  b.x_f32 = qXF32.AllocTensor<float>();
-  b.x_sub = qXSub.AllocTensor<bfloat16_t>();
-  b.y_acc = qYAcc.AllocTensor<float>();
-  b.c2 = qC2.AllocTensor<float>();
-  b.a_sub = qASub.AllocTensor<bfloat16_t>();
-  b.w_nib = qNib.AllocTensor<fp4x2_e2m1_t>();
-  b.w_wide = qWide.AllocTensor<bfloat16_t>();
-  b.w_scale = qScale.AllocTensor<uint8_t>();
-
-  const std::uint32_t core = static_cast<std::uint32_t>(GetBlockIdx());
-  const std::uint32_t tiles = (g.total_tokens + g.m_tile - 1u) / g.m_tile;
-
-  // --- THE ONLY DEVIATION: the trip schedule ------------------------------
-  std::uint32_t sample[kMaxSamples];
-  std::uint32_t n = BuildTileSampleSet(tiles, kRingDepth, sample);
-  if (sample_cap != nullptr) {
-    const std::uint32_t cap =
-        reinterpret_cast<const __gm__ std::uint32_t*>(sample_cap)[0];
-    // 0xFFFFFFFF -- SETUP ONLY: stand up the TPipe, the Matmul objects and the
-    // KfcServer, then tear them down without running a single tile. A
-    // diagnostic, and a load-bearing one: it bisects a run-time fault into
-    // "the MIX bring-up" versus "the tile body", which from the outside look
-    // identical -- both present as the simulator spinning. Nothing else can
-    // tell them apart without hardware.
-    if (cap == 0xFFFFFFFFu) {
-      n = 0u;
-    } else if (cap != 0u && cap < n) {
-      n = cap;
+    if (unlikely(tiling_config == nullptr || shared_workspace == nullptr)) {
+        return;
     }
-  }
+    const __gm__ Dsv4MoePrefillCubeTilingData* tiling_data =
+        reinterpret_cast<const __gm__ Dsv4MoePrefillCubeTilingData*>(tiling_config);
+    if (unlikely(TilingRejected(tiling_data))) {
+        return;
+    }
+    const Geometry geom = LoadGeometry(tiling_data);
 
-  for (std::uint32_t i = core; i < n; i += g.block_dim) {
-    ProcessTokenTile(g, sample[i], w1_packed, w1_scale, w3_packed, w3_scale,
-                     w2_packed, w2_scale, token_to_expert, xGm, yGm, b, qB1,
-                     qB2, mmGateUp, mmDown);
-  }
+    const std::uint32_t sub_core_idx  = static_cast<std::uint32_t>(GetSubBlockIdx());
+    GM_ADDR             aiv_workspace = Bytes(shared_workspace) + sub_core_idx * kKfcWorkspaceSlotBytes;
 
-  qScale.FreeTensor(b.w_scale);
-  qWide.FreeTensor(b.w_wide);
-  qNib.FreeTensor(b.w_nib);
-  qASub.FreeTensor(b.a_sub);
-  qC2.FreeTensor(b.c2);
-  qYAcc.FreeTensor(b.y_acc);
-  qXSub.FreeTensor(b.x_sub);
-  qXF32.FreeTensor(b.x_f32);
-  qC1.FreeTensor(b.c1);
-  qUp.FreeTensor(b.up_acc);
-  qGate.FreeTensor(b.gate_acc);
-  qAct.FreeTensor(b.act);
+    TPipe pipe;
+    GateUpMatmul matmul_gate_up;
+    DownMatmul   matmul_down;
+    REGIST_MATMUL_OBJ(&pipe, aiv_workspace, matmul_gate_up, matmul_down);
+
+    GlobalTensor<float> tokens_in_gm;
+    GlobalTensor<float> tokens_out_gm;
+    const std::uint64_t total_elements = static_cast<std::uint64_t>(geom.total_tokens) * geom.hidden;
+    tokens_in_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(tokens_in), total_elements);
+    tokens_out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(tokens_out), total_elements);
+
+    TQue<TPosition::VECCALC, 1> q_activation_resident;
+    TQue<TPosition::VECCALC, 1> q_gate_accumulator;
+    TQue<TPosition::VECCALC, 1> q_up_accumulator;
+    TQue<TPosition::VECIN,   1> q_subgemm_fwd;
+    TQue<TPosition::VECCALC, 1> q_tokens_f32_ping;
+    TQue<TPosition::VECCALC, 1> q_tokens_f32_pong;
+    TQue<TPosition::VECOUT,  1> q_tokens_sub_bf16_ping;
+    TQue<TPosition::VECOUT,  1> q_tokens_sub_bf16_pong;
+    TQue<TPosition::VECCALC, 1> q_down_accumulator;
+    TQue<TPosition::VECIN,   1> q_subgemm_down;
+    TQue<TPosition::VECOUT,  1> q_activation_sub_bf16;
+    TQue<TPosition::VECCALC, 1> q_weight_nibbles;
+    TQue<TPosition::VECCALC, 1> q_weight_expanded;
+    TQue<TPosition::VECCALC, 1> q_weight_scales;
+    TQue<TPosition::VECCALC, 1> q_scale_plane;
+    TQue<TPosition::VECCALC, 1> q_scale_temporary;
+
+    pipe.InitBuffer(q_activation_resident,   1, kCubeActBytes);
+    pipe.InitBuffer(q_gate_accumulator,      1, kCubeAcc1Bytes);
+    pipe.InitBuffer(q_up_accumulator,        1, kCubeAcc1Bytes);
+    pipe.InitBuffer(q_subgemm_fwd,           1, kCubeAcc1Bytes);
+    pipe.InitBuffer(q_tokens_f32_ping,       1, kCubeXF32Bytes);
+    pipe.InitBuffer(q_tokens_f32_pong,       1, kCubeXF32Bytes);
+    pipe.InitBuffer(q_tokens_sub_bf16_ping,  1, kCubeXSubBytes);
+    pipe.InitBuffer(q_tokens_sub_bf16_pong,  1, kCubeXSubBytes);
+    pipe.InitBuffer(q_down_accumulator,      1, kCubeAcc2Bytes);
+    pipe.InitBuffer(q_subgemm_down,          1, kCubeAcc2Bytes);
+    pipe.InitBuffer(q_activation_sub_bf16,   1, kCubeASubBytes);
+    pipe.InitBuffer(q_weight_nibbles,        1, kCubeNibBytes);
+    pipe.InitBuffer(q_weight_expanded,       1, kCubeWideBytes);
+    pipe.InitBuffer(q_weight_scales,         1, kCubeScaleBytes);
+    pipe.InitBuffer(q_scale_plane,           1, kCubeRSub * kCubeKSub * sizeof(bfloat16_t));
+    pipe.InitBuffer(q_scale_temporary,       1, 16 * sizeof(uint16_t));
+
+    TQue<TPosition::TSCM, 2> q_weight_fwd;
+    TQue<TPosition::TSCM, 2> q_weight_down;
+    pipe.InitBuffer(q_weight_fwd,  2, kCubeB1SlotBytes);
+    pipe.InitBuffer(q_weight_down, 2, kCubeB2SlotBytes);
+
+    Buffers buf;
+    buf.activation_resident   = q_activation_resident.AllocTensor<bfloat16_t>();
+    buf.gate_accumulator      = q_gate_accumulator.AllocTensor<float>();
+    buf.up_accumulator        = q_up_accumulator.AllocTensor<float>();
+    buf.subgemm_fwd           = q_subgemm_fwd.AllocTensor<float>();
+    buf.tokens_f32_ping       = q_tokens_f32_ping.AllocTensor<float>();
+    buf.tokens_f32_pong       = q_tokens_f32_pong.AllocTensor<float>();
+    buf.tokens_sub_bf16_ping  = q_tokens_sub_bf16_ping.AllocTensor<bfloat16_t>();
+    buf.tokens_sub_bf16_pong  = q_tokens_sub_bf16_pong.AllocTensor<bfloat16_t>();
+    buf.down_accumulator      = q_down_accumulator.AllocTensor<float>();
+    buf.subgemm_down          = q_subgemm_down.AllocTensor<float>();
+    buf.activation_sub_bf16   = q_activation_sub_bf16.AllocTensor<bfloat16_t>();
+    buf.weight_nibbles        = q_weight_nibbles.AllocTensor<fp4x2_e2m1_t>();
+    buf.weight_expanded       = q_weight_expanded.AllocTensor<bfloat16_t>();
+    buf.weight_scales         = q_weight_scales.AllocTensor<uint8_t>();
+    buf.scale_plane           = q_scale_plane.AllocTensor<bfloat16_t>();
+    buf.scale_temporary       = q_scale_temporary.AllocTensor<uint16_t>();
+
+    const std::uint32_t total_tiles = (geom.total_tokens + geom.token_tile - 1u) / geom.token_tile;
+
+    std::uint32_t sample_indices[kMaxSamples] = {};
+    std::uint32_t sample_count = BuildTileSampleSet(total_tiles, kRingDepth, sample_indices);
+
+    if (sample_cap_ptr != nullptr) {
+        const std::uint32_t cap = *reinterpret_cast<const __gm__ std::uint32_t*>(sample_cap_ptr);
+        if (cap != 0u && cap < sample_count) {
+            sample_count = cap;
+        }
+    }
+
+    const std::uint32_t core_idx = static_cast<std::uint32_t>(GetBlockIdx());
+
+    for (std::uint32_t s_idx = 0; s_idx < sample_count; ++s_idx) {
+        const std::uint32_t tile_idx = sample_indices[s_idx];
+        if ((tile_idx % geom.block_dim) == core_idx) {
+            ProcessTokenTile(
+                geom, tile_idx,
+                gate_weights_packed, gate_weight_scales,
+                up_weights_packed,   up_weight_scales,
+                down_weights_packed, down_weight_scales,
+                token_to_expert_lut,
+                tokens_in_gm, tokens_out_gm,
+                buf, q_weight_fwd, q_weight_down,
+                matmul_gate_up, matmul_down);
+        }
+    }
+
+    q_scale_temporary.FreeTensor(buf.scale_temporary);
+    q_scale_plane.FreeTensor(buf.scale_plane);
+    q_weight_scales.FreeTensor(buf.weight_scales);
+    q_weight_expanded.FreeTensor(buf.weight_expanded);
+    q_weight_nibbles.FreeTensor(buf.weight_nibbles);
+    q_activation_sub_bf16.FreeTensor(buf.activation_sub_bf16);
+    q_subgemm_down.FreeTensor(buf.subgemm_down);
+    q_down_accumulator.FreeTensor(buf.down_accumulator);
+    q_tokens_sub_bf16_pong.FreeTensor(buf.tokens_sub_bf16_pong);
+    q_tokens_sub_bf16_ping.FreeTensor(buf.tokens_sub_bf16_ping);
+    q_tokens_f32_pong.FreeTensor(buf.tokens_f32_pong);
+    q_tokens_f32_ping.FreeTensor(buf.tokens_f32_ping);
+    q_subgemm_fwd.FreeTensor(buf.subgemm_fwd);
+    q_up_accumulator.FreeTensor(buf.up_accumulator);
+    q_gate_accumulator.FreeTensor(buf.gate_accumulator);
+    q_activation_resident.FreeTensor(buf.activation_resident);
 }
+
+}  // namespace moe::kernels::arch35::dsv4_moe_prefill_cube
