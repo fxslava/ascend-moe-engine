@@ -659,7 +659,44 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
     const std::uint32_t core_idx    = static_cast<std::uint32_t>(GetBlockIdx());
     const std::uint32_t total_tiles = (geom.total_tokens + geom.token_tile - 1u) / geom.token_tile;
 
-    for (std::uint32_t tile_idx = core_idx; tile_idx < total_tiles; tile_idx += geom.block_dim) {
+    // ONLY SUB-CORE 0 DRIVES THE CUBE.
+    //
+    // In KERNEL_TYPE_MIX_AIC_1_2 one AIC is paired with TWO AIVs, and both of
+    // them share a GetBlockIdx() -- GetSubBlockIdx() is what tells them apart.
+    // Striding the tile grid by GetBlockIdx() alone therefore had BOTH paired
+    // AIVs execute the SAME tiles: duplicate `y` stores, and both sub-cores
+    // driving the same two Matmul objects through the KFC queue, issuing two
+    // interleaved streams of SetTensorA/SetTensorB/IterateAll/End against one
+    // server.
+    //
+    // The idle sub-core must still FALL THROUGH to a normal return rather than
+    // exit early, because the AIC server runs until `quitSize == MIX_NUM`
+    // (kernel_kfc.h: `isRun()` is `quitSize < MIX_NUM`, MIX_NUM =
+    // __MIX_CORE_AIC_RATION__ = 2) and each AIV's QUIT is sent by its
+    // KfcCommClient destructor at function exit. Entering the loop with
+    // tile_idx == total_tiles skips the WORK while keeping that exit path and
+    // the TQue alloc/free pairs below balanced.
+    //
+    // Minimal correct behaviour, not the fastest: splitting the tiles across
+    // the two sub-cores instead of idling one is a separate change, and it
+    // needs the `y` row disjointness argument redone per sub-core first.
+    // `% GetSubBlockNum()` IS LOAD-BEARING, not defensive.
+    //
+    // AscendC::GetSubBlockIdx() is the AIV's logical id across ALL AI Core
+    // groups -- with 10 groups at a 1:2 ratio it returns 0..19 -- while the
+    // id WITHIN the group is what "am I this AIC's first vector core" needs.
+    // (Matmul::GetSubBlockIdx() is the within-group one; the two are
+    // documented as 0,1,0,1,... versus 0,1,2,...,19.)
+    //
+    // Comparing the global id against 0 therefore happens to be right at
+    // block_dim == 1 and is WRONG for every larger grid: only the globally
+    // first AIV would drive its Cube and every other group's pair would idle,
+    // silently computing nothing. GetSubBlockNum() is the AIVs per logical AI
+    // Core, so the modulo recovers the within-group id at any grid size.
+    const bool drives_cube = (GetSubBlockIdx() % GetSubBlockNum()) == 0;
+
+    for (std::uint32_t tile_idx = drives_cube ? core_idx : total_tiles;
+         tile_idx < total_tiles; tile_idx += geom.block_dim) {
         ProcessTokenTile(
             geom, tile_idx,
             gate_weights_packed, gate_weight_scales,

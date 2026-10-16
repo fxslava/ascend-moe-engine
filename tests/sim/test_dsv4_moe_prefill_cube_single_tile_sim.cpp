@@ -101,23 +101,76 @@ static_assert(kTotalTokens % kMTile == 0u,
 // MIX_AIC_1_2: one AIC cluster holds 2 AIVs, so 2 is the minimum topology.
 constexpr std::uint32_t kSimAiv = 2;
 
-static_assert(kHidden % moe::kernels::arch35::kPrefillCubeKSub == 0u &&
-                  kHidden % moe::kernels::arch35::kPrefillCubeHSub == 0u &&
-                  kInter % moe::kernels::arch35::kPrefillCubeRSub == 0u &&
-                  kInter % moe::kernels::arch35::kPrefillCubeRSub2 == 0u,
+// ---------------------------------------------------------------------------
+// GEOMETRY: the axes' TRUE MINIMA, not the shared fixture's 512/512
+// ---------------------------------------------------------------------------
+// This driver overrides kSingleTileHidden/kSingleTileInter deliberately. The shared fixture uses
+// 512 on both axes, which at M_TILE = 16 is 48 sub-GEMMs for ONE token tile
+// (phase 1: inter/R_SUB * hidden/K_SUB * 2 = 32, phase 2: hidden/H_SUB *
+// inter/R_SUB2 = 16). MEASURED: that did not finish inside 2700 s of CAModel
+// wall time, reaching 1,610,000 cycles with zero faults -- about 596
+// simulated cycles per second of host time.
+//
+// 128 x 256 is the smallest shape the SCHEDULE admits, derived per axis:
+// hidden needs lcm(K_SUB 128, H_SUB 64) = 128, inter needs lcm(R_SUB 128,
+// R_SUB2 256) = 256. That is 6 sub-GEMMs -- phase 1: 2 * 1 * 2, phase 2:
+// 2 * 1 -- an 8x cut in Cube work.
+//
+// WHAT IS NOT GIVEN UP: the arithmetic. Every contraction still runs over its
+// WHOLE axis, so this is the real two-phase operator on a smaller problem and
+// the audited emu golden applies verbatim. That is the difference between
+// shrinking the AXES and capping the sub-GEMM LOOPS -- the latter would leave
+// phase 1 holding a partial sum of `act`, which is not the operator's answer
+// and could not be compared against this golden at all.
+//
+// WHAT IS GIVEN UP: hidden/K_SUB == 1, so the token prefetch ring never
+// ping-pongs here. It instead exercises the chunk_count == 1 edge of the
+// V_MTE2 handshake, where the prologue waits for nothing and DrainTokenRing
+// consumes exactly one token. The multi-chunk ring stays the 512-axis gate's
+// job.
+constexpr std::uint32_t kSingleTileHidden = 128;
+constexpr std::uint32_t kSingleTileInter  = 256;
+
+static_assert(kSingleTileHidden % moe::kernels::arch35::kPrefillCubeKSub == 0u &&
+                  kSingleTileHidden % moe::kernels::arch35::kPrefillCubeHSub == 0u &&
+                  kSingleTileInter % moe::kernels::arch35::kPrefillCubeRSub == 0u &&
+                  kSingleTileInter % moe::kernels::arch35::kPrefillCubeRSub2 == 0u,
               "the axes must be whole multiples of every sub-tile extent or "
               "MakeDsv4MoePrefillCubeTiling rejects the shape and this run "
               "never reaches the kernel");
+
+// The sub-GEMM census this run is expected to drive, stated so the cost of a
+// change to it is visible rather than discovered as a timeout.
+constexpr std::uint32_t kPhase1SubGemms =
+    (kSingleTileInter / moe::kernels::arch35::kPrefillCubeRSub) *
+    (kSingleTileHidden / moe::kernels::arch35::kPrefillCubeKSub) * 2u;
+constexpr std::uint32_t kPhase2SubGemms =
+    (kSingleTileHidden / moe::kernels::arch35::kPrefillCubeHSub) *
+    (kSingleTileInter / moe::kernels::arch35::kPrefillCubeRSub2);
+static_assert(kPhase1SubGemms + kPhase2SubGemms == 6u,
+              "the sub-GEMM count moved; re-derive the watchdog budget before "
+              "changing this, because the 512-axis shape's 48 sub-GEMMs did "
+              "not finish in 2700 s");
 
 constexpr float  kAbsTol      = 1.0e-2F;
 constexpr float  kRelTol      = 1.0e-2F;
 constexpr double kCosineFloor = 0.999;
 
-// Generous on purpose: it converts an unbalanced handshake from an infinite
-// wait into exit 3 with a name, and is not a performance threshold. The
-// measured dequant micro-run needed ~275 s almost entirely in simulator
-// bring-up, and this run adds a KfcServer and two Matmul objects to that.
-constexpr int kSingleTileBudgetSeconds = 2700;
+// SIZED FROM A MEASUREMENT, and it is a TIME BOX, not a deadlock detector.
+//
+// The 512-axis shape ran 2700 s and reached 1,610,000 cycles: ~596 simulated
+// cycles per second of host time. This shape has 1/8 the Cube work, so the
+// same schedule should land near 200,000 cycles, or ~340 s, on top of the
+// fixed simulator bring-up the dequant micro-gate measured at ~275 s. 900 s
+// therefore carries roughly a 1.5x margin over the expected total.
+//
+// WHAT TRIPPING IT DOES AND DOES NOT MEAN. This is host WALL-CLOCK: it cannot
+// tell a deadlock from a slow simulation, because a CAModel keeps advancing
+// cycles while every core sits blocked on a flag. Exceeding it means "did not
+// finish in the budget" and nothing more. To call a hang, compare the cycle
+// count at two trip points and show it is not advancing, or show a WaitFlag
+// with no matching SetFlag -- the budget alone is not evidence of either.
+constexpr int kSingleTileBudgetSeconds = 900;
 
 struct Spread {
   double rms = 0.0, stddev = 0.0, min = 0.0, max = 0.0;
@@ -234,19 +287,19 @@ int RunSingleTile() {
       "(MIX_AIC_1_2)\n"
       "seed 0x%llX  hidden %u  inter %u  experts %u  tokens %u  m_tile %u  "
       "tiles 1  aiv %u\n",
-      static_cast<unsigned long long>(kSeed), kHidden, kInter, kExperts,
+      static_cast<unsigned long long>(kSeed), kSingleTileHidden, kSingleTileInter, kExperts,
       kTotalTokens, kMTile, kSimAiv);
 
   const DumpCensus before = ExceptionDumps();
 
   try {
     std::mt19937_64 rng(kSeed);
-    const ExpertBank w1 = MakeBank(kInter, kHidden, kExperts, rng);
-    const ExpertBank w3 = MakeBank(kInter, kHidden, kExperts, rng);
-    const ExpertBank w2 = MakeBank(kHidden, kInter, kExperts, rng);
+    const ExpertBank w1 = MakeBank(kSingleTileInter, kSingleTileHidden, kExperts, rng);
+    const ExpertBank w3 = MakeBank(kSingleTileInter, kSingleTileHidden, kExperts, rng);
+    const ExpertBank w2 = MakeBank(kSingleTileHidden, kSingleTileInter, kExperts, rng);
 
     const std::size_t y_floats =
-        static_cast<std::size_t>(kTotalTokens) * kHidden;
+        static_cast<std::size_t>(kTotalTokens) * kSingleTileHidden;
     std::vector<float> x(y_floats);
     std::normal_distribution<float> draw(0.0F, 1.0F);
     for (float& v : x) v = draw(rng);
@@ -279,7 +332,34 @@ int RunSingleTile() {
     DeviceBuffer routeDev(route.size() * sizeof(std::int32_t));
     CopyToDevice(routeDev, route);
 
-    auto yDev = MakeGuardedOutput(y_floats);
+    // THREE-ZONE OUTPUT: [pre 4 KiB canary][output][post 4 KiB canary].
+    //
+    // The shared fixture's MakeGuardedOutput poisons a 256-byte tail only,
+    // which catches a store that runs off the END of y. It cannot catch one
+    // that lands BEFORE the base -- a negative row index, or a GM base that is
+    // short by a sub-tile -- because there is nothing poisoned there to
+    // notice. Phase 2 stores at `token_row_start * hidden + hidden_base`, so
+    // an index computed one sub-tile low writes below y and the post-only
+    // guard reports success.
+    //
+    // 4 KiB per band rather than 256 B: the phase 2 burst is `valid_rows`
+    // blocks of H_SUB floats with a per-row stride, so a mis-strided copy can
+    // skip well past a 256-byte band and land in live memory with the guard
+    // intact. 4 KiB covers 16 rows x 64 floats, which is one whole phase 2
+    // output sub-tile.
+    constexpr std::size_t kCanaryBandBytes  = 4096;
+    constexpr std::size_t kCanaryBandFloats = kCanaryBandBytes / sizeof(float);
+    const std::size_t y_total_floats = y_floats + 2u * kCanaryBandFloats;
+    DeviceBuffer yDev(y_total_floats * sizeof(float));
+    {
+      const std::vector<float> poison(y_total_floats, CanaryFloat());
+      CopyToDevice(yDev, poison);
+    }
+    // The kernel is handed the MIDDLE zone, so the pre band sits at negative
+    // offsets from its y base exactly as a real underrun would find it.
+    float* const y_device = static_cast<float*>(yDev.get()) + kCanaryBandFloats;
+    std::printf("  output: [pre %zu B 0x5A][%zu floats][post %zu B 0x5A]\n",
+                kCanaryBandBytes, y_floats, kCanaryBandBytes);
 
     // KFC reserve, zeroed, then 0x5A past it. The reserve is the larger of
     // what the operator declares and 64 KiB per launched AIV, so a sub-core
@@ -287,7 +367,7 @@ int RunSingleTile() {
     // it is what turns a spill into a named failure instead of a silent
     // corruption of whatever GM happened to follow.
     const std::uint64_t declared =
-        Dsv4MoePrefillCubeWorkspaceBytes(kTotalTokens, kHidden, kInter);
+        Dsv4MoePrefillCubeWorkspaceBytes(kTotalTokens, kSingleTileHidden, kSingleTileInter);
     const std::uint64_t kfc_reserve = std::max<std::uint64_t>(
         declared, static_cast<std::uint64_t>(kSimAiv) * 64ull * 1024ull);
     constexpr std::uint64_t kProbeBytes = 8ull << 20;
@@ -362,8 +442,8 @@ int RunSingleTile() {
         static_cast<const E8M0*>(w3s.get()),
         static_cast<const Mxfp4Pair*>(w2p.get()),
         static_cast<const E8M0*>(w2s.get()),
-        static_cast<const std::int32_t*>(routeDev.get()), kHidden, kInter,
-        kExperts, kTotalTokens, kSimAiv, static_cast<float*>(yDev->get()),
+        static_cast<const std::int32_t*>(routeDev.get()), kSingleTileHidden, kSingleTileInter,
+        kExperts, kTotalTokens, kSimAiv, y_device,
         wsDev.get(), /*sample_cap=*/0u, &tiling, runtime.stream());
     const auto finished = std::chrono::steady_clock::now();
     watchdog.Disarm();
@@ -381,12 +461,35 @@ int RunSingleTile() {
     }
 
     // ------------------------------------------------------------ inspection
-    RequireGuardIntact(*yDev, y_floats, "single tile");
-    std::printf("  guard band: intact (%zu floats past the %zu-float output)\n",
-                kGuardFloats, y_floats);
+    // Read the WHOLE allocation once, so both bands and the payload come from
+    // the same snapshot and a late store cannot slip between two copies.
+    std::vector<float> y_all(y_total_floats, 0.0F);
+    CopyFromDevice(y_all, yDev);
 
-    std::vector<float> y(y_floats, 0.0F);
-    CopyFromDevice(y, *yDev);
+    for (std::size_t i = 0; i < kCanaryBandFloats; ++i) {
+      if (!IsCanary(y_all[i])) {
+        Fail("PRE-canary band corrupted at float -" +
+             std::to_string(kCanaryBandFloats - i) + " below the y base: the "
+             "kernel stored BELOW its output. Check the phase 2 y row index "
+             "and the GM base passed to tokens_out.");
+      }
+    }
+    for (std::size_t i = 0; i < kCanaryBandFloats; ++i) {
+      const std::size_t at = kCanaryBandFloats + y_floats + i;
+      if (!IsCanary(y_all[at])) {
+        Fail("POST-canary band corrupted at float +" + std::to_string(i) +
+             " past the " + std::to_string(y_floats) +
+             "-float output: the kernel stored past its output. Check the "
+             "phase 2 tile ring's y row index.");
+      }
+    }
+    std::printf("  canary bands: both intact (%zu floats each side)\n",
+                kCanaryBandFloats);
+
+    const std::vector<float> y(y_all.begin() +
+                                   static_cast<std::ptrdiff_t>(kCanaryBandFloats),
+                               y_all.begin() + static_cast<std::ptrdiff_t>(
+                                                   kCanaryBandFloats + y_floats));
 
     const Occupancy occ = MeasureOccupancy(y);
     std::printf("  occupancy: %zu live, %zu exactly zero, %zu STILL CANARY "
@@ -421,8 +524,8 @@ int RunSingleTile() {
     const RowDiff diff = Compare16(y, want);
     std::printf("  diff: max abs %.6e at [%zu] (row %zu col %zu), max rel "
                 "%.6e, cosine %.8f\n",
-                diff.max_abs, diff.worst, diff.worst / kHidden,
-                diff.worst % kHidden, diff.max_rel, diff.cosine);
+                diff.max_abs, diff.worst, diff.worst / kSingleTileHidden,
+                diff.worst % kSingleTileHidden, diff.max_rel, diff.cosine);
     if (!diff.finite) Fail("the device produced a non-finite value");
     if (!diff.within) {
       Fail("max abs " + std::to_string(diff.max_abs) + " / max rel " +
@@ -449,7 +552,7 @@ int RunSingleTile() {
         "executes on the dav-3510 CAModel in MIX_AIC_1_2 at block_dim 1 and "
         "matches the two-phase Cube golden inside %g + %g*|want| with cosine "
         "%.8f >= %g. Wall %.1f s. Never run on hardware.\n",
-        kTotalTokens, kHidden, static_cast<int>(kExpert),
+        kTotalTokens, kSingleTileHidden, static_cast<int>(kExpert),
         static_cast<double>(kAbsTol), static_cast<double>(kRelTol),
         diff.cosine, kCosineFloor, seconds);
     return 0;

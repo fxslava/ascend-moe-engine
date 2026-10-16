@@ -199,15 +199,35 @@ inline constexpr std::uint32_t kPrefillCubeAivMax = 256;
 // Dsv4MoeBlockGeometryAdmissible: BiSheng partitions functions into __host__
 // and __aicore__ and will not let one definition serve both.
 //
-// The test override admits any multiple of 512 on both axes. 512 is the
-// smallest value that is a whole multiple of every sub-tile extent above
-// (R_SUB 128, K_SUB 128, H_SUB 64, R_SUB2 256), which is what keeps the
-// kernel's sub-GEMM loops square on the reduced geometries the CAModel gate
-// can afford to simulate.
+// The test override admits the TRUE PER-AXIS MINIMA, which are not the same
+// number on the two axes:
+//
+//   hidden  is divided by K_SUB (128, phase 1 contraction) and H_SUB (64,
+//           phase 2 output), so it needs lcm(128, 64) = 128.
+//   inter   is divided by R_SUB (128, phase 1 output) and R_SUB2 (256, phase 2
+//           contraction), so it needs lcm(128, 256) = 256.
+//
+// It previously demanded a multiple of 512 on BOTH axes. 512 is the smallest
+// number that is a whole multiple of EVERY extent, so it is what one uniform
+// bound has to be -- but a uniform bound is stricter than the schedule, and on
+// a cycle-accurate simulator the difference is the whole run. At 512/512 one
+// token tile is 48 sub-GEMMs (phase 1: inter/R_SUB * hidden/K_SUB * 2 = 32;
+// phase 2: hidden/H_SUB * inter/R_SUB2 = 16), which did not finish inside a
+// 2700 s CAModel budget. At 128/256 it is 6, an 8x cut, and the arithmetic is
+// UNCHANGED -- every contraction still runs to completion over its whole axis,
+// so the emu golden applies verbatim rather than needing a partial-sum
+// variant.
+//
+// Every divisibility and burst-alignment condition in
+// MakeDsv4MoePrefillCubeTiling was checked against 128/256 before this was
+// relaxed, including the strided-burst ones that bring `hidden` and `inter`
+// themselves in: (128-128)*4, (128-64)*4, (128-128)/2 and (256-256)/2 are all
+// whole numbers of 32-byte blocks. Widening only ADMITS more, so no geometry
+// that was accepted before is rejected now.
 #if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
 #define MOE_DSV4_PREFILL_CUBE_ADMISSIBLE(hidden, inter)                      \
-  ((hidden) >= 512u && (inter) >= 512u && (hidden) % 512u == 0u &&            \
-   (inter) % 512u == 0u)
+  ((hidden) >= 128u && (inter) >= 256u && (hidden) % 128u == 0u &&            \
+   (inter) % 256u == 0u)
 #else
 #define MOE_DSV4_PREFILL_CUBE_ADMISSIBLE(hidden, inter)                      \
   ((hidden) == 4096u && (inter) == 2048u)
