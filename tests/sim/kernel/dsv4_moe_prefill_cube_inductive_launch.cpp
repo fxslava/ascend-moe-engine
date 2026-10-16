@@ -20,12 +20,11 @@
 //      reproducible value -- a core count that moved with the host's SKU would
 //      make both the run's cost and its coverage irreproducible. The
 //      production wrapper queries; this one is told.
-//   2. `sample_cap_gm` points at one uint32 in GM that caps how many of the
-//      sampled tiles run. The CAModel cost model is MEASURED, never derived
+//   2. A simulation-only uint32 follows the production tiling POD in its
+//      staged GM allocation and caps how many sampled tiles run. The CAModel cost model is MEASURED, never derived
 //      (three predictions for these suites have been wrong), so the driver
 //      needs to be able to run 1 and 2 tiles to measure this gate's own fixed
-//      cost. It is a separate operand rather than a tiling field because
-//      Dsv4MoePrefillCubeTilingData's 72-byte layout is public ABI.
+//      cost. The production 72-byte tiling ABI remains unchanged.
 //
 // Everything downstream of the builder is identical, so the geometry
 // validation under test is production's. The wrapper owns validation, the
@@ -45,7 +44,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     GM_ADDR x_tokens, GM_ADDR w1_packed, GM_ADDR w1_scale, GM_ADDR w3_packed,
     GM_ADDR w3_scale, GM_ADDR w2_packed, GM_ADDR w2_scale,
     GM_ADDR token_to_expert, GM_ADDR y_tokens, GM_ADDR workspace,
-    GM_ADDR sample_cap, GM_ADDR tiling);
+    GM_ADDR tiling);
 
 constexpr const char* kSimOp = "dsv4_moe_prefill_cube_inductive_sim";
 
@@ -58,7 +57,7 @@ Status LaunchDsv4MoePrefillCubeInductiveSim(
     const E8M0* w2_scale_gm, const std::int32_t* token_to_expert_gm,
     std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
     std::uint32_t total_tokens, std::uint32_t aiv_count, float* y_tokens_gm,
-    void* workspace_gm, const std::uint32_t* sample_cap_gm,
+    void* workspace_gm, std::uint32_t sample_cap,
     Dsv4MoePrefillCubeTilingData* tiling_out, aclrtStream stream) {
   if (x_tokens_gm == nullptr || w1_packed_gm == nullptr ||
       w1_scale_gm == nullptr || w3_packed_gm == nullptr ||
@@ -86,8 +85,13 @@ Status LaunchDsv4MoePrefillCubeInductiveSim(
     *tiling_out = tiling;  // so the driver can print and mirror the grid
   }
 
+  struct InductiveTiling {
+    Dsv4MoePrefillCubeTilingData production;
+    std::uint32_t sample_cap;
+  };
+  const InductiveTiling inductive_tiling{tiling, sample_cap};
   detail::TilingStaging staging;
-  const Status staged = staging.Stage(kSimOp, &tiling, sizeof(tiling));
+  const Status staged = staging.Stage(kSimOp, &inductive_tiling, sizeof(inductive_tiling));
   if (staged != Status::success) {
     return staged;
   }
@@ -102,7 +106,7 @@ Status LaunchDsv4MoePrefillCubeInductiveSim(
       detail::Gm(w3_scale_gm), detail::Gm(w2_packed_gm),
       detail::Gm(w2_scale_gm), detail::Gm(token_to_expert_gm),
       detail::Gm(y_tokens_gm), detail::Gm(workspace_gm),
-      detail::Gm(sample_cap_gm), detail::Gm(staging.get()));
+      detail::Gm(staging.get()));
 
   return detail::FinishLaunch(kSimOp, stream);
 }

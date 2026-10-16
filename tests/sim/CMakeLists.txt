@@ -601,6 +601,58 @@ if(ENABLE_DSV4_CAMODEL_TEST)
                         "LINKER:-rpath-link,${_dir}")
   endforeach()
 
+  # Standalone vector conversion check, without KFC or any GEMM work.
+  set(_dsv4_dequant_unit_object
+      "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/dsv4_moe_prefill_cube_dequant_unit.dav-3510.o")
+  add_custom_command(
+    OUTPUT "${_dsv4_dequant_unit_object}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+            "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+            "${ASCEND_HOME_PATH}/bin/bisheng"
+            -O2 --npu-arch=dav-3510 --asc-aicore-lang
+            "-I${CMAKE_SOURCE_DIR}/include"
+            "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+            "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+            "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+            "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+            "-I${ASCEND_HOME_PATH}/include"
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_dequant_unit.cpp"
+            -o "${_dsv4_dequant_unit_object}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_dequant_unit.cpp"
+            "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+    VERBATIM)
+  set_source_files_properties("${_dsv4_dequant_unit_object}"
+                              PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  list(GET _dsv4_prefill_cube_sim_objects 3 _dsv4_dequant_launch_common_object)
+  add_executable(test_dsv4_moe_prefill_cube_dequant_unit
+    test_dsv4_moe_prefill_cube_dequant_unit.cpp "${_dsv4_dequant_unit_object}"
+    "${_dsv4_dequant_launch_common_object}")
+  add_dependencies(test_dsv4_moe_prefill_cube_dequant_unit
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_dequant_unit PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include")
+  target_compile_options(test_dsv4_moe_prefill_cube_dequant_unit PRIVATE -Wall -Wextra)
+  target_link_libraries(test_dsv4_moe_prefill_cube_dequant_unit PRIVATE
+    moe_emu Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES})
+  set_target_properties(test_dsv4_moe_prefill_cube_dequant_unit PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_dequant_unit PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
   # ---------------------------------------------------------------------
   # THIS GATE DOES NOT PASS YET, AND THAT IS THE POINT OF REGISTERING IT.
   # ---------------------------------------------------------------------

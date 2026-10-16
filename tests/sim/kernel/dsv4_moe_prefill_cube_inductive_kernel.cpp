@@ -29,8 +29,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     GM_ADDR up_weights_packed,   GM_ADDR up_weight_scales,
     GM_ADDR down_weights_packed, GM_ADDR down_weight_scales,
     GM_ADDR token_to_expert_lut, GM_ADDR tokens_out,
-    GM_ADDR shared_workspace,    GM_ADDR tiling_config,
-    GM_ADDR sample_cap_ptr) {
+    GM_ADDR shared_workspace,    GM_ADDR tiling_config) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
 
     if (unlikely(tiling_config == nullptr || shared_workspace == nullptr)) {
@@ -43,13 +42,10 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     }
     const Geometry geom = LoadGeometry(tiling_data);
 
-    const std::uint32_t sub_core_idx  = static_cast<std::uint32_t>(GetSubBlockIdx());
-    GM_ADDR             aiv_workspace = Bytes(shared_workspace) + sub_core_idx * kKfcWorkspaceSlotBytes;
-
     TPipe pipe;
     GateUpMatmul matmul_gate_up;
     DownMatmul   matmul_down;
-    REGIST_MATMUL_OBJ(&pipe, aiv_workspace, matmul_gate_up, matmul_down);
+    REGIST_MATMUL_OBJ(&pipe, shared_workspace, matmul_gate_up, matmul_down);
 
     GlobalTensor<float> tokens_in_gm;
     GlobalTensor<float> tokens_out_gm;
@@ -119,11 +115,10 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     std::uint32_t sample_indices[kMaxSamples] = {};
     std::uint32_t sample_count = BuildTileSampleSet(total_tiles, kRingDepth, sample_indices);
 
-    if (sample_cap_ptr != nullptr) {
-        const std::uint32_t cap = *reinterpret_cast<const __gm__ std::uint32_t*>(sample_cap_ptr);
-        if (cap != 0u && cap < sample_count) {
-            sample_count = cap;
-        }
+    const std::uint32_t cap = *reinterpret_cast<const __gm__ std::uint32_t*>(
+        Bytes(tiling_config) + sizeof(Dsv4MoePrefillCubeTilingData));
+    if (cap != 0u && cap < sample_count) {
+        sample_count = cap;
     }
 
     const std::uint32_t core_idx = static_cast<std::uint32_t>(GetBlockIdx());

@@ -64,7 +64,7 @@ Status LaunchDsv4MoePrefillCubeInductiveSim(
     const E8M0* w2_scale_gm, const std::int32_t* token_to_expert_gm,
     std::uint32_t hidden, std::uint32_t inter, std::uint32_t num_experts,
     std::uint32_t total_tokens, std::uint32_t aiv_count, float* y_tokens_gm,
-    void* workspace_gm, const std::uint32_t* sample_cap_gm,
+    void* workspace_gm, std::uint32_t sample_cap,
     Dsv4MoePrefillCubeTilingData* tiling_out, aclrtStream stream);
 }  // namespace moe::kernels::arch35
 
@@ -313,12 +313,6 @@ LaunchOutcome RunOne(const char* label, Runtime& runtime,
     CopyToDevice(wsDev, ws_init);
   }
 
-  DeviceBuffer capDev(sizeof(std::uint32_t));
-  {
-    const std::vector<std::uint32_t> cap{sample_cap};
-    CopyToDevice(capDev, cap);
-  }
-
   Dsv4MoePrefillCubeTilingData tiling{};
   std::printf("\n--- %s ---\n", label);
   std::printf("  aiv_count %u, sample cap %u (0 = all of S)\n", aiv_count, sample_cap);
@@ -335,8 +329,8 @@ LaunchOutcome RunOne(const char* label, Runtime& runtime,
       static_cast<const E8M0*>(w2s.get()),
       static_cast<const std::int32_t*>(routeDev.get()), kHidden, kInter,
       kExperts, kTotalTokens, aiv_count,
-      static_cast<float*>(yDev->get()), wsDev.get(),
-      static_cast<const std::uint32_t*>(capDev.get()), &tiling,
+       static_cast<float*>(yDev->get()), wsDev.get(),
+       sample_cap, &tiling,
       runtime.stream());
   const auto finished = std::chrono::steady_clock::now();
   watchdog.Disarm();
@@ -406,6 +400,12 @@ LaunchOutcome RunOne(const char* label, Runtime& runtime,
                 spread.rms, spread.stddev, spread.min, spread.max);
   }
 
+  for (std::size_t i = 0; i < 4; ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &y[i], sizeof(bits));
+    std::printf("  tile 0 output[%zu]: actual %.9g (0x%08x), want %.9g\n",
+                i, y[i], bits, want[i]);
+  }
   const RowDiff diff = CompareOnSamples(y, want, samples, kHidden, kMTile, kTotalTokens);
   std::printf("  diff on S: max abs %.6e, max rel %.6e, cosine %.8f\n",
               diff.max_abs, diff.max_rel, diff.cosine);

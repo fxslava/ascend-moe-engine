@@ -29,10 +29,10 @@
 // - Cube/Vector Co-Design: REGIST_MATMUL_OBJ instantiates an AscendC::KfcServer. On AIC, the
 //   macro executes server.Run() and returns immediately. On AIV, execution falls through to drive
 //   the pipeline, issue GEMM requests, and perform vector SwiGLU / dequantization.
-// - KFC Mailbox Partitioning: To prevent command queue corruption between the two paired AIVs
-//   sharing a single AIC, the GM workspace is partitioned by sub-core index:
-//       aiv_workspace = shared_workspace + GetSubBlockIdx() * kKfcWorkspaceSlotBytes (64 KB).
-// - Core Grid Distribution: Block indexing over 64 AIVs (core_idx = GetBlockIdx(), grid stride block_dim)
+// - KFC Mailbox Partitioning: The Matmul framework indexes paired AIV
+//   mailboxes from the caller-provided shared workspace.
+// - Core Grid Distribution: GetBlockIdx() is the absolute dispatched core index;
+//   GetSubBlockIdx() identifies the paired vector sub-core for KFC.
 //   saturates 100% of the available vector and matrix compute units on the chip.
 //
 // 2. MATHEMATICAL MODEL & ASYMMETRIC ACTIVATION CLAMP:
@@ -106,7 +106,6 @@ static_assert(kCubeHSub  == kPrefillCubeHSub,      "phase 2 hidden output sub-ti
 static_assert(kCubeRSub2 == kPrefillCubeRSub2,     "phase 2 inter contraction sub-tile disagrees");
 static_assert(kCubeGroup == kPrefillCubeGroupSize, "MXFP4 group size disagrees");
 
-constexpr std::uint32_t kKfcWorkspaceSlotBytes = 64u * 1024u;
 constexpr int           kEvTokensPing          = 2;
 constexpr int           kEvTokensPong          = 3;
 
@@ -244,9 +243,9 @@ __aicore__ inline void AsyncLoadWeightsSubTile(
     SetFlag<HardEvent::MTE2_V>(kEvCubeMte2ToV);
 }
 
-__aicore__ inline void DequantSubTileToL1(
+__aicore__ inline void DequantSubTileVector(
     std::uint32_t row_count, std::uint32_t col_count,
-    const Buffers& buf, const LocalTensor<bfloat16_t>& l1_weight_slot) {
+    const Buffers& buf) {
     const std::uint32_t groups_per_row = col_count / kCubeGroup;
     const std::uint32_t total_elements = row_count * col_count;
 
@@ -269,13 +268,19 @@ __aicore__ inline void DequantSubTileToL1(
         ShiftLeft(row_scales_u16, row_scales_u16, static_cast<uint16_t>(7), 16);
         PipeBarrier<PIPE_V>();
 
-        Broadcast<bfloat16_t, 2>(buf.scale_plane[out_base], row_scales_bf16, dst_shape, src_shape, nullptr);
+        Broadcast<bfloat16_t, 2, 1>(buf.scale_plane[out_base], row_scales_bf16, dst_shape, src_shape);
     }
     PipeBarrier<PIPE_V>();
 
     Mul(buf.weight_expanded, buf.weight_expanded, buf.scale_plane, total_elements);
     PipeBarrier<PIPE_V>();
+}
 
+__aicore__ inline void DequantSubTileToL1(
+    std::uint32_t row_count, std::uint32_t col_count,
+    const Buffers& buf, const LocalTensor<bfloat16_t>& l1_weight_slot) {
+    DequantSubTileVector(row_count, col_count, buf);
+    const std::uint32_t total_elements = row_count * col_count;
     SetFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
     DataCopy(l1_weight_slot, buf.weight_expanded, total_elements);
@@ -502,13 +507,10 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
     }
     const Geometry geom = LoadGeometry(tiling_data);
 
-    const std::uint32_t sub_core_idx  = static_cast<std::uint32_t>(GetSubBlockIdx());
-    GM_ADDR             aiv_workspace = Bytes(shared_workspace) + sub_core_idx * kKfcWorkspaceSlotBytes;
-
     TPipe pipe;
     GateUpMatmul matmul_gate_up;
     DownMatmul   matmul_down;
-    REGIST_MATMUL_OBJ(&pipe, aiv_workspace, matmul_gate_up, matmul_down);
+    REGIST_MATMUL_OBJ(&pipe, shared_workspace, matmul_gate_up, matmul_down);
 
     GlobalTensor<float> tokens_in_gm;
     GlobalTensor<float> tokens_out_gm;
