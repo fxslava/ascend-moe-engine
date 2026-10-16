@@ -724,19 +724,24 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   endforeach()
 
   # ---------------------------------------------------------------------
-  # STEP 1 OF THE INDUCTIVE ASSEMBLY: DequantSubTileVector, alone
+  # THE INDUCTIVE ASSEMBLY GATE: one routine of the Cube prefill at a time
   # ---------------------------------------------------------------------
-  # Same routine as the unit check above, but this is the GATE: it runs the
-  # primary [16, 64] sub-tile at the operator's forced M_TILE, poisons three
-  # canary bands (output guard tail, output tile, a UB sentinel behind
-  # scale_temporary), audits its own golden on the host before touching the
-  # device, and reports a named refusal through a status word instead of the
-  # zeroed output an early `return` would leave behind.
+  # Step 1  DequantSubTileVector                        MXFP4/E8M0 in UB
+  # Step 2  AsyncLoadTokensChunk + PrepareTokensChunk   token prefetch ring
+  #
+  # Every case poisons its canary bands (output guard tail, output tile, and a
+  # UB sentinel behind the buffers under test), audits its golden on the host
+  # before touching the device, and reports a named refusal through a status
+  # word instead of the zeroed output an early `return` would leave behind.
   #
   # It is AIV-only on purpose: no REGIST_MATMUL_OBJ, no KfcServer, no Cube. The
   # end-to-end gate below has never completed a trip and floods pem_lsu with
   # small-offset faults; a gate that shares none of that bring-up is what makes
-  # "the conversion is not the fault site" a statement rather than a guess.
+  # "these routines are not the fault site" a statement rather than a guess.
+  #
+  # ONE BINARY FOR ALL STEPS, and the reason is the measurement below: the wall
+  # time is dominated by simulator bring-up, not by the launches. Add a shape or
+  # a routine here; do not add a second executable.
   set(_dsv4_dequant_micro_object
       "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/test_dequant_micro_kernel.dav-3510.o")
   add_custom_command(
@@ -792,24 +797,24 @@ if(ENABLE_DSV4_CAMODEL_TEST)
                         "LINKER:-rpath-link,${_dir}")
   endforeach()
 
-  # MEASURED, 2026-10-16, first completed execution of any part of
-  # dsv4_moe_prefill_cube on anything: 274.6 s and 290.6 s wall over two runs
-  # of all three sub-tiles, 16x64 then 128x128 then 64x256, every word
-  # bit-exact both times and no pem_lsu diagnostic in either.
+  # MEASURED on this workstation, 2026-10-16.
   #
-  # Nearly all of that is FIXED cost -- simulator bring-up, binary load and
-  # teardown -- because the three launches together are only ~37 K simulated
-  # cycles. The practical consequence for whoever extends this: adding another
-  # sub-tile shape to this binary is close to free, while adding a second
-  # micro gate costs another ~290 s. Put Step 2 and Step 3 routine checks in
-  # here rather than in new executables.
+  #   Step 1 only, 3 sub-tiles          274.6 s / 290.6 s over two runs
+  #   Step 1 + Step 2, 6 launches       469.6 s
   #
-  # 900 s is ~3.1x the slower measurement. Generous enough for a loaded host,
-  # tight enough that a hang is a failure within minutes instead of hours.
+  # Every word bit-exact in each, and no pem_lsu diagnostic in any of them.
+  # Nearly all of the wall time is FIXED cost -- simulator bring-up, binary load
+  # and teardown -- because the launches themselves are tens of thousands of
+  # cycles. That is why all steps share this one binary: another shape here is
+  # nearly free, another executable is another ~300 s.
+  #
+  # 1500 s is ~3.2x the current measurement. Re-measure when a step is added
+  # rather than letting the budget drift into the range where a hang sits
+  # undetected for half an hour.
   add_test(NAME Dsv4PrefillCubeDequantMicroSim COMMAND test_dequant_micro_sim)
   set_tests_properties(Dsv4PrefillCubeDequantMicroSim PROPERTIES
-    LABELS "sim;arch35;camodel;functional;vector;dequant"
-    TIMEOUT 900
+    LABELS "sim;arch35;camodel;functional;vector;dequant;prefetch"
+    TIMEOUT 1500
     ENVIRONMENT
       "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
   )

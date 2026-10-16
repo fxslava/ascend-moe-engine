@@ -1,0 +1,26 @@
+# Line endings.
+#
+# This checkout runs with core.autocrlf=true, so without a rule here git hands
+# every text file to the working tree with CRLF. For sources that is harmless.
+# For the shell scripts it is not: they are run by WSL bash, and a `\r` on the
+# shebang line makes the kernel pick /bin/sh instead of bash, so the script
+# fails with "set: pipefail: invalid option name" followed by a syntax error at
+# end of file -- a failure that names neither the cause nor the file's encoding.
+#
+# `scripts/device_compile_kernels.sh` is the project's BiSheng dav-3510 compile
+# gate (CLAUDE.md section 5.1) and `scripts/verify_npu_build.sh` is the NPU
+# build gate (section 5.3). Both are documented to be invoked as
+# `wsl -d Ubuntu-22.04 -- bash /mnt/c/ascend-moe-engine/scripts/<name>.sh`, so
+# they have to survive a Windows checkout with LF intact.
+*.sh      text eol=lf
+*.bash    text eol=lf
+configure text eol=lf
+
+# CMake drives those same scripts and is read by WSL tooling as well.
+*.cmake        text eol=lf
+CMakeLists.txt text eol=lf
+
+# Simulator and driver output that is regenerated on every camodel run; see the
+# .gitignore entries for why none of it is tracked.
+*.dump binary
+*.bin  binary

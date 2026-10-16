@@ -107,6 +107,11 @@ static_assert(kCubeHSub  == kPrefillCubeHSub,      "phase 2 hidden output sub-ti
 static_assert(kCubeRSub2 == kPrefillCubeRSub2,     "phase 2 inter contraction sub-tile disagrees");
 static_assert(kCubeGroup == kPrefillCubeGroupSize, "MXFP4 group size disagrees");
 
+// The token prefetch ring. Two slots, two event ids -- and each id carries TWO flags, because a
+// flag is keyed by the (srcPipe, dstPipe, eventID) triple: `MTE2_V` id 2 ("ping is full") and
+// `V_MTE2` id 2 ("ping is free") are distinct hardware flags. That is what lets a correct two-way
+// handshake fit the four event ids arch35 provides, all of which this operator already spends.
+constexpr std::uint32_t kTokenRingSlots        = 2;
 constexpr int           kEvTokensPing          = 2;
 constexpr int           kEvTokensPong          = 3;
 
@@ -291,10 +296,36 @@ __aicore__ inline void DequantSubTileToL1(
     WaitFlag<HardEvent::MTE3_V>(kEvCubeMte3ToV);
 }
 
+// THE TOKEN RING NEEDS EDGES IN BOTH DIRECTIONS.
+//
+// `MTE2_V` says "the slot is full, the Vector may read it". That alone is not a double buffer: it
+// leaves the other direction unstated, and the other direction is what stops MTE2 from refilling a
+// slot the Vector has not finished reading. With two slots and three or more chunks, chunk k+1 is
+// loaded into the slot chunk k-1 is still being cast out of, and nothing orders the two.
+//
+// OBSERVED, 2026-10-16, dav-3510 CAModel, `Dsv4PrefillCubeDequantMicroSim` at hidden = 512: chunk 0
+// came back holding CHUNK 2's values, which is exactly that race resolving the wrong way -- the
+// MTE2 burst for chunk 2 landed in the ping slot before the Cast of chunk 0 had read it. Four
+// chunks is the smallest grid that can show it (a two-chunk run reuses no slot and passed), and the
+// corruption is silent: no fault, no flag, plausible numbers from the wrong chunk.
+//
+// So `V_MTE2` carries the matching buffer-free token: `PrepareTokensChunk` sets it once it has
+// consumed a slot, and `AsyncLoadTokensChunk` waits for it before refilling one. The event id is
+// the slot's own -- flags are keyed by the (srcPipe, dstPipe, eventID) triple, so `V_MTE2` id 2 and
+// `MTE2_V` id 2 are different flags and the ring still costs only the two ids it already spent.
+//
+// `slot_was_consumed` is the caller's statement that this slot has been cast out of before, so
+// there is a token to wait for. It is false for the first load into each slot, where the edge
+// starts empty; waiting there would hang rather than synchronize. The caller must then DRAIN the
+// tokens the last chunks leave outstanding -- see `DrainTokenRing` and its use per `inter_base`,
+// because a leaked flag outlives the launch and corrupts the next one.
 __aicore__ inline void AsyncLoadTokensChunk(
     const GlobalTensor<float>& tokens_in_gm, std::uint32_t token_row_start, std::uint32_t hidden_base,
     std::uint32_t valid_rows, const Geometry& geom,
-    const LocalTensor<float>& dst_tensor, int event_id) {
+    const LocalTensor<float>& dst_tensor, int event_id, bool slot_was_consumed) {
+    if (slot_was_consumed) {
+        WaitFlag<HardEvent::V_MTE2>(event_id);
+    }
     DataCopyParams burst_params;
     burst_params.blockCount = static_cast<std::uint16_t>(valid_rows);
     burst_params.blockLen   = static_cast<std::uint16_t>((geom.hidden_sub_fwd * 4u) / 32u);
@@ -310,6 +341,25 @@ __aicore__ inline void PrepareTokensChunk(
     WaitFlag<HardEvent::MTE2_V>(event_id);
     Cast(tokens_sub_bf16, tokens_f32, RoundMode::CAST_RINT, valid_rows * hidden_sub_fwd);
     PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::V_MTE2>(event_id);
+}
+
+// Consumes the buffer-free tokens the last chunks leave outstanding, so none survives into the next
+// `inter_base` pass or the next launch.
+//
+// The count is exactly one per slot that was cast out of, and it does NOT depend on the parity of
+// the chunk count. Per slot: a token is set once per chunk that occupied it, and consumed once per
+// REFILL of it, and a slot is refilled for every chunk it holds except the first -- so each slot
+// ends one token up, whichever slot the last chunk happened to land in. Clamped to the chunk count
+// because a single-chunk pass never occupies the second slot, and draining it would wait forever on
+// a token nothing set.
+__aicore__ inline void DrainTokenRing(std::uint32_t chunk_count) {
+    if (chunk_count >= 1u) {
+        WaitFlag<HardEvent::V_MTE2>(kEvTokensPing);
+    }
+    if (chunk_count >= 2u) {
+        WaitFlag<HardEvent::V_MTE2>(kEvTokensPong);
+    }
 }
 
 __aicore__ inline void RunSubGemmAccumulate(
@@ -422,20 +472,25 @@ __aicore__ inline void ProcessTokenTile(
         Duplicate(buf.up_accumulator,   0.0F, accum_elements);
         PipeBarrier<PIPE_V>();
 
+        const std::uint32_t chunk_count = geom.hidden / geom.hidden_sub_fwd;
         std::uint32_t hidden_base = 0;
         bool is_ping              = true;
 
-        AsyncLoadTokensChunk(tokens_in_gm, token_row_start, hidden_base, valid_rows, geom, buf.tokens_f32_ping, kEvTokensPing);
+        // The first load into each slot has no buffer-free token to wait for, so the prologue and
+        // the loads for chunks below the slot count pass `false`. `kTokenRingSlots` is the ring
+        // depth, stated once so the guard and the drain cannot disagree about it.
+        AsyncLoadTokensChunk(tokens_in_gm, token_row_start, hidden_base, valid_rows, geom, buf.tokens_f32_ping, kEvTokensPing, false);
 
         for (; hidden_base + geom.hidden_sub_fwd < geom.hidden; hidden_base += geom.hidden_sub_fwd) {
             const std::uint32_t next_hidden_base = hidden_base + geom.hidden_sub_fwd;
+            const std::uint32_t next_chunk       = next_hidden_base / geom.hidden_sub_fwd;
             auto& curr_tokens_f32  = is_ping ? buf.tokens_f32_ping      : buf.tokens_f32_pong;
             auto& next_tokens_f32  = is_ping ? buf.tokens_f32_pong      : buf.tokens_f32_ping;
             auto& curr_tokens_bf16 = is_ping ? buf.tokens_sub_bf16_ping : buf.tokens_sub_bf16_pong;
             const int curr_event   = is_ping ? kEvTokensPing            : kEvTokensPong;
             const int next_event   = is_ping ? kEvTokensPong            : kEvTokensPing;
 
-            AsyncLoadTokensChunk(tokens_in_gm, token_row_start, next_hidden_base, valid_rows, geom, next_tokens_f32, next_event);
+            AsyncLoadTokensChunk(tokens_in_gm, token_row_start, next_hidden_base, valid_rows, geom, next_tokens_f32, next_event, next_chunk >= kTokenRingSlots);
 
             PrepareTokensChunk(curr_tokens_bf16, curr_tokens_f32, valid_rows, geom.hidden_sub_fwd, curr_event);
             RunSubGemmAccumulate(matmul_gate_up, curr_tokens_bf16, gate_packed_ptr, gate_scales_ptr, inter_base, hidden_base, valid_rows, geom, buf, q_weight_fwd, buf.gate_accumulator, accum_elements);
@@ -451,6 +506,11 @@ __aicore__ inline void ProcessTokenTile(
         PrepareTokensChunk(final_tokens_bf16, final_tokens_f32, valid_rows, geom.hidden_sub_fwd, final_event);
         RunSubGemmAccumulate(matmul_gate_up, final_tokens_bf16, gate_packed_ptr, gate_scales_ptr, inter_base, hidden_base, valid_rows, geom, buf, q_weight_fwd, buf.gate_accumulator, accum_elements);
         RunSubGemmAccumulate(matmul_gate_up, final_tokens_bf16, up_packed_ptr,   up_scales_ptr,   inter_base, hidden_base, valid_rows, geom, buf, q_weight_fwd, buf.up_accumulator,   accum_elements);
+
+        // The ring is re-primed on every `inter_base` pass, so it must also be drained on every
+        // pass. Leaving the tokens outstanding would make the next pass's prologue -- which does
+        // not wait -- run against a stale free token, and the last pass's would outlive the launch.
+        DrainTokenRing(chunk_count);
 
         ApplySwiGLUActivation(buf, valid_rows, inter_base, geom, accum_elements);
     }
