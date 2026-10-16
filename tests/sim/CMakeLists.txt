@@ -528,6 +528,11 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   add_custom_target(dsv4_moe_prefill_cube_sim_kernel_objects
                     DEPENDS ${_dsv4_prefill_cube_sim_objects})
 
+  # The host-compiled Cube tiling builder, shared with the arch35_device_launch
+  # build. Defines dsv4_prefill_cube_cube_tiling; see the module for why that
+  # one TU is not built with BiSheng.
+  include("${CMAKE_SOURCE_DIR}/cmake/dsv4_prefill_cube_cube_tiling.cmake")
+
   add_executable(test_dsv4_moe_prefill_cube_inductive_sim
     test_dsv4_moe_prefill_cube_inductive_sim.cpp
     ${_dsv4_prefill_cube_sim_objects}
@@ -546,6 +551,7 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     DSV4_TILING_TEST_OVERRIDE=1
   )
   target_link_libraries(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
     moe_emu
     Threads::Threads
     "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
@@ -600,6 +606,70 @@ if(ENABLE_DSV4_CAMODEL_TEST)
     target_link_options(test_dsv4_moe_prefill_cube_inductive_sim PRIVATE
                         "LINKER:-rpath-link,${_dir}")
   endforeach()
+
+  # ---------------------------------------------------------------------
+  # SINGLE-TILE BRING-UP: one ProcessTokenTile trip, one AIC cluster
+  # ---------------------------------------------------------------------
+  # Links the SAME device objects as the inductive gate above -- same kernel,
+  # same launch wrapper, same tiling TU -- and differs only in its host driver,
+  # which passes total_tokens = 16 so the grid collapses to a single full tile
+  # at block_dim 1. Nothing is recompiled for it and no kernel source is
+  # duplicated, so a pass here is a statement about the production
+  # ProcessTokenTile body and not about a reduced copy of it.
+  #
+  # It exists because the gate above has never completed a trip and cannot
+  # attribute its pem_lsu flood to any one of the KfcServer, the two Matmul
+  # objects, the L1 ring, the grid stride and the ragged epilogue it stands up
+  # together. This target removes every one of those except the Cube path.
+  add_executable(test_dsv4_moe_prefill_cube_single_tile_sim
+    test_dsv4_moe_prefill_cube_single_tile_sim.cpp
+    ${_dsv4_prefill_cube_sim_objects}
+  )
+  add_dependencies(test_dsv4_moe_prefill_cube_single_tile_sim
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_single_tile_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_single_tile_sim
+                         PRIVATE -Wall -Wextra)
+  # Must match the flag the device objects were compiled with, or the host and
+  # the kernel disagree on which geometries MOE_DSV4_PREFILL_CUBE_ADMISSIBLE
+  # accepts and 512/512 is rejected on one side only.
+  target_compile_definitions(test_dsv4_moe_prefill_cube_single_tile_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_prefill_cube_single_tile_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_prefill_cube_single_tile_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  # -rpath-link ONLY, never -rpath: §4.4, same reasoning as the gate above.
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_single_tile_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  add_test(NAME Dsv4MoePrefillCubeSingleTileSim
+           COMMAND test_dsv4_moe_prefill_cube_single_tile_sim)
+  set_tests_properties(Dsv4MoePrefillCubeSingleTileSim PROPERTIES
+    LABELS "sim;arch35;camodel;cube;mix;bringup"
+    TIMEOUT 3600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
 
   # Standalone vector conversion check, without KFC or any GEMM work.
   set(_dsv4_dequant_unit_object

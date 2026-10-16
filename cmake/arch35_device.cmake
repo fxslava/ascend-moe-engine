@@ -58,6 +58,14 @@ include("${CMAKE_SOURCE_DIR}/cmake/arch35_ops.cmake")
 ascendc_library(arch35_device_launch STATIC
   ${MOE_ARCH35_OP_ASC_SOURCES}
 )
+
+# dsv4_moe_prefill_cube's launch wrapper calls MakeDsv4MoePrefillCubeGemmTiling
+# to build the two TCubeTilings it stages for REGIST_MATMUL_OBJ. That builder
+# is the one op_host TU compiled by the HOST compiler rather than BiSheng, so
+# it cannot live in MOE_ARCH35_OP_ASC_SOURCES and is linked in as its own
+# target. PUBLIC so consumers of arch35_device_launch resolve the symbol too.
+include("${CMAKE_SOURCE_DIR}/cmake/dsv4_prefill_cube_cube_tiling.cmake")
+target_link_libraries(arch35_device_launch PUBLIC dsv4_prefill_cube_cube_tiling)
 # Each operator's private headers (op_kernel/ and op_host/) are on the include
 # path so the bare-filename includes the layout mandates resolve.
 ascendc_include_directories(arch35_device_launch PRIVATE

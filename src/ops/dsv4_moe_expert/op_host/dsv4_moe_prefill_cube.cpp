@@ -22,6 +22,9 @@
 #include "launch_common.hpp"
 
 #include "dsv4_moe_prefill_cube_tiling.h"
+#include "dsv4_moe_prefill_cube_cube_tiling.h"
+
+#include <cstring>
 
 namespace moe::kernels::arch35 {
 namespace {
@@ -78,8 +81,35 @@ Status LaunchDsv4MoePrefillCube(
     return shape;
   }
 
+  // THE STAGING BUFFER CARRIES THE OPERATOR POD **AND** THE TWO CUBE TILINGS.
+  //
+  // The 72-byte Dsv4MoePrefillCubeTilingData is unchanged and still at offset
+  // 0; the Matmul framework's two TCubeTilings follow it. They have to reach
+  // the device somehow, and REGIST_MATMUL_OBJ needs them as
+  // `const __gm__ TCubeTiling*` -- see dsv4_moe_prefill_cube_cube_tiling.h for
+  // what passing no tiling at all did instead (a null-pointer read storm on
+  // the Cube that never terminated).
+  //
+  // This is NOT an operator ABI break: the published POD keeps its size and
+  // its MOE_ARCH35_ASSERT_TILING_POD. The staging buffer is wrapper-private.
+  alignas(8) unsigned char staging_blob[kPrefillCubeStagingBytes] = {};
+  std::memcpy(staging_blob, &tiling, sizeof(tiling));
+  const Status gate_tiling = MakeDsv4MoePrefillCubeGemmTiling(
+      PrefillCubeGemm::gate_up, tiling.m_tile,
+      staging_blob + kPrefillCubeGateTilingOffset);
+  if (gate_tiling != Status::success) {
+    return gate_tiling;
+  }
+  const Status down_tiling = MakeDsv4MoePrefillCubeGemmTiling(
+      PrefillCubeGemm::down, tiling.m_tile,
+      staging_blob + kPrefillCubeDownTilingOffset);
+  if (down_tiling != Status::success) {
+    return down_tiling;
+  }
+
   detail::TilingStaging staging;
-  const Status staged = staging.Stage(kCubeOp, &tiling, sizeof(tiling));
+  const Status staged =
+      staging.Stage(kCubeOp, staging_blob, sizeof(staging_blob));
   if (staged != Status::success) {
     return staged;
   }

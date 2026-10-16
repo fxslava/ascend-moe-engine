@@ -11,6 +11,7 @@
 
 #include "dsv4_moe_prefill_cube_arch35.h"
 #include "dsv4_moe_prefill_cube_tiling.h"
+#include "dsv4_moe_prefill_cube_cube_tiling.h"
 #include "dsv4_moe_prefill_cube_sample_set.h"
 
 // Textually include the production TU for verbatim compute logic
@@ -45,7 +46,28 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     TPipe pipe;
     GateUpMatmul matmul_gate_up;
     DownMatmul   matmul_down;
-    REGIST_MATMUL_OBJ(&pipe, shared_workspace, matmul_gate_up, matmul_down);
+    // REGIST_MATMUL_OBJ TAKES INTERLEAVED (object, tiling) PAIRS.
+    //
+    // Passing the two objects alone compiles and silently initializes BOTH
+    // Matmuls with a NULL TCubeTiling -- KfcServer::InitObjAux falls to its
+    // `InitKfc(tpipe, (void*)nullptr, ...)` branches, and every tiling field
+    // the Cube then reads is a load off address 0. On the dav-3510 CAModel
+    // that is the `pem_lsu.cc:484 invalid ldst addr` flood at ldst_addr 4, 8,
+    // 12, 16, 20, 24, 28, 32, 40, 52, 60, 72, 76, 120, 124 -- exactly the
+    // TCubeTiling field offsets -- and the launch never terminates. The full
+    // derivation is in dsv4_moe_prefill_cube_cube_tiling.h.
+    //
+    // The pointers are typed `const __gm__ TCubeTiling*` deliberately: that
+    // exact type selects InitKfc's branch which COPIES the struct out of GM
+    // into a core-local one before Init (matmul_server.h:78). The host stages
+    // both structs behind the 72-byte operator POD in the same allocation.
+    const __gm__ TCubeTiling* gate_up_cube_tiling =
+        reinterpret_cast<const __gm__ TCubeTiling*>(Bytes(tiling_config) + kPrefillCubeGateTilingOffset);
+    const __gm__ TCubeTiling* down_cube_tiling =
+        reinterpret_cast<const __gm__ TCubeTiling*>(Bytes(tiling_config) + kPrefillCubeDownTilingOffset);
+    REGIST_MATMUL_OBJ(&pipe, shared_workspace,
+                      matmul_gate_up, gate_up_cube_tiling,
+                      matmul_down,    down_cube_tiling);
 
     GlobalTensor<float> tokens_in_gm;
     GlobalTensor<float> tokens_out_gm;
@@ -115,8 +137,10 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     std::uint32_t sample_indices[kMaxSamples] = {};
     std::uint32_t sample_count = BuildTileSampleSet(total_tiles, kRingDepth, sample_indices);
 
+    // Behind BOTH Cube tilings, not at sizeof(the POD): the gate tiling
+    // occupies offset 72 now. Kept in step with the sim launch wrapper.
     const std::uint32_t cap = *reinterpret_cast<const __gm__ std::uint32_t*>(
-        Bytes(tiling_config) + sizeof(Dsv4MoePrefillCubeTilingData));
+        Bytes(tiling_config) + kPrefillCubeStagingBytes);
     if (cap != 0u && cap < sample_count) {
         sample_count = cap;
     }

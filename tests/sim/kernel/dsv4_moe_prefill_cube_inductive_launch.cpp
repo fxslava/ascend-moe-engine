@@ -36,6 +36,9 @@
 #include "launch_common.hpp"
 
 #include "dsv4_moe_prefill_cube_tiling.h"
+#include "dsv4_moe_prefill_cube_cube_tiling.h"
+
+#include <cstring>
 
 namespace moe::kernels::arch35 {
 namespace {
@@ -85,13 +88,42 @@ Status LaunchDsv4MoePrefillCubeInductiveSim(
     *tiling_out = tiling;  // so the driver can print and mirror the grid
   }
 
-  struct InductiveTiling {
-    Dsv4MoePrefillCubeTilingData production;
-    std::uint32_t sample_cap;
-  };
-  const InductiveTiling inductive_tiling{tiling, sample_cap};
+  // THE STAGING BUFFER CARRIES THE OPERATOR POD **AND** THE TWO CUBE TILINGS.
+  //
+  // The 72-byte Dsv4MoePrefillCubeTilingData is unchanged and still at offset
+  // 0; the Matmul framework's two TCubeTilings follow it. They have to reach
+  // the device somehow, and REGIST_MATMUL_OBJ needs them as
+  // `const __gm__ TCubeTiling*` -- see dsv4_moe_prefill_cube_cube_tiling.h for
+  // what passing no tiling at all did instead (a null-pointer read storm on
+  // the Cube that never terminated).
+  //
+  // This is NOT an operator ABI break: the published POD keeps its size and
+  // its MOE_ARCH35_ASSERT_TILING_POD. The staging buffer is wrapper-private.
+  alignas(8) unsigned char staging_blob[kPrefillCubeStagingBytes] = {};
+  std::memcpy(staging_blob, &tiling, sizeof(tiling));
+  const Status gate_tiling = MakeDsv4MoePrefillCubeGemmTiling(
+      PrefillCubeGemm::gate_up, tiling.m_tile,
+      staging_blob + kPrefillCubeGateTilingOffset);
+  if (gate_tiling != Status::success) {
+    return gate_tiling;
+  }
+  const Status down_tiling = MakeDsv4MoePrefillCubeGemmTiling(
+      PrefillCubeGemm::down, tiling.m_tile,
+      staging_blob + kPrefillCubeDownTilingOffset);
+  if (down_tiling != Status::success) {
+    return down_tiling;
+  }
+
+  // The sim-only sample cap now sits BEHIND both Cube tilings. It used to be
+  // at sizeof(Dsv4MoePrefillCubeTilingData) == 72, which is where the gate
+  // tiling starts; leaving it there would have made the cap and the gate
+  // tiling's `usedCoreNum` the same four bytes.
+  alignas(8) unsigned char sim_blob[kPrefillCubeStagingBytes + sizeof(std::uint32_t)] = {};
+  std::memcpy(sim_blob, staging_blob, sizeof(staging_blob));
+  std::memcpy(sim_blob + kPrefillCubeStagingBytes, &sample_cap, sizeof(sample_cap));
+
   detail::TilingStaging staging;
-  const Status staged = staging.Stage(kSimOp, &inductive_tiling, sizeof(inductive_tiling));
+  const Status staged = staging.Stage(kSimOp, sim_blob, sizeof(sim_blob));
   if (staged != Status::success) {
     return staged;
   }
