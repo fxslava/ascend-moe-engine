@@ -265,6 +265,23 @@ __aicore__ inline void DequantSubTileVector(
     const uint32_t dst_shape[2] = {groups_per_row, kCubeGroup};
     const uint32_t src_shape[2] = {groups_per_row, 1};
 
+    // ONE ROW AT A TIME, and the Mul moved INSIDE the loop.
+    //
+    // `buf.scale_plane` used to be an R_SUB x K_SUB plane (32,768 B) that this
+    // loop filled row by row, followed by a single Mul over the whole
+    // sub-tile. The plane was pure over-allocation: a row's scales are used
+    // only by that row's multiply. It is now one row wide
+    // (kCubeScaleRowBytes), and each row is scaled as soon as it is
+    // broadcast.
+    //
+    // The arithmetic is UNCHANGED -- elementwise multiply, same operands, same
+    // order within a row -- so the emu golden is unaffected. What changes is
+    // 32,256 B of UB and one big Mul becoming row_count small ones.
+    //
+    // WHY IT MATTERED: the old Broadcast into scale_plane[out_base] was the
+    // instruction the simulator reported as `ub_addr_overflow`, 1,280 times
+    // per call, because the UB layout over-committed and this was the buffer
+    // sitting past the end of it.
     for (std::uint32_t r_idx = 0; r_idx < row_count; ++r_idx) {
         const std::uint32_t scale_base = r_idx * kCubeScaleRowStride;
         const std::uint32_t out_base   = r_idx * col_count;
@@ -274,12 +291,13 @@ __aicore__ inline void DequantSubTileVector(
         ShiftLeft(row_scales_u16, row_scales_u16, static_cast<uint16_t>(7), 16);
         PipeBarrier<PIPE_V>();
 
-        Broadcast<bfloat16_t, 2, 1>(buf.scale_plane[out_base], row_scales_bf16, dst_shape, src_shape);
-    }
-    PipeBarrier<PIPE_V>();
+        Broadcast<bfloat16_t, 2, 1>(buf.scale_plane, row_scales_bf16, dst_shape, src_shape);
+        PipeBarrier<PIPE_V>();
 
-    Mul(buf.weight_expanded, buf.weight_expanded, buf.scale_plane, total_elements);
-    PipeBarrier<PIPE_V>();
+        Mul(buf.weight_expanded[out_base], buf.weight_expanded[out_base],
+            buf.scale_plane, col_count);
+        PipeBarrier<PIPE_V>();
+    }
 }
 
 __aicore__ inline void DequantSubTileToL1(
@@ -290,8 +308,34 @@ __aicore__ inline void DequantSubTileToL1(
     SetFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
     WaitFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
     DataCopy(l1_weight_slot, buf.weight_expanded, total_elements);
-    SetFlag<HardEvent::MTE3_MTE1>(kEvCubeMte3ToMte1);
-    WaitFlag<HardEvent::MTE3_MTE1>(kEvCubeMte3ToMte1);
+    // NO MTE3_MTE1 HERE. It used to be, and it was the deadlock.
+    //
+    // MTE1 (L1 -> L0A/L0B) is an AIC-ONLY pipeline. The Ascend C intra-core
+    // synchronization tables list MTE3_MTE1 among the legal combinations for
+    // the AIC and NOT for the AIV, whose only pipelines are S, V, MTE2 and
+    // MTE3. This function runs on the AIV, so `WaitFlag<MTE3_MTE1>` here
+    // blocked on a pipe event that NO transition on this core can produce --
+    // a directed circuit with zero tokens and no live producer. It compiled,
+    // and it never completed.
+    //
+    // It was not a BALANCE error, which is why counting SetFlag against
+    // WaitFlag did not find it: the pair was textually 1:1. What was wrong is
+    // that the pipe pair is not legal on this core.
+    //
+    // The dependency it was reaching for -- this AIV's UB -> L1 write must
+    // land before the Cube's MTE1 reads that L1 slot -- is CROSS-CORE, and
+    // intra-core SetFlag/WaitFlag cannot express a cross-core edge at all;
+    // that would need CrossCoreSetFlag/CrossCoreWaitFlag. It also does not
+    // need to be expressed here: the caller EnQues this slot on the
+    // TQue<TPosition::TSCM, 2> and DeQues it before SetTensorB, and the
+    // Matmul framework's KFC message at IterateAll is what orders the Cube
+    // against it.
+    //
+    // MEASURED: with this pair present, no launch retired at any shape -- 48
+    // sub-GEMMs for 2700 s, and 6 sub-GEMMs for 900 s, both ending on the
+    // host watchdog with zero pem_lsu diagnostics and the cycle count still
+    // climbing. The lifecycle-only variant, which never reaches this
+    // function, retired in 41 s.
     SetFlag<HardEvent::MTE3_V>(kEvCubeMte3ToV);
     WaitFlag<HardEvent::MTE3_V>(kEvCubeMte3ToV);
 }
@@ -378,7 +422,29 @@ __aicore__ inline void RunSubGemmAccumulate(
     matmul_gate_up.SetTensorB(staged_weight, true);
     matmul_gate_up.SetOrgShape(valid_rows, geom.inter_sub_fwd, geom.hidden_sub_fwd);
     matmul_gate_up.SetTail(valid_rows, geom.inter_sub_fwd, geom.hidden_sub_fwd);
-    matmul_gate_up.IterateAll(buf.subgemm_fwd);
+    // VECIN OUTPUT GOES THROUGH Iterate + GetTensorC, NOT IterateAll.
+    //
+    // This used to be `IterateAll(buf.subgemm_fwd)`. The Ascend C reference for
+    // IterateAll's LocalTensor overload says its supported TPositions are TSCM
+    // and VECIN and then, for VECIN specifically: "When outputting to the
+    // VECIN tensor, use the Iterate API." C here is
+    // MatmulType<TPosition::VECIN, ...>, so IterateAll was the one overload
+    // the contract rules out for this destination, and the Fixpipe -> UB
+    // delivery it synchronously waits on is the step GetTensorC drives -- a
+    // call this kernel never made.
+    //
+    // THE LOOP RUNS EXACTLY ONCE AT THIS TILING, and that is load-bearing:
+    // every GetTensorC writes the SAME UB tensor, so with more than one block
+    // the Add below would accumulate only the last one. The host tiling makes
+    // base == single for both sub-GEMMs (gate/up 16x128x128, down 16x64x256,
+    // verified from MakeDsv4MoePrefillCubeGemmTiling's output), so there is a
+    // single block. The `while` form is kept rather than a bare pair because
+    // it is the documented shape and it terminates correctly either way --
+    // but if base ever stops equalling single, this accumulation has to be
+    // rewritten, not just re-looped.
+    while (matmul_gate_up.Iterate()) {
+        matmul_gate_up.GetTensorC(buf.subgemm_fwd);
+    }
     matmul_gate_up.End();
     q_weight_fwd.FreeTensor(staged_weight);
 
@@ -433,7 +499,29 @@ __aicore__ inline void RunDownProjectionStep(
     matmul_down.SetTensorB(staged_down, true);
     matmul_down.SetOrgShape(valid_rows, geom.hidden_sub_down, geom.inter_sub_down);
     matmul_down.SetTail(valid_rows, geom.hidden_sub_down, geom.inter_sub_down);
-    matmul_down.IterateAll(buf.subgemm_down);
+    // VECIN OUTPUT GOES THROUGH Iterate + GetTensorC, NOT IterateAll.
+    //
+    // This used to be `IterateAll(buf.subgemm_down)`. The Ascend C reference for
+    // IterateAll's LocalTensor overload says its supported TPositions are TSCM
+    // and VECIN and then, for VECIN specifically: "When outputting to the
+    // VECIN tensor, use the Iterate API." C here is
+    // MatmulType<TPosition::VECIN, ...>, so IterateAll was the one overload
+    // the contract rules out for this destination, and the Fixpipe -> UB
+    // delivery it synchronously waits on is the step GetTensorC drives -- a
+    // call this kernel never made.
+    //
+    // THE LOOP RUNS EXACTLY ONCE AT THIS TILING, and that is load-bearing:
+    // every GetTensorC writes the SAME UB tensor, so with more than one block
+    // the Add below would accumulate only the last one. The host tiling makes
+    // base == single for both sub-GEMMs (gate/up 16x128x128, down 16x64x256,
+    // verified from MakeDsv4MoePrefillCubeGemmTiling's output), so there is a
+    // single block. The `while` form is kept rather than a bare pair because
+    // it is the documented shape and it terminates correctly either way --
+    // but if base ever stops equalling single, this accumulation has to be
+    // rewritten, not just re-looped.
+    while (matmul_down.Iterate()) {
+        matmul_down.GetTensorC(buf.subgemm_down);
+    }
     matmul_down.End();
     q_weight_down.FreeTensor(staged_down);
 
@@ -630,8 +718,8 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
     pipe.InitBuffer(q_weight_nibbles,        1, kCubeNibBytes);
     pipe.InitBuffer(q_weight_expanded,       1, kCubeWideBytes);
     pipe.InitBuffer(q_weight_scales,         1, kCubeScaleBytes);
-    pipe.InitBuffer(q_scale_plane,           1, kCubeRSub * kCubeKSub * sizeof(bfloat16_t));
-    pipe.InitBuffer(q_scale_temporary,       1, 16 * sizeof(uint16_t));
+    pipe.InitBuffer(q_scale_plane,           1, kCubeScaleRowBytes);
+    pipe.InitBuffer(q_scale_temporary,       1, kCubeScaleTempBytes);
 
     TQue<TPosition::TSCM, 2> q_weight_fwd;
     TQue<TPosition::TSCM, 2> q_weight_down;

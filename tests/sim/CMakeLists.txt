@@ -662,6 +662,159 @@ if(ENABLE_DSV4_CAMODEL_TEST)
                         "LINKER:-rpath-link,${_dir}")
   endforeach()
 
+  # ---------------------------------------------------------------------
+  # VARIANT (a) OF THE BISECTION: the Matmul/KFC lifecycle, with no compute
+  # ---------------------------------------------------------------------
+  # Same device objects would not do here -- this needs its OWN kernel TU,
+  # because the whole point is a kernel that issues no compute instruction.
+  # It shares the tiling TU and launch_common with the gate above.
+  set(_dsv4_kfc_lifecycle_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_kfc_lifecycle_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_kfc_lifecycle_launch.cpp"
+  )
+  set(_dsv4_kfc_lifecycle_objects)
+  foreach(_source IN LISTS _dsv4_kfc_lifecycle_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_kfc_lifecycle_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_kfc_lifecycle_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_kfc_lifecycle_objects
+                    DEPENDS ${_dsv4_kfc_lifecycle_objects})
+
+  # Reuse the gate's tiling and launch_common objects (indices 2 and 3 of
+  # _dsv4_prefill_cube_sim_objects) rather than compiling them twice.
+  list(GET _dsv4_prefill_cube_sim_objects 2 _dsv4_lifecycle_tiling_object)
+  list(GET _dsv4_prefill_cube_sim_objects 3 _dsv4_lifecycle_common_object)
+  add_executable(test_kfc_lifecycle_sim
+    test_kfc_lifecycle_sim.cpp
+    ${_dsv4_kfc_lifecycle_objects}
+    "${_dsv4_lifecycle_tiling_object}"
+    "${_dsv4_lifecycle_common_object}"
+  )
+  add_dependencies(test_kfc_lifecycle_sim
+                   dsv4_kfc_lifecycle_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_kfc_lifecycle_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_kfc_lifecycle_sim PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_kfc_lifecycle_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1)
+  target_link_libraries(test_kfc_lifecycle_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_kfc_lifecycle_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_kfc_lifecycle_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # Variant (b), staged: same device-object recipe as the lifecycle probe.
+  set(_dsv4_stage_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_subgemm_stage_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_subgemm_stage_launch.cpp")
+  set(_dsv4_stage_objects)
+  foreach(_source IN LISTS _dsv4_stage_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_stage_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_stage_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_stage_objects DEPENDS ${_dsv4_stage_objects})
+
+  add_executable(test_subgemm_stage_sim
+    test_subgemm_stage_sim.cpp ${_dsv4_stage_objects}
+    "${_dsv4_lifecycle_tiling_object}" "${_dsv4_lifecycle_common_object}")
+  add_dependencies(test_subgemm_stage_sim dsv4_stage_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_subgemm_stage_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include")
+  target_compile_options(test_subgemm_stage_sim PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_subgemm_stage_sim PRIVATE DSV4_TILING_TEST_OVERRIDE=1)
+  target_link_libraries(test_subgemm_stage_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling moe_emu Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES})
+  set_target_properties(test_subgemm_stage_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_subgemm_stage_sim PRIVATE "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  add_test(NAME KfcLifecycleSim COMMAND test_kfc_lifecycle_sim)
+  set_tests_properties(KfcLifecycleSim PROPERTIES
+    LABELS "sim;arch35;camodel;cube;mix;bringup;bisect"
+    TIMEOUT 600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
   add_test(NAME Dsv4MoePrefillCubeSingleTileSim
            COMMAND test_dsv4_moe_prefill_cube_single_tile_sim)
   set_tests_properties(Dsv4MoePrefillCubeSingleTileSim PROPERTIES

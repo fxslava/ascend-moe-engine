@@ -126,15 +126,65 @@ static_assert(kCubeKSub / kCubeGroup <= kCubeScaleRowStride &&
                   kCubeRSub2 / kCubeGroup <= kCubeScaleRowStride,
               "a sub-tile row's E8M0 scales must fit one 32-byte burst block");
 
-inline constexpr std::uint32_t kCubeUbBytes =
-    kCubeActBytes + 2u * kCubeAcc1Bytes + kCubeAcc1Bytes + kCubeXF32Bytes +
-    kCubeXSubBytes + kCubeAcc2Bytes + kCubeAcc2Bytes + kCubeASubBytes +
-    kCubeNibBytes + kCubeWideBytes + kCubeScaleBytes;
+// A ONE-ROW SCALE BUFFER, not an R_SUB x K_SUB PLANE.
+//
+// This was `kCubeRSub * kCubeKSub * 2` = 32,768 B: a full dequantized scale
+// plane, built one row at a time by Broadcast and then consumed by ONE Mul
+// over the whole sub-tile. The plane was never needed. Every row's scales are
+// used only by that row's multiply, so a single row of the widest sub-tile
+// serves, and the Mul moves inside the row loop.
+//
+// MEASURED CONSEQUENCE of the plane, on the dav-3510 CAModel: the Broadcast
+// into scale_plane[out_base] was the access reported by
+// `rvec_dec.cc judge_valid_addr ub_addr_overflow`, 1,280 diagnostics per
+// DequantSubTileVector call (10 per row x 128 rows, a 256 B Broadcast split
+// into 32 B bodies), in EVERY run that reached the dequantizer and none that
+// did not.
+//
+// The widest row is phase 2's R_SUB2 contraction, not phase 1's K_SUB.
+inline constexpr std::uint32_t kCubeScaleRowElems =
+    kCubeKSub > kCubeRSub2 ? kCubeKSub : kCubeRSub2;
+inline constexpr std::uint32_t kCubeScaleRowBytes = kCubeScaleRowElems * 2u;
 
-static_assert(kCubeUbBytes == 163840,
-              "the Cube prefill UB budget must sum to 163,840 B -- if this "
-              "fires, the table in the comment above is stale and the "
-              "M_TILE = 32 arithmetic with it");
+// THE SUM MUST LIST EVERY InitBuffer, ONCE PER CALL.
+//
+// The previous formula did not, and the static_assert below was therefore
+// vacuous -- it constrained a number that did not describe the kernel. It
+// under-counted by 45,088 B in three ways: kCubeXF32Bytes and kCubeXSubBytes
+// are each allocated TWICE (ping and pong) but were counted once, and the
+// scale plane and the scale temporary were absent altogether. The comment
+// above claiming "57,344 B of headroom" was computed from that wrong sum.
+//
+// Ordered to mirror the InitBuffer sequence in the kernel so the two can be
+// diffed by eye. If a buffer is added there and not here, the assert stops
+// meaning anything again.
+inline constexpr std::uint32_t kCubeScaleTempBytes = 16u * 2u;
+
+inline constexpr std::uint32_t kCubeUbBytes =
+    kCubeActBytes +          // q_activation_resident
+    kCubeAcc1Bytes +         // q_gate_accumulator
+    kCubeAcc1Bytes +         // q_up_accumulator
+    kCubeAcc1Bytes +         // q_subgemm_fwd
+    kCubeXF32Bytes +         // q_tokens_f32_ping
+    kCubeXF32Bytes +         // q_tokens_f32_pong
+    kCubeXSubBytes +         // q_tokens_sub_bf16_ping
+    kCubeXSubBytes +         // q_tokens_sub_bf16_pong
+    kCubeAcc2Bytes +         // q_down_accumulator
+    kCubeAcc2Bytes +         // q_subgemm_down
+    kCubeASubBytes +         // q_activation_sub_bf16
+    kCubeNibBytes +          // q_weight_nibbles
+    kCubeWideBytes +         // q_weight_expanded
+    kCubeScaleBytes +        // q_weight_scales
+    kCubeScaleRowBytes +     // q_scale_plane  (was kCubeRSub * kCubeKSub * 2)
+    kCubeScaleTempBytes;     // q_scale_temporary
+
+static_assert(kCubeUbBytes == 176672,
+              "the Cube prefill UB budget must sum to 176,672 B. This number "
+              "is the ACTUAL total of the kernel's InitBuffer calls, verified "
+              "against them one by one; the old 163,840 omitted the scale "
+              "plane, the scale temporary and the second of each ping/pong "
+              "pair. If this fires, re-derive it from the kernel rather than "
+              "adjusting the literal");
 static_assert(kCubeUbBytes <= kUsableUbBytes,
               "the Cube prefill UB budget exceeds the arch35 usable ceiling");
 

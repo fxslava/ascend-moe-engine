@@ -106,8 +106,8 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_inductive_sim(
     pipe.InitBuffer(q_weight_nibbles,        1, kCubeNibBytes);
     pipe.InitBuffer(q_weight_expanded,       1, kCubeWideBytes);
     pipe.InitBuffer(q_weight_scales,         1, kCubeScaleBytes);
-    pipe.InitBuffer(q_scale_plane,           1, kCubeRSub * kCubeKSub * sizeof(bfloat16_t));
-    pipe.InitBuffer(q_scale_temporary,       1, 16 * sizeof(uint16_t));
+    pipe.InitBuffer(q_scale_plane,           1, kCubeScaleRowBytes);
+    pipe.InitBuffer(q_scale_temporary,       1, kCubeScaleTempBytes);
 
     TQue<TPosition::TSCM, 2> q_weight_fwd;
     TQue<TPosition::TSCM, 2> q_weight_down;
