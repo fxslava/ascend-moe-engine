@@ -104,6 +104,12 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
         pipe.InitBuffer(l1w_buf[s], kPipeN * kPipeKSub * sizeof(bfloat16_t));
     }
 
+    // The pipeline each CrossCoreWaitFlag scopes its block to: the one that
+    // CONSUMES what the flag protects. See dsv4_prefill_cube_pipeline.h.
+    constexpr pipe_t kPipeWaitAicSlot  = PIPE_MTE1;  // CopyL12L0B from the slot
+    constexpr pipe_t kPipeWaitAivSlot  = PIPE_MTE3;  // ND2NZ push into the slot
+    constexpr pipe_t kPipeWaitAivFinal = PIPE_MTE3;  // DataCopy UB -> GM
+
     if ASCEND_IS_AIC {
         __ca__ bfloat16_t l0a[kPipeM * kPipeKSub];
         __cb__ bfloat16_t l0b[kPipeKSub * kPipeN];
@@ -121,6 +127,33 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             Te::MakeMemPtr(reinterpret_cast<__cbuf__ bfloat16_t*>(l1a_t.GetPhyAddr())),
             Te::MakeFrameLayout<Te::NZLayoutPtn, bfloat16_t>(kPipeM, kPipeKSub));
 
+        // WHY EVERY FENCE IN THIS LOOP IS AN IMMEDIATE SetFlag/WaitFlag PAIR
+        // AND NOT A DEFERRED TOKEN -- MEASURED, dav-3510 CAModel, 2026-10-18.
+        //
+        // This loop briefly carried both WAR fences as tokens raised on one
+        // lap and consumed on the next, with `bool ..._war_live` bookkeeping,
+        // so that the Cube could run behind the loader. The textual balance
+        // was 1:1 and the drain after the loop consumed exactly what the loop
+        // raised. IT STILL BROKE, in two ways at once:
+        //
+        //   * 4 x `pem_ccu.cc execute_set_flag already has same set_flag!`.
+        //     A deferred fence's SetFlag and WaitFlag sit on DIFFERENT PIPES
+        //     -- M and MTE1 for the L0 fence, MTE1 and MTE2 for the l1A one --
+        //     and the scalar unit issues the whole loop body without blocking.
+        //     Program order therefore does NOT order the set against the wait:
+        //     the producing pipe runs ahead and raises lap k+1's token before
+        //     the consuming pipe has reached lap k's wait, which lands a
+        //     SetFlag on an already-set binary flag. An IMMEDIATE pair cannot
+        //     do this, because the wait is on the consuming pipe and the
+        //     scalar unit cannot get past it with a token outstanding.
+        //   * the 4-tile accumulation came back as ONE tile's product
+        //     (`got 1 want 4`, 256 of 2048 elements wrong). Removing the
+        //     `PipeBarrier<PIPE_M>` below is what did that -- see the note on
+        //     it at the Mmad.
+        //
+        // So: balance is necessary and NOT sufficient. A deferred intra-core
+        // fence also needs the two pipes to be ordered against each other,
+        // which nothing here provides.
         for (std::uint32_t k = 0; k < tiles; ++k) {
             const std::uint32_t slot = k % kPipeRingSlots;
 
@@ -135,7 +168,13 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             // increments the AIC's counter once BOTH AIVs have set, exactly
             // as documented -- see kPipeAivPerAic for the measurement that
             // settles it.
-            CrossCoreWaitFlag(static_cast<uint16_t>(kPipeFlagSlotReady + slot));
+            //
+            // Scoped to PIPE_MTE1, the pipe that reads the slot. The MTE2
+            // burst above is deliberately issued BEFORE this wait and is not
+            // gated by it: A tile k does not depend on the weight slot, so
+            // the two overlap.
+            CrossCoreWaitFlag<kPipeSyncMode, kPipeWaitAicSlot>(
+                static_cast<uint16_t>(kPipeFlagSlotReady + slot));
 
             LocalTensor<bfloat16_t> l1w_t = l1w_buf[slot].Get<bfloat16_t>();
             auto l1W = Te::MakeTensor(
@@ -151,23 +190,94 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             // why L1 already holds the contraction-major tile.
             Te::Copy(Te::MakeCopy(Te::CopyL12L0B{}, Te::CopyL12L0BTraitDefault{}), l0B, l1W);
 
+            // WAR ON l1A, AND IT WAS A LATENT RACE BEFORE THIS FENCE EXISTED.
+            // l1A is a SINGLE buffer rewritten every tile, so tile k+1's
+            // GM -> L1 burst (MTE2) targets the same bytes tile k's
+            // CopyL12L0A (MTE1) has just read. The loop had an MTE2_MTE1
+            // fence, which is the RAW direction only; nothing held MTE2 back.
+            // It did not corrupt the 4-tile sum, but only because the burst is
+            // slower than the L1 -> L0 read it was racing, which is a timing
+            // accident and not a guarantee.
+            //
+            // IMMEDIATE, not deferred: the wait blocks MTE2, which is the pipe
+            // that would do the overwriting, and it is placed after the MTE1
+            // reads it protects.
+            SetFlag<HardEvent::MTE1_MTE2>(kEvPipeMte1ToMte2);
+            WaitFlag<HardEvent::MTE1_MTE2>(kEvPipeMte1ToMte2);
+
+            // RELEASE THE SLOT HERE, NOT AFTER THE MMAD. The AIV may refill
+            // it as soon as MTE1 has drained it, which this set waits for by
+            // construction; holding it until after the Mmad made the AIV wait
+            // a full Cube step for no dependency.
+            if (k + kPipeRingSlots < tiles) {
+                CrossCoreSetFlag<kPipeSyncMode, PIPE_MTE1>(
+                    static_cast<uint16_t>(kPipeFlagSlotFree + slot));
+            }
+
             SetFlag<HardEvent::MTE1_M>(EVENT_ID0);
             WaitFlag<HardEvent::MTE1_M>(EVENT_ID0);
 
             // THE ACCUMULATION. ccubeInitVal only on the first tile; every
             // later Mmad adds into the same L0C.
+            //
+            // THIS CONFIGURATION IS CORRECT AND IS NOT THE BUG, which took
+            // five hypotheses to establish, so the evidence is recorded here
+            // rather than re-derived. CANN's own Matmul framework computes the
+            // same two flags for its K loop
+            // (scheduler/batch/batch_scheduler_base.h,
+            // UpdateMmadComputeParams):
+            //
+            //     cmatrixSource  = sL0CInit && IsBias();
+            //     cmatrixInitVal = sL0CInit && !IsBias();
+            //
+            // so for every K step after the first (sL0CInit == false) it
+            // passes (source = false, initVal = false) through the PLAIN
+            // three-operand Mmad -- exactly what this call does. That is the
+            // canonical in-place `C += A * B` on this part, demonstrated by a
+            // shipping implementation.
+            //
+            // ALSO TRIED AND EQUIVALENT: the four-operand bias overload,
+            // `Te::Mmad(op, l0C, l0A, l0B, l0C)`. A bias in L0C routes to
+            // MmadWithBias, which sets cmatrixSource = false and hardcodes
+            // cmatrixInitVal = false -- the same pair. It compiles and it
+            // produced a BIT-IDENTICAL wrong answer on the CAModel. Do not
+            // spend another run on it.
             Te::MmadParams mmadParams(static_cast<uint16_t>(kPipeM),
                                       static_cast<uint16_t>(kPipeN),
                                       static_cast<uint16_t>(kPipeKSub),
                                       0, k == 0u);
             Te::Mmad(Te::MakeMmad(Te::MmadOperation{}, Te::MmadTraitDefault{}).with(mmadParams),
                      l0C, l0A, l0B);
+
+            // MEASURED: AN Mmad WITH ccubeInitVal = false DOES ACCUMULATE IN
+            // PLACE. A diagnostic that issued a SECOND Mmad over the same
+            // L0A/L0B with init = false, run at stage 1, returned `got 2 want
+            // 1` / `got 4 want 2` / `got 6 want 3` -- exactly 2x on all 2048
+            // elements, dav-3510 CAModel, 2026-10-18. So the Cube's
+            // accumulation path is sound and the multi-tile shortfall this
+            // probe used to report was never about these flags.
+            // THIS BARRIER IS A DOCUMENTED HARDWARE CONTRACT AT THIS SHAPE.
+            //
+            // It was removed once, on the reasoning that successive Mmads into
+            // one L0C are ordered by PIPE_M against itself. Mmad.md's
+            // "Synchronization optimization description" says otherwise: a
+            // PipeBarrier<PIPE_M> is required between consecutive Mmads
+            // accumulating into the same L0C unless the shape clears
+            //
+            //     (m / 16) * (n / 16) < 10
+            //
+            // and this probe is m = 16, n = 128 -> 1 * 8 = 8, UNDER the
+            // threshold, so the barrier is mandatory. Above the threshold the
+            // hardware scheduler handles the write-read dependency itself,
+            // which is the regime the removal was reasoning from.
             PipeBarrier<PIPE_M>();
 
-            if (k + kPipeRingSlots < tiles) {
-                CrossCoreSetFlag<kPipeSyncMode, PIPE_MTE1>(
-                    static_cast<uint16_t>(kPipeFlagSlotFree + slot));
-            }
+            // WAR ON L0A/L0B: tile k+1's MTE1 writes the buffers tile k's
+            // Mmad reads. IMMEDIATE, for the pipe-ordering reason at the top
+            // of the loop. The barrier above has already retired the Mmad, so
+            // this pair only has to hold MTE1 back, not wait on the Cube.
+            SetFlag<HardEvent::M_MTE1>(kEvPipeMToMte1);
+            WaitFlag<HardEvent::M_MTE1>(kEvPipeMToMte1);
         }
 
         SetFlag<HardEvent::M_FIX>(EVENT_ID0);
@@ -208,8 +318,23 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             pipe.InitBuffer(q_nib[s], 1, kPipeKSub * kPipeNHalf / 2u);
             pipe.InitBuffer(q_scale[s], 1, kPipeKSub * kCubeScaleRowStride);
         }
-        TQue<TPosition::VECCALC, 1> q_wide, q_plane, q_temp;
-        pipe.InitBuffer(q_wide,  1, kPipeKSub * kPipeNHalf * sizeof(bfloat16_t));
+        // `wide` IS NOW PING-PONGED, and that is the change that buys the
+        // Vector/MTE3 overlap. With one shared wide buffer the ND2NZ push of
+        // tile k and the dequant of tile k+1 contend for the same bytes, so
+        // the loop had to fence MTE3 -> V immediately after every push, which
+        // blocked the Vector unit until the push drained. Two buffers make
+        // that fence a full ring lap long, so dequant(k+1) overlaps push(k).
+        //
+        // Costs kPipeKSub * kPipeNHalf * 2 = 16,384 B of extra UB.
+        //
+        // scale_plane and scale_temporary stay SHARED on purpose: they are
+        // scratch consumed inside DequantSubTileVector, and there is one
+        // Vector unit, so two dequants never overlap each other.
+        TQue<TPosition::VECCALC, 1> q_wide[kPipeRingSlots];
+        TQue<TPosition::VECCALC, 1> q_plane, q_temp;
+        for (std::uint32_t s = 0; s < kPipeRingSlots; ++s) {
+            pipe.InitBuffer(q_wide[s], 1, kPipeKSub * kPipeNHalf * sizeof(bfloat16_t));
+        }
         pipe.InitBuffer(q_plane, 1, kCubeScaleRowBytes);
         pipe.InitBuffer(q_temp,  1, kCubeScaleTempBytes);
 
@@ -218,11 +343,12 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             buf[s].weight_nibbles  = q_nib[s].AllocTensor<fp4x2_e2m1_t>();
             buf[s].weight_scales   = q_scale[s].AllocTensor<uint8_t>();
         }
-        LocalTensor<bfloat16_t> wide  = q_wide.AllocTensor<bfloat16_t>();
+        LocalTensor<bfloat16_t> wide[kPipeRingSlots];
         LocalTensor<bfloat16_t> plane = q_plane.AllocTensor<bfloat16_t>();
         LocalTensor<uint16_t>   temp  = q_temp.AllocTensor<uint16_t>();
         for (std::uint32_t s = 0; s < kPipeRingSlots; ++s) {
-            buf[s].weight_expanded  = wide;
+            wide[s] = q_wide[s].AllocTensor<bfloat16_t>();
+            buf[s].weight_expanded  = wide[s];
             buf[s].scale_plane      = plane;
             buf[s].scale_temporary  = temp;
         }
@@ -241,49 +367,80 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
 
         // Prologue: with prefetch on, tile 0's MTE2 is issued before the loop
         // so that iteration 0 can issue tile 1's load before dequantizing 0.
+        // No V_MTE2 WAR wait on this one -- nothing has read slot 0 yet.
         if (prefetch) {
             AsyncLoadWeightsSubTile(packed, scales, 0u, col_start,
-                                    kPipeKSub, kPipeNHalf, kPipeWCols, buf[0]);
+                                    kPipeKSub, kPipeNHalf, kPipeWCols, buf[0],
+                                    kEvPipeMte2ToV[0]);
         }
 
+        // One outstanding deferred token per ring slot, tracked explicitly so
+        // the drain after the loop consumes exactly what the loop raised.
+        bool wide_war_live[kPipeRingSlots] = {false, false};
+        bool nib_war_live[kPipeRingSlots]  = {false, false};
+
         for (std::uint32_t k = 0; k < tiles; ++k) {
-            const std::uint32_t slot = k % kPipeRingSlots;
+            const std::uint32_t slot      = k % kPipeRingSlots;
+            const std::uint32_t next_slot = (k + 1u) % kPipeRingSlots;
 
             if (!prefetch) {
+                // The WAR event is passed here too. Without it slot `slot`'s
+                // V_MTE2 token from lap k-2 is never consumed, and the
+                // SetFlag below then lands on an already-set flag -- the
+                // exact undefined behaviour this refactor exists to remove.
                 AsyncLoadWeightsSubTile(packed, scales, k * kPipeKSub, col_start,
-                                        kPipeKSub, kPipeNHalf, kPipeWCols, buf[slot]);
+                                        kPipeKSub, kPipeNHalf, kPipeWCols, buf[slot],
+                                        kEvPipeMte2ToV[slot],
+                                        nib_war_live[slot] ? kEvPipeNibFree[slot] : -1);
+                nib_war_live[slot] = false;
             }
 
-            if (k >= kPipeRingSlots) {
-                CrossCoreWaitFlag(static_cast<uint16_t>(kPipeFlagSlotFree + slot));
-            }
-
-            // The production FP4 -> BF16 conversion, verbatim. Its first act
-            // is WaitFlag<MTE2_V>, which CONSUMES the token the load above
-            // (or the previous iteration's prefetch) raised.
-            DequantSubTileVector(kPipeKSub, kPipeNHalf, buf[slot]);
-
-            // THE PREFETCH GOES HERE, NOT BEFORE THE DEQUANT.
+            // THE PREFETCH NOW PRECEDES THE DEQUANT, which is what makes
+            // tile k+1's MTE2 burst run against tile k's Vector work rather
+            // than merely against the Cube.
             //
-            // Intra-core SetFlag is NOT a counting semaphore: raising
-            // MTE2_V for tile k+1 while tile k's token is still outstanding
-            // is a hardware error, and the simulator says so --
-            // `pem_ccu.cc:2277 execute_set_flag already has same set_flag!`.
-            // AsyncLoadWeightsSubTile raises kEvCubeMte2ToV unconditionally,
-            // so exactly one of its tokens may be in flight at a time.
-            //
-            // Issuing the load after the dequant has consumed the token
-            // still overlaps three stages -- tile k+1's MTE2 runs against
-            // tile k's UB -> L1 push and against the Cube's consumption of
-            // tile k -- it just does not also overlap the vector dequant
-            // with its own prefetch. Recovering that last overlap needs
-            // ping/pong event ids inside the load helper, which would mean
-            // editing a production routine this probe reuses verbatim.
+            // Two things had to change for this to be legal. An intra-core
+            // flag is BINARY, so one shared MTE2_V id allowed only one burst
+            // in flight -- hence kEvPipeMte2ToV[slot], one id per slot. And
+            // the burst now overwrites a staging buffer whose previous tenant
+            // the Vector unit may still be reading, so the loader takes a
+            // V_MTE2 WAR event as well. Both are defaulted parameters on the
+            // production routine, so its own callers are untouched.
             if (prefetch && k + 1u < tiles) {
                 AsyncLoadWeightsSubTile(packed, scales, (k + 1u) * kPipeKSub, col_start,
                                         kPipeKSub, kPipeNHalf, kPipeWCols,
-                                        buf[(k + 1u) % kPipeRingSlots]);
+                                        buf[next_slot], kEvPipeMte2ToV[next_slot],
+                                        nib_war_live[next_slot]
+                                            ? kEvPipeNibFree[next_slot] : -1);
+                nib_war_live[next_slot] = false;
             }
+
+            // Scoped to PIPE_MTE3: what this flag protects is the AIV's own
+            // ND2NZ push INTO the L1 slot, and MTE3 is what performs it.
+            // Leaving the Vector pipe unblocked here is deliberate -- the
+            // dequant below does not touch L1.
+            if (k >= kPipeRingSlots) {
+                CrossCoreWaitFlag<kPipeSyncMode, kPipeWaitAivSlot>(
+                    static_cast<uint16_t>(kPipeFlagSlotFree + slot));
+            }
+
+            // The production FP4 -> BF16 conversion, verbatim. Its first act
+            // is WaitFlag<MTE2_V>, which CONSUMES the token this slot's load
+            // raised.
+            // WAR on this slot's `wide`: its push, a full ring lap ago, must
+            // have drained before the dequant overwrites it.
+            if (wide_war_live[slot]) {
+                WaitFlag<HardEvent::MTE3_V>(kEvPipeWideFree[slot]);
+                wide_war_live[slot] = false;
+            }
+
+            DequantSubTileVector(kPipeKSub, kPipeNHalf, buf[slot],
+                                 kEvPipeMte2ToV[slot]);
+
+            // The nibble staging is now readable-no-more by anyone until the
+            // next burst; hand the WAR token to that burst.
+            SetFlag<HardEvent::V_MTE2>(kEvPipeNibFree[slot]);
+            nib_war_live[slot] = true;
 
             // UB -> L1 with an inline ND2NZ conversion. The UB holds
             // ND(K_SUB, N/2) -- this AIV's column half of the tile -- and
@@ -293,27 +450,78 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
             // col_start * K_SUB elements in. The two AIVs therefore write
             // disjoint block ranges, which the ND2NZ contract requires --
             // it does not order overlapping writes.
-            LocalTensor<bfloat16_t> l1w_t = l1w_buf[slot].Get<bfloat16_t>();
-            SetFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
-            WaitFlag<HardEvent::V_MTE3>(kEvCubeVToMte3);
-            Nd2NzParams nd2nz;
-            nd2nz.ndNum             = 1;
-            nd2nz.nValue            = static_cast<uint16_t>(kPipeKSub);
-            nd2nz.dValue            = kPipeNHalf;
-            nd2nz.srcNdMatrixStride = 0;
-            nd2nz.srcDValue         = kPipeNHalf;
-            nd2nz.dstNzC0Stride     = static_cast<uint16_t>(kPipeKSub);
-            nd2nz.dstNzNStride      = 1;
-            nd2nz.dstNzMatrixStride = 0;
-            DataCopy(l1w_t[col_start * kPipeKSub], wide, nd2nz);
-            SetFlag<HardEvent::MTE3_V>(kEvCubeMte3ToV);
-            WaitFlag<HardEvent::MTE3_V>(kEvCubeMte3ToV);
+            // THE PUSH IS THE SHIPPING ROUTINE, NOT THE Nd2NzParams OVERLOAD.
+            //
+            // `PushUbTileToL1Nz` comes from the operator's own kernel source,
+            // which this TU already includes -- so this probe now exercises
+            // the primitive production actually uses, which is the point of
+            // the probe. It bursts straight from wide[slot] into the slot's C0
+            // blocks, one strided DataCopy per block, with NO intermediate
+            // buffer.
+            //
+            // WHAT THAT REMOVES. The Nd2NzParams overload resolves to
+            // DataCopyUB2L1ND2NZImpl, which runs `TransND2NZ` into a SHARED
+            // PopStackBuffer and bursts from there. That buffer is rewritten
+            // by every push, and the implementation fences it V -> MTE3 but
+            // not MTE3 -> V, so the write-after-read is the caller's to close.
+            // Leaving it open corrupted the FIRST C0 BLOCK of every tile but
+            // the last -- MEASURED as 256 of 2048 elements wrong, which is 16
+            // columns x 16 rows, with columns 16..127 correct. An immediate
+            // MTE3 -> V fence also closes it, and did; bursting from
+            // wide[slot] means there is no shared buffer to close over at all.
+            //
+            // AND IT MAKES THE DEFERRED FENCE SOUND AGAIN. See the MTE3_V set
+            // below: `wide` is per-slot, so a token consumed one ring lap
+            // later is the right scope for it -- which was the original
+            // reasoning, correct about `wide` and wrong only because MTE3 was
+            // not actually reading `wide`.
+            //
+            // RAW: the dequant wrote wide[slot] on the Vector pipe and MTE3
+            // reads it DIRECTLY now, so this fence is REQUIRED. It was
+            // redundant under the Nd2NzParams overload -- there TransND2NZ
+            // read `wide` on V, making the edge V -> V -- and dropping it was
+            // correct then and would be a silent wrong answer now.
+            SetFlag<HardEvent::V_MTE3>(kEvPipeWideReady);
+            WaitFlag<HardEvent::V_MTE3>(kEvPipeWideReady);
+
+            PushUbTileToL1Nz(l1w_buf[slot].Get<bfloat16_t>(), wide[slot],
+                             /*rows=*/kPipeKSub, /*cols=*/kPipeNHalf,
+                             /*src_row_stride=*/kPipeNHalf,
+                             /*nz_rows=*/kPipeKSub,
+                             /*col_base=*/col_start, /*row_base=*/0u);
+
+            // WAR on wide[slot], DEFERRED ONE RING LAP. This is the overlap
+            // the three-stage schedule exists for: an immediate wait here
+            // would block PIPE_V until the push drained, so the next dequant
+            // could not start. It is sound because wide is per-slot and
+            // nothing overwrites wide[slot] until the lap that reuses it.
+            SetFlag<HardEvent::MTE3_V>(kEvPipeWideFree[slot]);
+            wide_war_live[slot] = true;
 
             CrossCoreSetFlag<kPipeSyncMode, PIPE_MTE3>(
                 static_cast<uint16_t>(kPipeFlagSlotReady + slot));
         }
 
-        CrossCoreWaitFlag(kPipeFlagProduct);
+        // DRAIN EVERY DEFERRED TOKEN. A flag left raised is not harmless: the
+        // next SetFlag on the same (srcPipe, dstPipe, eventID) triple lands on
+        // an already-set flag, which is undefined behaviour and what the
+        // simulator reports as `execute_set_flag already has same set_flag!`.
+        // Since the host relaunches this kernel per stage, a leak would show
+        // up as a hang in a LATER run rather than this one.
+        for (std::uint32_t s = 0; s < kPipeRingSlots; ++s) {
+            if (wide_war_live[s]) {
+                WaitFlag<HardEvent::MTE3_V>(kEvPipeWideFree[s]);
+                wide_war_live[s] = false;
+            }
+            if (nib_war_live[s]) {
+                WaitFlag<HardEvent::V_MTE2>(kEvPipeNibFree[s]);
+                nib_war_live[s] = false;
+            }
+        }
+
+        // Scoped to PIPE_MTE3: the DataCopy below is what must not run until
+        // the Fixpipe has landed the product in this AIV's UB.
+        CrossCoreWaitFlag<kPipeSyncMode, kPipeWaitAivFinal>(kPipeFlagProduct);
 
         GlobalTensor<bfloat16_t> out;
         out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(out_gm), kPipeOutElems);
@@ -326,7 +534,9 @@ extern "C" __global__ __aicore__ void test_dualdst_pipeline_kernel(
 
         q_temp.FreeTensor(temp);
         q_plane.FreeTensor(plane);
-        q_wide.FreeTensor(wide);
+        for (std::uint32_t s = 0; s < kPipeRingSlots; ++s) {
+            q_wide[s].FreeTensor(wide[s]);
+        }
         for (std::uint32_t s = 0; s < kPipeRingSlots; ++s) {
             q_scale[s].FreeTensor(buf[s].weight_scales);
             q_nib[s].FreeTensor(buf[s].weight_nibbles);

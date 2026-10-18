@@ -59,7 +59,7 @@ float FromBf16(std::uint16_t h) {
 // of being inferred. W is position-dependent in BOTH axes so an n <-> k swap
 // cannot hide:
 //
-//   W[n][k] = ((n + 2 * k) % 4) + 1        values 1..4
+//   W[k][n] = ((n + 2 * k + k / K_SUB) % 4) + 1        values 1..4
 //
 // The multiplier on k must NOT be odd-and-congruent-to-1 mod 4: a first
 // attempt used (n * 5 + k) % 4, and since 5 == 1 (mod 4) that is symmetric in
@@ -75,8 +75,30 @@ float AValue(std::uint32_t m, std::uint32_t c) {
   return (c == m) ? 1.0F : 0.0F;
 }
 // W is [K][N], contraction-major -- see the header for why.
+//
+// THE `kk / kPipeKSub` TERM IS THE TILE INDEX, AND WITHOUT IT THIS PROBE
+// CANNOT LOCALIZE AN ACCUMULATION FAILURE.
+//
+// The term was absent, leaving W[kk][n] = ((n + 2*kk) % 4) + 1. Tile t row m
+// is kk = t * K_SUB + m, and 2 * t * K_SUB = 256 * t is a multiple of 4, so
+// EVERY TILE CONTRIBUTED THE IDENTICAL VALUE and the 4-tile sum was just
+// 4x one tile. That is enough to notice that an accumulation is wrong -- it
+// reported `got 1 want 4` -- but not to say WHICH tile survived, or whether
+// one survived at all versus three being skipped. A degeneracy in the operand
+// that hides the thing being measured is exactly what CLAUDE.md section 4.8
+// is about, and it cost several cycle-accurate runs here.
+//
+// With the term, tile t contributes ((n + 2*m + t) % 4) + 1, the four tiles
+// contribute the four distinct residues, and the sum is 1+2+3+4 = 10 at EVERY
+// (m, n). So:
+//
+//   got == 10         accumulated correctly
+//   got == t + 1      at (m, n) = (0, 0): only tile t landed
+//
+// Still exact: the values are 1..4, all exact OCP E2M1 codes at scale 2^0, and
+// 10 is exact in BF16.
 float WValue(std::uint32_t kk, std::uint32_t n) {
-  return static_cast<float>(((n + 2u * kk) % 4u) + 1u);
+  return static_cast<float>(((n + 2u * kk + kk / kPipeKSub) % 4u) + 1u);
 }
 // B[k][n] = W[k][n] directly, so with the selector A:
 //   C[m][n] = sum over tiles of W[t * K_SUB + m][n]

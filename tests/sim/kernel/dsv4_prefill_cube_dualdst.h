@@ -108,25 +108,145 @@ inline constexpr std::uint32_t kDualDstUbOffset = 0;
 // `CrossCoreSetFlag<kSubBlockSyncMode = 0x2, PIPE_FIX>(flag)`, AIV
 // `CrossCoreWaitFlag(flag)` with no template arguments at all.
 inline constexpr std::uint8_t  kDualDstSyncMode = 0x2;
-inline constexpr std::uint16_t kDualDstFlagReady = 0;
+
+// --- THE WAIT SIDE'S TEMPLATE ARGUMENTS ARE NOT COSMETIC ON 950PR --------
+//
+// `CrossCoreWaitFlag` is declared
+//
+//     template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>
+//
+// so the bare `CrossCoreWaitFlag(flag)` spelling is <modeId 0, PIPE_S>, NOT
+// mode 2. `CrossCoreSetFlag` by contrast declares NO defaults, which is why
+// only the wait side can be written bare at all.
+//
+// On Ascend 950PR/950DT the spec says both template arguments are EFFECTIVE
+// and "CrossCoreWaitFlag blocks the subsequent instructions of the SPECIFIED
+// pipeline"; on A2/A3 the hardware ignores them and blocks ALL pipelines.
+// So the bare spelling that is correct-by-accident on A2/A3 degenerates on
+// 950PR into a PIPE_S-scoped block in the wrong mode, and PIPE_S is listed
+// as NOT SUPPORTED for modes 0, 1 and 2.
+//
+// THE SPEC CONTRADICTS ITSELF HERE AND THE CONTRADICTION IS WORTH RECORDING:
+// the constraint text forbids PIPE_S on the wait side for modes 0/1/2, while
+// the normative calling example under "Full-Core Synchronization Between AIC
+// and AIV" uses exactly the bare default --
+//
+//     if ASCEND_IS_AIV { CrossCoreSetFlag<2, PIPE_MTE3>(0); }
+//     if ASCEND_IS_AIC { CrossCoreWaitFlag(0); }
+//
+// -- as do the mode 0 and mode 1 examples. The shipping turboquant kernel
+// follows the examples. So "the default spelling is undefined behaviour" is
+// NOT established; what IS established from the prototype is that the
+// default is mode 0 + PIPE_S, which is a different mode and the one pipe
+// scope the constraint list excludes.
+//
+// THE AIC's RENDEZVOUS WAIT KEEPS THE BARE SPELLING, because that is the
+// spelling the passing configuration carries and the explicit one at that one
+// site has never been measured green. See the flagId note below for the
+// three-point bisection that assigned the blame, and note what it exonerates:
+// an earlier reading of this probe's failure blamed the wait spelling, on two
+// data points that differed in the flagIds as well. It was the flagIds.
+//
+// WHICH PIPE. The wait blocks one pipeline's issue, so the pipe must be the
+// one that CONSUMES the data the flag protects. Picking any other pipe does
+// not fail loudly -- it stops gating the consumer, which turns a deadlock
+// into a silent wrong answer. Per site:
+//
+//   AIV waits kDualDstFlagReady    -> next AIV op is DataCopy(out, landing),
+//                                     UB -> GM, so PIPE_MTE3.
+//   AIC waits kDualDstFlagOperands -> next AIC op is CopyGM2L1, so PIPE_MTE2.
+//
+// PIPE_V would be wrong for the AIV: there is no vector instruction after
+// the wait, so a PIPE_V-scoped block gates nothing and the MTE3 copy-out
+// reads the landing zone before the Fixpipe has written it.
+// The two pipe_t constants themselves live in the DEVICE TU
+// (test_fixpipe_dualdst_kernel.cpp, kDualDstWaitPipeAiv/Aic). `pipe_t` is an
+// AscendC device type and this header is included by the host checker with a
+// stock g++, so naming it here would break that build.
+
+// --- flagId allocation ---------------------------------------------------
+//
+// Modes 0/1/2 give each core 16 flagIds (0-15) and two ranges are reserved
+// by other CANN machinery:
+//
+//   [0, 2N-1]  the Matmul high-level API, for N defined Matmul objects, so
+//              [0, 7] at the maximum of 4 objects.
+//   [11, 14]   the SyncAll hardware synchronisation API.
+//
+// This probe defines NO Matmul object and calls no SyncAll, so neither range
+// is actually live here -- but it only needs two flags, so it takes them
+// from outside both ranges and the question does not arise.
+// --- MEASURED: THE FLAGIDS CANNOT BE MOVED FREELY, AND 8/9 DO NOT WORK ---
+//
+// These were briefly moved to 8 and 9 on the reasoning that [0, 2N-1] belongs
+// to the Matmul API and [11, 14] to SyncAll, so 8/9 are "isolated". They are
+// back at 0/1 because that is what the committed, passing configuration used
+// -- NOT because 8/9 were shown to be bad. That attempt is worth recording
+// precisely, because it is a lesson about this gate and not about flagIds:
+//
+//   dav-3510 CAModel, 2026-10-18, stage 4, in run order:
+//     explicit AIC wait + 8/9   HANGS at the 200 s watchdog
+//     bare AIC wait    + 0/1    RETIRES in 13.0 s, PASSES   (= committed)
+//     bare AIC wait    + 8/9    HANGS
+//     explicit AIC wait + 0/1   HANGS                       (== committed,
+//                                                            behaviourally)
+//
+// The fourth run is the one that matters. It differs from the second only by
+// an unused `constexpr pipe_t` and three static_asserts -- no codegen -- and
+// it hung where the second passed. SO THIS PROBE IS NONDETERMINISTIC, and the
+// two "8/9 hangs" rows carry no information: a flake explains them just as
+// well. An earlier reading of rows 1-3 concluded that the flagIds were the
+// cause; that conclusion was unsound and is retracted here.
+//
+// Nothing in the toolkit predicts a flagId restriction either: GetffstMsg
+// masks the id with 0xf so 0..15 are representable, and the only documented
+// reservations are the Matmul range and SyncAll's [11, 14] (SYNC_AIC_FLAG 11,
+// SYNC_AIV_FLAG 12, SYNC_AIC_AIV_FLAG 13, SYNC_AIV_ONLY_ALL 14, in
+// dav_3510/kernel_operator_sync_impl.h).
+//
+// WHAT THIS GATE NEEDS BEFORE IT CAN SETTLE ANYTHING: a repeat count. One run
+// is not a result here, and the intermittency has to be characterised and
+// explained before any single-run A/B over this probe is worth believing.
+inline constexpr std::uint16_t kDualDstFlagReady    = 0;  // AIC -> both AIVs
 
 // Stage selector, passed in the status buffer by the launcher.
 //   1  AIC Cube chain only -- the AIVs record their UB address and exit
 //      without waiting. Answers "does GM->L1->L0->Mmad->Fixpipe retire".
 //   2  full probe, including the cross-core handshake and the copy-out.
-//   3  as 2, but the AIV waits with EXPLICIT <mode 2, PIPE_MTE3> instead of
-//      the default template arguments.
-//   4  as 3, plus the AIV -> AIC rendezvous: the AIVs set a flag and the AIC
-//      waits on it BEFORE the Cube runs. THIS IS THE WORKING CONFIGURATION
-//      and the default.
+//   3  as 2, but the AIV waits with the BARE DEFAULT template arguments,
+//      which resolve to <modeId 0, PIPE_S>. Retained as the known-bad rung:
+//      it is the spelling the turboquant kernel and the spec's own mode 2
+//      example use, and the one this probe no longer relies on.
+//   4  correctly scoped waits -- <mode 2, consuming pipe> at every site --
+//      PLUS the AIV -> AIC rendezvous: the AIVs set a flag and the AIC waits
+//      on it BEFORE the Cube runs. THIS IS THE WORKING CONFIGURATION and the
+//      default.
+//
+// STAGES 3 AND 4 DIFFER IN TWO THINGS AT ONCE, DELIBERATELY. Stage 4 is the
+// configuration under test; stage 3 exists to show that the bare default
+// wait is not what carries it. A rung that changed only the spelling, with
+// the rendezvous already in place, is the next bisection to run if stage 4
+// ever regresses -- it is not pre-registered here because the ladder is
+// `>=`-gated and adding it between 3 and 4 would renumber the gate.
 //
 // WHAT THE LADDER ESTABLISHED, because the result is not what the mode
 // documentation on its own suggests:
 //
 //   stage 1   retires, 17.3 s   the Cube chain alone is fine
-//   stage 2   HANGS             AIC->AIV flag, default wait
-//   stage 3   HANGS             AIC->AIV flag, explicit <2, PIPE_MTE3> wait
+//   stage 2   HANGS             AIC->AIV flag, bare default wait
+//   stage 3   HANGS             AIC->AIV flag, bare default wait (renumbered;
+//                               the rung that measured HANGS carried the
+//                               explicit <2, PIPE_MTE3> wait, which stage 4
+//                               now carries instead)
 //   stage 4   retires, 14.6 s   the same, once the AIVs ALSO signal the AIC
+//
+// READ THAT TABLE WITH ITS DATE. Rows 1, 2 and 4 were measured 2026-10-17
+// against the PREVIOUS stage semantics, where stages 3 and 4 BOTH took the
+// explicit <2, PIPE_MTE3> branch because the gate was `stage >= 3`. So the
+// 14.6 s stage 4 result WAS an explicitly scoped wait, and what rows 2 and 3
+// jointly establish is that no spelling of a ONE-WAY AIC -> AIV release
+// fires. Stage 3 is now the bare-default rung and has not been re-measured
+// under that meaning.
 //
 // So a one-way AIC -> AIV release does not fire, whichever way the wait is
 // spelled. The AIV -> AIC direction has to be exercised first. Mode 2 is
@@ -142,7 +262,17 @@ inline constexpr std::uint32_t kDualDstStageWaitMode2 = 3;
 inline constexpr std::uint32_t kDualDstStageRendezvous = 4;
 
 // The AIV -> AIC direction, used only by stage 4.
-inline constexpr std::uint16_t kDualDstFlagOperands = 1;
+inline constexpr std::uint16_t kDualDstFlagOperands = 1;  // both AIVs -> AIC
+
+static_assert(kDualDstFlagReady <= 15 && kDualDstFlagOperands <= 15,
+              "a mode 2 flagId is 4 bits; a larger value is silently "
+              "truncated to its low 4 bits rather than rejected");
+static_assert(kDualDstFlagReady != kDualDstFlagOperands,
+              "the two directions must not share a counter");
+static_assert((kDualDstFlagReady < 11 || kDualDstFlagReady > 14) &&
+                  (kDualDstFlagOperands < 11 || kDualDstFlagOperands > 14),
+              "flagIds 11-14 are reserved by the SyncAll hardware "
+              "synchronisation API");
 
 // --- status block -------------------------------------------------------
 //

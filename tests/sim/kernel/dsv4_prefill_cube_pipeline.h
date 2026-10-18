@@ -117,10 +117,30 @@ inline constexpr std::uint32_t kPipeHalfElems = kPipeMHalf * kPipeN;
 inline constexpr std::uint32_t kPipeOutElems  = 2u * kPipeHalfElems;
 
 // --- cross-core flags -----------------------------------------------------
-// Mode 2 on every set, default template arguments on every wait. The AIV ->
-// AIC direction is exercised first by construction: the AIC's first act is to
-// wait for slot 0, which is the rendezvous STEP 1 measured to be mandatory
-// (see dsv4_prefill_cube_dualdst.h -- a one-way AIC -> AIV flag never fires).
+// Mode 2 on every set AND on every wait. The AIV -> AIC direction is
+// exercised first by construction: the AIC's first act is to wait for slot 0,
+// which is the rendezvous STEP 1 measured to be mandatory (see
+// dsv4_prefill_cube_dualdst.h -- a one-way AIC -> AIV flag never fires).
+//
+// THE WAIT SIDE IS NO LONGER WRITTEN BARE. `CrossCoreWaitFlag` declares
+// `template <uint8_t modeId = 0, pipe_t pipe = PIPE_S>`, so `CrossCoreWaitFlag(f)`
+// is mode 0 + PIPE_S -- a different mode from the mode 2 the set side uses,
+// and the one pipe scope the spec's constraint list excludes for modes 0/1/2.
+// On 950PR both template arguments are EFFECTIVE (on A2/A3 the hardware
+// ignores them and blocks every pipeline), and an effective wait blocks only
+// the pipeline it names. So the pipe has to be the one that CONSUMES what the
+// flag protects, per site:
+//
+//   AIC waits SlotReady+slot  -> next is CopyL12L0B out of the L1 slot, MTE1.
+//   AIV waits SlotFree+slot   -> what it gates is this AIV's ND2NZ push INTO
+//                                that L1 slot, which is MTE3.
+//   AIV waits Product         -> next is DataCopy(out, landing), UB -> GM,
+//                                so MTE3.
+//
+// Choosing the wrong pipe does not fail loudly: it stops gating the consumer,
+// which is a silent wrong answer rather than a hang. The pipe_t constants
+// live in the device TU because `pipe_t` is an AscendC type and this header
+// is read by the host checker under a stock g++.
 inline constexpr std::uint8_t  kPipeSyncMode = 0x2;
 
 // THE AIC WAITS ONCE PER TILE, NOT ONCE PER AIV, AND THAT IS MEASURED.
@@ -133,9 +153,49 @@ inline constexpr std::uint8_t  kPipeSyncMode = 0x2;
 // a 240 s watchdog. The documented all-M semantics hold, one wait is right,
 // and a partially-written L1 slot is NOT explained by the Cube overtaking
 // the second AIV.
-inline constexpr std::uint16_t kPipeFlagSlotReady = 0;  // + slot : AIV -> AIC
-inline constexpr std::uint16_t kPipeFlagSlotFree  = 2;  // + slot : AIC -> AIV
-inline constexpr std::uint16_t kPipeFlagProduct   = 4;  //         AIC -> AIV
+// --- flagId allocation: [0, 3] IS NOT FREE IN THIS TU --------------------
+//
+// This probe's device TU textually includes the production kernel
+// (op_kernel/dsv4_moe_prefill_cube_kernel.cpp) to reuse
+// AsyncLoadWeightsSubTile and DequantSubTileVector verbatim. That file
+// DEFINES TWO Matmul objects -- GateUpMatmul and DownMatmul -- and the spec
+// is explicit that the Matmul high-level API uses CrossCoreSetFlag
+// internally and occupies flagId [0, 2N-1] for N defined objects. N = 2, so
+// [0, 3] is Matmul's.
+//
+// The original allocation was ready = 0 (-> 0, 1), free = 2 (-> 2, 3),
+// product = 4: FOUR of the five flags sat inside Matmul's range. The
+// probe's own entry point never calls REGIST_MATMUL_OBJ, so those flags are
+// very likely not live at run time -- but "very likely not live" is not a
+// property worth depending on for a handshake, and nothing in the build
+// would report it if it were wrong.
+//
+// SyncAll owns [11, 14], so the safe region is [4, 10] + {15}. Five flags
+// fit in [4, 8] with room to spare:
+inline constexpr std::uint16_t kPipeFlagSlotReady = 4;  // + slot : AIV -> AIC
+inline constexpr std::uint16_t kPipeFlagSlotFree  = 6;  // + slot : AIC -> AIV
+inline constexpr std::uint16_t kPipeFlagProduct   = 8;  //         AIC -> AIV
+
+// The Matmul object count this TU inherits. If the production kernel gains a
+// third object the reserved range grows to [0, 5] and the asserts below
+// catch it at compile time rather than as an intermittent hang.
+inline constexpr std::uint16_t kPipeMatmulObjects = 2;
+inline constexpr std::uint16_t kPipeMatmulFlagMax = 2u * kPipeMatmulObjects - 1u;
+
+static_assert(kPipeFlagSlotReady > kPipeMatmulFlagMax &&
+                  kPipeFlagSlotFree > kPipeMatmulFlagMax &&
+                  kPipeFlagProduct > kPipeMatmulFlagMax,
+              "a flagId inside [0, 2N-1] can be taken by the Matmul "
+              "high-level API, which this TU defines N=2 objects of");
+static_assert(kPipeFlagSlotReady + kPipeRingSlots - 1u < kPipeFlagSlotFree &&
+                  kPipeFlagSlotFree + kPipeRingSlots - 1u < kPipeFlagProduct,
+              "the per-slot flag ranges must not overlap each other");
+static_assert(kPipeFlagProduct <= 15,
+              "a mode 2 flagId is 4 bits; a larger value is silently "
+              "truncated to its low 4 bits rather than rejected");
+static_assert(kPipeFlagSlotReady < 11 && kPipeFlagProduct < 11,
+              "flagIds 11-14 are reserved by the SyncAll hardware "
+              "synchronisation API");
 
 // --- HOW THE LAYOUT DEFECT WAS FOUND, 2026-10-17 --------------------------
 // Kept because the method is reusable and the conclusion is not guessable
@@ -175,6 +235,67 @@ inline constexpr std::uint16_t kPipeFlagProduct   = 4;  //         AIC -> AIV
 inline constexpr std::uint32_t kPipeStageOneTile  = 1;
 inline constexpr std::uint32_t kPipeStageAccum    = 2;
 inline constexpr std::uint32_t kPipeStagePrefetch = 3;
+
+// --- intra-core event ids for the deferred fences -------------------------
+//
+// An intra-core flag is BINARY, not a counter: a second SetFlag on the same
+// (srcPipe, dstPipe, eventID) triple before the first is consumed is
+// undefined behaviour, and a later PipeBarrier<PIPE_ALL> then hangs. Every
+// fence that is DEFERRED across a loop iteration therefore needs one id per
+// ring slot, because two of its tokens are outstanding at once.
+//
+// The production routines this probe reuses own kEvCubeMte2ToV (= 0) as their
+// default. The probe passes a PER-SLOT id instead so tile k+1's MTE2 burst
+// can be in flight while the Vector unit dequantizes tile k -- that overlap
+// is the whole point of stage 3 and it is unreachable with one shared id.
+//
+// Ids 6 and 7 are excluded: 6 is reserved for internal system planning and 7
+// is used by TPipe's automatic synchronization feature.
+inline constexpr int kEvPipeMte2ToV[kPipeRingSlots] = {0, 4};
+// The wide (dequant output) WAR fence, deferred one full ring lap.
+inline constexpr int kEvPipeWideFree[kPipeRingSlots] = {3, 5};
+// The dequant -> push RAW fence. Consumed immediately, so one id suffices.
+//
+// IT IS REQUIRED BECAUSE THE PUSH BURSTS FROM `wide` DIRECTLY. The probe uses
+// the operator's own `PushUbTileToL1Nz`, one strided DataCopy per NZ C0 block
+// out of wide[slot], so the Vector write and the MTE3 read are on different
+// pipes and need this edge. It was briefly dropped as redundant, which was
+// true only while the push went through the `Nd2NzParams` overload: that path
+// reads `wide` with `TransND2NZ` on the VECTOR pipe and bursts from a separate
+// stack buffer, making the edge V -> V. Dropping it with the direct push would
+// be a silent wrong answer.
+inline constexpr int kEvPipeWideReady = 1;
+// The nibble/scale staging WAR fence: the Vector unit must have finished
+// READING slot s before tile k+1's burst overwrites it. Per-slot, because the
+// prefetch is issued a full iteration ahead of the dequant that consumes it.
+// V_MTE2 is a DIFFERENT HardEvent from MTE2_V, and a flag is keyed by the
+// whole (srcPipe, dstPipe, eventID) triple, so these ids may repeat the
+// kEvPipeMte2ToV values without aliasing them.
+inline constexpr int kEvPipeNibFree[kPipeRingSlots] = {0, 1};
+// AIC-side fences, both IMMEDIATE pairs. Distinct HardEvents, so these ids may
+// repeat ids used by the AIV: a flag is keyed by the full
+// (srcPipe, dstPipe, eventID) triple, and the AIC and AIV are different cores
+// besides.
+//
+// THEY WERE BRIEFLY DEFERRED ACROSS A LAP, LIKE THE AIV's, AND THAT DOES NOT
+// WORK HERE. A deferred fence's SetFlag and WaitFlag sit on different pipes and
+// the scalar unit issues the loop body without blocking, so the producing pipe
+// can raise lap k+1's token before the consuming pipe reaches lap k's wait --
+// `execute_set_flag already has same set_flag!`, four times per run, with the
+// counts textually balanced. The AIV's deferred fences survive that because a
+// RAW chain already orders their two pipes (a burst cannot be issued until the
+// Vector unit releases the staging, and the Vector unit cannot dequantize until
+// the burst lands); nothing plays that role for the AIC's L0 buffers.
+inline constexpr int kEvPipeMToMte1    = 1;  // L0A/L0B WAR, Mmad -> next MTE1
+inline constexpr int kEvPipeMte1ToMte2 = 2;  // l1A WAR, MTE1 -> next MTE2
+
+static_assert(kPipeRingSlots == 2,
+              "the per-slot event id tables above are sized for a depth-2 "
+              "ring; a deeper ring needs more ids and only 0-5 are usable");
+static_assert(kEvPipeMte2ToV[0] != kEvPipeMte2ToV[1] &&
+                  kEvPipeWideFree[0] != kEvPipeWideFree[1],
+              "a deferred fence needs a DISTINCT id per slot, or the second "
+              "SetFlag lands on an unconsumed flag");
 
 // --- status block ---------------------------------------------------------
 // One 128 B region per writer. A shared cache line loses writes, because

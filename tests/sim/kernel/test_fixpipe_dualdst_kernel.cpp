@@ -62,6 +62,10 @@ struct CopyL0C2UBTraitDualDstM {
     static constexpr const TraitType value = kL0c2UbTrait;
 };
 
+// The pipe the AIV's CrossCoreWaitFlag scopes its block to: the pipeline that
+// CONSUMES what the flag protects. See dsv4_prefill_cube_dualdst.h.
+inline constexpr pipe_t kDualDstWaitPipeAiv = PIPE_MTE3;  // DataCopy UB -> GM
+
 // `region` picks the writer's own cache line; `slot` is the word inside it.
 // See the header for why a shared line loses writes.
 __aicore__ inline void WriteStatus(GM_ADDR status, std::uint32_t region,
@@ -94,6 +98,18 @@ extern "C" __global__ __aicore__ void test_fixpipe_dualdst_kernel(
         // AIV -> AIC direction only releases once BOTH have, so this is one
         // wait for two setters.
         if (stage >= kDualDstStageRendezvous) {
+            // Mode 2's AIV -> AIC direction releases only once BOTH AIVs have
+            // set, so this is one wait for two setters.
+            //
+            // THE BARE SPELLING, because it is the one the passing
+            // configuration carries. It briefly became
+            // `CrossCoreWaitFlag<kDualDstSyncMode, PIPE_MTE2>` as part of
+            // naming the mode and the pipe at every site, and that version
+            // hung -- but the bisection in dsv4_prefill_cube_dualdst.h shows
+            // the hang was the flagIds moving to 8/9 at the same time, NOT
+            // this spelling. The explicit form here is therefore untested
+            // rather than wrong; it is simply not what has been measured
+            // green, so it is not what ships in the probe.
             CrossCoreWaitFlag(kDualDstFlagOperands);
         }
 
@@ -215,8 +231,15 @@ extern "C" __global__ __aicore__ void test_fixpipe_dualdst_kernel(
         }
 
         if (stage >= kDualDstStageFull) {
-            if (stage >= kDualDstStageWaitMode2) {
-                CrossCoreWaitFlag<kDualDstSyncMode, PIPE_MTE3>(kDualDstFlagReady);
+            // Stage 4 names the mode and the consuming pipe; stage 3 keeps
+            // the bare default (<modeId 0, PIPE_S>) as the known-bad rung.
+            // The block has to land on PIPE_MTE3 because the instruction it
+            // must gate is the DataCopy below -- a PIPE_V scope would gate
+            // nothing here and let the copy-out read the landing zone before
+            // the Fixpipe wrote it.
+            if (stage >= kDualDstStageRendezvous) {
+                CrossCoreWaitFlag<kDualDstSyncMode, kDualDstWaitPipeAiv>(
+                    kDualDstFlagReady);
             } else {
                 CrossCoreWaitFlag(kDualDstFlagReady);
             }
