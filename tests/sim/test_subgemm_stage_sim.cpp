@@ -17,9 +17,11 @@
 #include "dsv4_moe_block_sim_common.hpp"
 
 #include "dsv4_moe_prefill_cube_tiling.h"
+#include "kernel/dsv4_prefill_cube_ub_census.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace moe::kernels::arch35 {
 Status LaunchSubgemmStageProbe(const Mxfp4Pair* w_packed_gm,
@@ -43,6 +45,135 @@ constexpr std::uint32_t kProbeAiv    = 2;
 // replayed sub-GEMM (94.1 s at 1 rep, 151.6 s at 2). Pass it explicitly when
 // the stage is expected to cost more.
 int g_probe_budget = 180;
+
+// Decodes the UB physical address census the probe writes. See
+// kernel/dsv4_prefill_cube_ub_census.h for the wire format and the reason it
+// is read rather than computed.
+//
+// Nothing here FAILS the run: the census is a measurement, and the thing it
+// measures is exactly the thing that is currently wrong. Printing it under a
+// failing stage is the point.
+void PrintUbCensus(const std::vector<std::int32_t>& status) {
+  using namespace moe::kernels::arch35;
+
+  const auto word = [&status](std::uint32_t i) -> std::uint32_t {
+    return static_cast<std::uint32_t>(status[static_cast<std::size_t>(i)]);
+  };
+
+  if (word(1) != kUbCensusMagic) {
+    std::printf("  UB census: ABSENT (word 1 = 0x%08X, expected 0x%08X)\n",
+                word(1), kUbCensusMagic);
+    return;
+  }
+  const std::uint32_t entries = word(2);
+  if (entries != kUbCensusTotalEntries) {
+    std::printf("  UB census: TORN (%u entries, expected %u)\n", entries,
+                kUbCensusTotalEntries);
+    return;
+  }
+
+  std::vector<std::uint64_t> addr(entries);
+  for (std::uint32_t i = 0; i < entries; ++i) {
+    addr[i] = static_cast<std::uint64_t>(word(kUbCensusHeaderWords + 2u * i)) |
+              (static_cast<std::uint64_t>(word(kUbCensusHeaderWords + 2u * i + 1u))
+               << 32);
+  }
+
+  const std::uint64_t base = addr[0];
+  std::printf(
+      "\n  UB PHYSICAL ADDRESS CENSUS (GetPhyAddr, allocation order)\n"
+      "  TPipe dynamic pool base = %llu B (0x%llX)\n"
+      "  physical UB             = %u B (0x%X)\n"
+      "  dynamic pool available  = %lld B\n"
+      "  %-24s %10s %10s %10s  %s\n",
+      static_cast<unsigned long long>(base),
+      static_cast<unsigned long long>(base), kUbCensusPhysicalUbBytes,
+      kUbCensusPhysicalUbBytes,
+      static_cast<long long>(kUbCensusPhysicalUbBytes) -
+          static_cast<long long>(base),
+      "buffer", "addr", "0x", "size", "");
+
+  // Sizes are not transmitted: TPipe allocates in InitBuffer order, so each
+  // UB buffer is bounded by the next one's address. The last UB entry has no
+  // successor, so its size is left blank rather than guessed.
+  for (std::uint32_t i = 0; i < kUbCensusUbEntries; ++i) {
+    const bool has_next = (i + 1u) < kUbCensusUbEntries;
+    const long long size =
+        has_next ? static_cast<long long>(addr[i + 1u]) -
+                       static_cast<long long>(addr[i])
+                 : -1;
+    const bool past_end = addr[i] >= kUbCensusPhysicalUbBytes;
+    char size_text[24];
+    if (size >= 0) {
+      std::snprintf(size_text, sizeof(size_text), "%lld", size);
+    } else {
+      std::snprintf(size_text, sizeof(size_text), "%s", "-");
+    }
+    std::printf("  %-24s %10llu 0x%08llX %10s  %s\n", kUbCensusNames[i],
+                static_cast<unsigned long long>(addr[i]),
+                static_cast<unsigned long long>(addr[i]), size_text,
+                past_end ? "<== PAST PHYSICAL UB" : "");
+  }
+
+  // The first address past the last UB allocation. scale_temporary is
+  // 16 uint16 = 32 B, the one size the census cannot derive from a successor.
+  constexpr std::uint64_t kScaleTemporaryBytes = 32;
+  const std::uint64_t ub_end =
+      addr[kUbCensusUbEntries - 1u] + kScaleTemporaryBytes;
+
+  // The ring slots. Whether these are UB or L1 is the open question the
+  // census exists to close, so the verdict is computed from the addresses
+  // rather than asserted: contiguous from ub_end means they share the UB pool.
+  bool ring_in_ub = true;
+  for (std::uint32_t i = 0; i < kUbCensusTscmSlots; ++i) {
+    const std::uint32_t e = kUbCensusTscmEntry + i;
+    const std::uint64_t a = addr[e];
+    if (a == ~static_cast<std::uint64_t>(0)) {
+      std::printf("  %-24s %10s %10s %10s  %s\n", kUbCensusNames[e], "-", "-",
+                  "-", "(not recorded)");
+      ring_in_ub = false;
+      continue;
+    }
+    const long long size =
+        (i + 1u < kUbCensusTscmSlots &&
+         addr[e + 1u] != ~static_cast<std::uint64_t>(0))
+            ? static_cast<long long>(addr[e + 1u]) - static_cast<long long>(a)
+            : -1;
+    char size_text[24];
+    if (size >= 0) {
+      std::snprintf(size_text, sizeof(size_text), "%lld", size);
+    } else {
+      std::snprintf(size_text, sizeof(size_text), "%s", "-");
+    }
+    std::printf("  %-24s %10llu 0x%08llX %10s  %s\n", kUbCensusNames[e],
+                static_cast<unsigned long long>(a),
+                static_cast<unsigned long long>(a), size_text,
+                a >= kUbCensusPhysicalUbBytes ? "<== PAST PHYSICAL UB" : "");
+    if (a < ub_end) {
+      ring_in_ub = false;  // below the UB high-water mark: a separate pool
+    }
+  }
+
+  // THE NUMBER THAT MATTERS. If the ring shares the UB pool, the budget is
+  // everything up to the last ring slot's end, not just the sixteen UB
+  // buffers -- and the sixteen alone would understate it by 131,072 B.
+  constexpr std::uint64_t kRingSlotBytes = 32768;
+  const std::uint64_t used_end =
+      ring_in_ub ? addr[kUbCensusTotalEntries - 1u] + kRingSlotBytes : ub_end;
+  std::printf(
+      "  16 UB buffers           = %llu B (base .. %llu)\n"
+      "  TSCM ring slots         = %s\n"
+      "  UB pool high-water mark = %llu B\n"
+      "  headroom to physical UB = %lld B%s\n\n",
+      static_cast<unsigned long long>(ub_end - base),
+      static_cast<unsigned long long>(ub_end),
+      ring_in_ub ? "IN THE UB POOL, contiguous from the UB end"
+                 : "a separate pool (L1), as the headers say",
+      static_cast<unsigned long long>(used_end),
+      static_cast<long long>(kUbCensusPhysicalUbBytes) -
+          static_cast<long long>(used_end),
+      used_end > kUbCensusPhysicalUbBytes ? "   *** OVERFLOWS ***" : "");
+}
 
 const char* StageName(std::uint32_t s) {
   switch (s) {
@@ -94,7 +225,7 @@ int RunStage(std::uint32_t stage) {
       CopyToDevice(wsDev, init);
     }
 
-    std::vector<std::int32_t> status(8, -1);
+    std::vector<std::int32_t> status(kUbCensusStatusWords, -1);
     DeviceBuffer statusDev(status.size() * sizeof(std::int32_t));
     CopyToDevice(statusDev, status);
 
@@ -113,6 +244,7 @@ int RunStage(std::uint32_t stage) {
       Fail(LaunchFailure("LaunchSubgemmStageProbe", st));
     }
     CopyFromDevice(status, statusDev);
+    PrintUbCensus(status);
     std::printf("  liveness word: %d (expected %u)\n", status[0], stage);
     if (status[0] != static_cast<std::int32_t>(stage)) {
       Fail("the launch returned but the kernel body did not complete its stage");

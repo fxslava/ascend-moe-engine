@@ -106,6 +106,11 @@ static_assert(kCubeKSub  == kPrefillCubeKSub,      "phase 1 hidden contraction s
 static_assert(kCubeHSub  == kPrefillCubeHSub,      "phase 2 hidden output sub-tile disagrees");
 static_assert(kCubeRSub2 == kPrefillCubeRSub2,     "phase 2 inter contraction sub-tile disagrees");
 static_assert(kCubeGroup == kPrefillCubeGroupSize, "MXFP4 group size disagrees");
+// The act plane's capacity. The HOST copy is authoritative because the host
+// admissibility predicate is what rejects `inter > cap`; this one only sizes the
+// buffer. A drift between them is a plane that is smaller than the geometry the
+// host admitted, which is a silent write past its end, so it is a compile error.
+static_assert(kCubeActInterCap == kPrefillCubeInterCap, "act plane capacity disagrees between the UB layout and the tiling header the host validates from");
 
 // The token prefetch ring. Two slots, two event ids -- and each id carries TWO flags, because a
 // flag is keyed by the (srcPipe, dstPipe, eventID) triple: `MTE2_V` id 2 ("ping is full") and

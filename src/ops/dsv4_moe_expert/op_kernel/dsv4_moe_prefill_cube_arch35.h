@@ -42,6 +42,28 @@ inline constexpr std::uint32_t kCubeGroup = 32;    // MXFP4 group
 inline constexpr std::uint32_t kCubeHiddenMax = 4096;
 inline constexpr std::uint32_t kCubeInterMax = 2048;
 
+// THE ACT PLANE'S CAPACITY IS NOT kCubeInterMax.
+//
+// kCubeInterMax is the MODEL's widest inter axis. kCubeActInterCap is how wide
+// a `inter` the resident act plane is actually built to hold, and the two are
+// only the same number in a production build. Sizing the plane from the model
+// maximum charged 65,536 B whatever the run's geometry, and no CAModel fixture
+// goes past inter = 512 -- so 49,152 B of that was capacity no access ever
+// used.
+//
+// This is the host's constant, duplicated for the same reason kCubeMTile is:
+// op_host/dsv4_moe_prefill_cube_tiling.h is what VALIDATES the geometry (§2.5)
+// and op_kernel/ is private (§1.2), so each side carries its own copy and the
+// kernel TU static_asserts them equal. The HOST side is authoritative: its
+// admissibility predicate rejects `inter > cap`, and without that rejection an
+// over-wide `inter` is a silent write past the end of the plane rather than an
+// error -- the kernel's early return produces a zeroed output, not a fault.
+#if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
+inline constexpr std::uint32_t kCubeActInterCap = 512;
+#else
+inline constexpr std::uint32_t kCubeActInterCap = kCubeInterMax;
+#endif
+
 // Both phases' weight sub-tiles hold the same number of elements, which is why
 // ONE staging pair (nibbles + BF16) serves both. Asserted rather than assumed:
 // the two shapes are chosen independently and this coincidence is load-bearing.
@@ -55,11 +77,15 @@ static_assert(kCubeWeightSubElems == kCubeHSub * kCubeRSub2,
 // ---------------------------------------------------------------------------
 // Resident across BOTH phases:
 //
-//     act          BF16  [16, 2048]   65,536 B   the whole point of the
+//     act          BF16  [16, cap]    32 B/col  the whole point of the
 //                                                schedule: it carries the
 //                                                intermediate from the last
 //                                                gate/up GEMM to the first
-//                                                down GEMM with no GM hop
+//                                                down GEMM with no GM hop.
+//                                                65,536 B at the production
+//                                                cap of 2048, 16,384 B at
+//                                                the sim cap of 512 -- see
+//                                                kCubeActInterCap
 //
 // Phase 1 only:
 //
@@ -84,22 +110,29 @@ static_assert(kCubeWeightSubElems == kCubeHSub * kCubeRSub2,
 //     w_wide       BF16  [16384]      32,768 B   expanded, before UB -> L1
 //     w_scale      u8    [128 x 32]    4,096 B   E8M0 bytes, one 32 B burst
 //                                                block per sub-tile row
-//                                     ---------
-//                                     163,840 B  of 221,184 B usable
+//
+// THE TABLE ABOVE IS NOT THE BUDGET. It lists the buffers once; the kernel
+// allocates x_f32 and x_sub TWICE (ping and pong) and adds a one-row scale
+// buffer and a 32 B scale temporary that the table never had. The authority
+// is kCubeUbBytes below, which enumerates the InitBuffer calls one for one:
+//
+//     everything except act         111,136 B    kCubeUbBytesLessAct
+//     + act at the production cap    65,536 B -> 176,672 B total
+//     + act at the sim cap of 512    16,384 B -> 127,520 B total
 //
 // The phase-only segments are NOT overlaid even though the phases are disjoint
 // in time: TPipe allocates statically, and overlaying them would mean aliasing
 // two LocalTensors onto one TBuf, which is how a buffer-reuse bug becomes
-// invisible. There is 57,344 B of headroom, so the honest layout is affordable
-// and the clever one is not worth its failure mode.
+// invisible.
 //
-// AT M_TILE = 32 every row of that table except the three weight-staging ones
-// doubles, since they are the only buffers whose extent does not carry M:
-// 163,840 + 65,536 + 16,384 + 8,192 + 8,192 + 4,096 + 4,096 + 4,096 + 8,192
-// = 282,624 B, which exceeds not just kUsableUbBytes but physical UB (262,144).
-// So 16 is forced, and the forcing term is the `act` residency -- the same
-// argument as before the two-phase rewrite, for the same reason.
-inline constexpr std::uint32_t kCubeActBytes = kCubeMTile * kCubeInterMax * 2u;
+// AT M_TILE = 32 every line except the three weight-staging ones doubles,
+// since they are the only buffers whose extent does not carry M. At the
+// production cap that is 176,672 + 131,072 = 307,744 B, past physical UB
+// (262,144) on its own and nearly 2.4x the dynamic pool a TPipe on an AIV
+// actually hands out. So 16 is forced, and the forcing term is the `act`
+// residency -- the same argument as before the two-phase rewrite, for the
+// same reason.
+inline constexpr std::uint32_t kCubeActBytes = kCubeMTile * kCubeActInterCap * 2u;
 inline constexpr std::uint32_t kCubeAcc1Bytes = kCubeMTile * kCubeRSub * 4u;
 inline constexpr std::uint32_t kCubeAcc2Bytes = kCubeMTile * kCubeHSub * 4u;
 inline constexpr std::uint32_t kCubeXF32Bytes = kCubeMTile * kCubeKSub * 4u;
@@ -118,7 +151,10 @@ inline constexpr std::uint32_t kCubeScaleRowsMax =
 inline constexpr std::uint32_t kCubeScaleBytes =
     kCubeScaleRowsMax * kCubeScaleRowStride;
 
-static_assert(kCubeActBytes == 65536, "act must be 65,536 B");
+static_assert(kCubeActBytes == kCubeMTile * kCubeActInterCap * 2u &&
+                  kCubeActBytes == (kCubeActInterCap == 2048u ? 65536u : 16384u),
+              "the act plane is M_TILE x inter_cap in BF16: 65,536 B at the "
+              "production cap of 2048, 16,384 B at the sim cap of 512");
 static_assert(kCubeWideBytes == 32768, "the dequant staging must be 32,768 B");
 // A sub-tile row's scale bytes must fit the 32 B block the burst reserves for
 // it, in BOTH phases -- K_SUB / 32 = 4 and R_SUB2 / 32 = 8, so both do.
@@ -178,21 +214,138 @@ inline constexpr std::uint32_t kCubeUbBytes =
     kCubeScaleRowBytes +     // q_scale_plane  (was kCubeRSub * kCubeKSub * 2)
     kCubeScaleTempBytes;     // q_scale_temporary
 
-static_assert(kCubeUbBytes == 176672,
-              "the Cube prefill UB budget must sum to 176,672 B. This number "
-              "is the ACTUAL total of the kernel's InitBuffer calls, verified "
+// Everything EXCEPT the act plane. Stated separately because it is the part
+// that does not move with the geometry, and because the act plane is the only
+// line the inter cap can shrink -- so this is the floor any cap has to clear.
+inline constexpr std::uint32_t kCubeUbBytesLessAct = kCubeUbBytes - kCubeActBytes;
+
+static_assert(kCubeUbBytesLessAct == 111136,
+              "every InitBuffer except the act plane sums to 111,136 B. This "
+              "number is the ACTUAL total of the kernel's calls, verified "
               "against them one by one; the old 163,840 omitted the scale "
               "plane, the scale temporary and the second of each ping/pong "
               "pair. If this fires, re-derive it from the kernel rather than "
               "adjusting the literal");
+static_assert(kCubeUbBytes == kCubeUbBytesLessAct + kCubeActBytes &&
+                  kCubeUbBytes == (kCubeActInterCap == 2048u ? 176672u : 127520u),
+              "the Cube prefill UB budget is 176,672 B at the production inter "
+              "cap and 127,520 B at the sim cap of 512");
+
+// kUsableUbBytes IS NOT THE BINDING CEILING, and this assert is kept because
+// it is cheap, not because passing it means anything. kCubeUbBytes is not the
+// whole UB charge either. Both statements are MEASURED, on the dav-3510
+// CAModel, 2026-10-17, by the GetPhyAddr census in
+// tests/sim/kernel/test_subgemm_stage_kernel.cpp.
+//
+// WHAT THE CENSUS READ, at the sim cap, stage 3, hidden 128 / inter 256:
+//
+//     TPipe dynamic pool base            0          NOT ~131,616
+//     activation_resident                0 ..  16,384
+//     ... the sixteen UB buffers ...
+//     scale_temporary              127,488 .. 127,520
+//     q_weight_fwd [0] (TSCM)      127,520 .. 160,288
+//     q_weight_fwd [1] (TSCM)      160,288 .. 193,056
+//     q_weight_down[0] (TSCM)      193,056 .. 225,824
+//     q_weight_down[1] (TSCM)      225,824 .. 258,592
+//
+// TWO THINGS THAT WERE BELIEVED AND ARE NOT TRUE:
+//
+//   1. The pool does NOT start past a SIMT DataCache reservation. It starts
+//      at 0. `TPipe::ResetPool()` on an AIV seeds it with
+//      `GetDynamicMemStartPos<Hardware::UB>()` = `&dynamicStartUB[0]`
+//      (impl/basic_api/kernel_tensor_impl.h, dav_3510 only), and in this
+//      build that linker symbol resolves to zero. So the whole 262,144 B is
+//      addressable, and both "buffers begin at ~131,616" and "the usable
+//      ceiling is ~130,528" were readings of something else.
+//
+//   2. kCubeUbBytes IS NOT THE CHARGE. All four TPosition::TSCM ring slots
+//      come back CONTIGUOUS with the sixteen UB buffers, 32,768 B apart,
+//      running 127,520 -> 258,592. They are not in the separate L1 pool that
+//      GetPhyType(TSCM) == Hardware::L1 and TPipe::TscmInitBuffer's
+//      top-of-L1 allocation would predict. The ring is 131,072 B of UB.
+//
+// WHICH IS THE WHOLE BUG. The budget that faulted was
+// 176,672 + 131,072 = 307,744 against 262,144 -- over by 45,600 B, the
+// "~46 KB" the ub_addr_overflow diagnostics were reporting. The budget that
+// does not is 127,520 + 131,072 = 258,592, which fits with 3,552 B to spare,
+// and the fault count is zero.
+//
+// Measured, dav-3510 CAModel, 2026-10-17, by the GetPhyAddr census in
+// tests/sim/kernel/test_subgemm_stage_kernel.cpp. Never run on hardware.
+// The weight ring's slot sizes. Declared here rather than in the "L1" section
+// below because the census says that is where they are SPENT: the ring is a
+// line in the UB budget, and the section below is named for a pool it does
+// not reach.
+inline constexpr std::uint32_t kCubeB1SlotBytes = kCubeRSub * kCubeKSub * 2u;
+inline constexpr std::uint32_t kCubeB2SlotBytes = kCubeHSub * kCubeRSub2 * 2u;
+static_assert(kCubeB1SlotBytes == 32768 && kCubeB2SlotBytes == 32768,
+              "each weight ring slot is 32,768 B");
+
+// Two slots per queue, two queues, all four live at once -- confirmed by the
+// census, which read them contiguous and 32,768 B apart.
+inline constexpr std::uint32_t kCubeTscmRingBytes =
+    2u * kCubeB1SlotBytes + 2u * kCubeB2SlotBytes;
+static_assert(kCubeTscmRingBytes == 131072, "the weight ring costs 131,072 B");
+inline constexpr std::uint32_t kCubeUbTotalBytes =
+    kCubeUbBytes + kCubeTscmRingBytes;
+
+// The largest act plane physical UB can hold, and hence the largest `inter`
+// this schedule admits, derived rather than chosen:
+//
+//     262,144 - 111,136 (UB less act) - 131,072 (ring) = 19,936 B for act
+//     19,936 / (M_TILE * 2) = 623 columns
+//     rounded down to a whole phase 2 contraction sub-tile  -> 512
+//
+// So kCubeActInterCap = 512 is not a sim convenience, it is the ceiling.
+inline constexpr std::uint32_t kCubeActInterCapMax =
+    ((kUbTotalBytes - kCubeUbBytesLessAct - kCubeTscmRingBytes) /
+     (kCubeMTile * 2u)) /
+    kCubeRSub2 * kCubeRSub2;
+static_assert(kCubeActInterCapMax == 512,
+              "the act plane's ceiling is 512 inter columns at this layout");
+
+// NOT ASSERTED, DELIBERATELY, AND THIS IS A KNOWN DEFECT RATHER THAN A GAP:
+//
+//     static_assert(kCubeUbTotalBytes <= kUbTotalBytes)
+//
+// would hold at the sim cap (258,592) and FAIL in a production build
+// (307,744). The production geometry -- hidden 4096, inter 2048 -- does not
+// fit this schedule's UB, so a production build today compiles a kernel that
+// over-commits UB by 45,600 B and whose stores past the end the simulator
+// drops silently. Writing the assert is the correct fix and it retires the
+// operator's headline shape, which is a decision about what v1 supports and
+// not a comment edit. Until it is taken, `kCubeActInterCap` at 2048 is known
+// wrong and only the sim cap is verified.
+//
+// The assert below is kept because it is cheap, not because passing it means
+// anything: kUsableUbBytes is 221,184 and the real ceiling is 262,144 against
+// a charge this constant does not include.
 static_assert(kCubeUbBytes <= kUsableUbBytes,
               "the Cube prefill UB budget exceeds the arch35 usable ceiling");
 
 // ---------------------------------------------------------------------------
-// L1: the weight sub-tile staging the Cube reads B from
+// The weight sub-tile staging the Cube reads B from
 // ---------------------------------------------------------------------------
-// TWO slots for phase 1 and ONE for phase 2, and what the second slot is for
-// needs stating precisely because the obvious reading is wrong TODAY.
+// THIS SECTION IS NAMED "L1" AND THE MEASUREMENT SAYS IT IS NOT.
+//
+// `TQue<TPosition::TSCM, 2>` is supposed to be an L1 allocation:
+// GetPhyType(TSCM) is Hardware::L1, and TPipe::TscmInitBuffer fills it from
+// the TOP of L1 downward, so the four slots should have reported addresses
+// near 524,288 in a pool of their own. The GetPhyAddr census read them at
+// 127,520 / 160,288 / 193,056 / 225,824 -- contiguous with the UB buffers and
+// inside UB. See the census note on kCubeUbTotalBytes above; the 131,072 B
+// they cost is charged there, not here.
+//
+// kCubeL1Bytes below is therefore NOT a measured L1 occupancy. It is kept
+// because the emu golden's L1 charge is written against the same formula and
+// the two are compared; it is not evidence about this kernel's L1 use, and
+// the assert under it is checking an arithmetic identity rather than a
+// hardware fact. WHY the slots land in UB is not yet explained -- the
+// toolkit's own allocation path does not predict it -- and that is the next
+// thing to understand, because 131,072 B is half this operator's budget.
+//
+// What the slot COUNT is for still holds, and still needs stating precisely
+// because the obvious reading is wrong TODAY.
 //
 // Phase 1 stages W1 and W3 for the SAME (r0, k0) step -- they reduce against
 // the same X sub-tile, which is the reuse the k-inner loop order exists for.
@@ -207,18 +360,14 @@ static_assert(kCubeUbBytes <= kUsableUbBytes,
 // obvious next optimization and should not have to re-widen L1 to land.
 // Phase 2's W2 sub-tile has no partner.
 //
-// 98,304 B of 524,288. The headroom is not slack: the Matmul framework stages
-// its own A1 copy of the A matrix in L1, and GetMatmulApiTiling sizes that
-// from the declared types without consulting this file.
-inline constexpr std::uint32_t kCubeB1SlotBytes = kCubeRSub * kCubeKSub * 2u;
-inline constexpr std::uint32_t kCubeB2SlotBytes = kCubeHSub * kCubeRSub2 * 2u;
+// 98,304 B on the formula the golden shares. Note it counts THREE slots while
+// the ring allocates FOUR (two per queue), which is the other half of why
+// this number does not describe the hardware charge -- kCubeTscmRingBytes
+// does.
 inline constexpr std::uint32_t kCubeL1Bytes = 2u * kCubeB1SlotBytes + kCubeB2SlotBytes;
-
-static_assert(kCubeB1SlotBytes == 32768 && kCubeB2SlotBytes == 32768,
-              "each L1 weight slot is 32,768 B");
 static_assert(kCubeL1Bytes <= 524288u / 2u,
-              "the operator's own L1 use must leave at least half of L1 to the "
-              "Matmul framework's A1 staging");
+              "the formula the emu golden charges L1 by must leave at least "
+              "half of L1 to the Matmul framework's A1 staging");
 
 // --- KFC queue reserve ----------------------------------------------------
 // REGIST_MATMUL_OBJ stands up a KfcServer whose message queue lives at the

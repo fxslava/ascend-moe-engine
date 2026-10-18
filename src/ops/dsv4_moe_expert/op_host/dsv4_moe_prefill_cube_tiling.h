@@ -224,13 +224,59 @@ inline constexpr std::uint32_t kPrefillCubeAivMax = 256;
 // themselves in: (128-128)*4, (128-64)*4, (128-128)/2 and (256-256)/2 are all
 // whole numbers of 32-byte blocks. Widening only ADMITS more, so no geometry
 // that was accepted before is rejected now.
+// ---------------------------------------------------------------------------
+// THE `inter` CAP IS A UB CAPACITY, NOT A MODEL PARAMETER
+// ---------------------------------------------------------------------------
+// `act` is UB-RESIDENT across the phase boundary, so the kernel's act plane is
+// a FIXED [M_TILE, inter_cap] allocation and `inter` indexes straight into it
+// (`activation_resident[r * inter + inter_base]`). A geometry whose `inter`
+// exceeds the compiled capacity therefore walks off the end of that plane --
+// and on device that is not a fault, it is a silent write into whatever UB
+// follows. Section 2.5 puts exactly that class of rejection on the host, so
+// the cap is declared HERE, admissibility enforces it, and
+// op_kernel/dsv4_moe_prefill_cube_arch35.h sizes kCubeActBytes from its own
+// copy of the same number with a static_assert tying the two together.
+//
+// The sim override drops it to 512, because a plane sized for 2048 spends
+// 65,536 B of the UB budget on capacity no CAModel run uses -- 49,152 B of it
+// dead at the widest shape any sim fixture asks for. That is not a
+// micro-saving: MEASURED on the dav-3510 CAModel, the operator's UB charge is
+// not kCubeUbBytes but kCubeUbBytes plus the 131,072 B of TPosition::TSCM
+// weight ring, which shares the UB pool rather than living in L1. At the
+// production cap that is 307,744 B against a 262,144 B physical UB, and this
+// plane was the single largest line in it. The census that reads this is in
+// tests/sim/kernel/test_subgemm_stage_kernel.cpp and the derivation is on
+// kCubeUbBytes in op_kernel/dsv4_moe_prefill_cube_arch35.h.
+//
+// WHY 512 AND NOT 256. The staged bisection probe and the single-tile gate
+// both run at inter = 256, and 256 would reclaim another 8,192 B. But
+// tests/sim/dsv4_moe_block_sim_common.hpp fixes the shared sim fixture at
+// hidden = 512 / inter = 512, and the prefill inductive gate -- the one this
+// whole bisection is working toward -- runs at that shape. A cap of 256 would
+// make its geometry inadmissible, which is a rejection at MakeTiling rather
+// than a hang, but it would retire the gate rather than fix it. The consumers
+// static_assert their own `inter` against this cap so a future narrowing
+// fails to compile in the test that depends on it.
+#if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
+inline constexpr std::uint32_t kPrefillCubeInterCap = 512;
+#else
+inline constexpr std::uint32_t kPrefillCubeInterCap = 2048;
+#endif
+
+static_assert(kPrefillCubeInterCap % kPrefillCubeRSub == 0 &&
+                  kPrefillCubeInterCap % kPrefillCubeRSub2 == 0,
+              "the act plane capacity must be a whole number of both phases' "
+              "inter-axis sub-tiles, or the last pass of either phase indexes "
+              "past the end of the plane");
+
 #if defined(DSV4_TILING_TEST_OVERRIDE) && DSV4_TILING_TEST_OVERRIDE
 #define MOE_DSV4_PREFILL_CUBE_ADMISSIBLE(hidden, inter)                      \
   ((hidden) >= 128u && (inter) >= 256u && (hidden) % 128u == 0u &&            \
-   (inter) % 256u == 0u)
+   (inter) % 256u == 0u && (inter) <= kPrefillCubeInterCap)
 #else
 #define MOE_DSV4_PREFILL_CUBE_ADMISSIBLE(hidden, inter)                      \
-  ((hidden) == 4096u && (inter) == 2048u)
+  ((hidden) == 4096u && (inter) == 2048u &&                                   \
+   (inter) <= kPrefillCubeInterCap)
 #endif
 
 inline constexpr bool Dsv4MoePrefillCubeAdmissible(std::uint32_t hidden,

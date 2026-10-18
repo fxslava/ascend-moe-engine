@@ -37,6 +37,13 @@
 // answers "does it retire", never "is the answer right", so the token prefetch
 // ring is deliberately out of the picture -- it was audited separately and
 // balances. Keeping it out means a hang here cannot be the ring.
+//
+// EVERY STAGE ALSO DUMPS A UB PHYSICAL ADDRESS CENSUS into the status buffer
+// before it runs. See kernel/dsv4_prefill_cube_ub_census.h: the simulator's
+// ub_addr_overflow names an address, and the census is what turns that into a
+// buffer name. It is how the pool base was found to be 0 rather than the
+// ~131,616 the DataCache story predicted, and how the TSCM weight ring was
+// found to sit in UB rather than L1.
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
@@ -45,11 +52,71 @@
 #include "dsv4_moe_prefill_cube_tiling.h"
 #include "dsv4_moe_prefill_cube_cube_tiling.h"
 
+#include "dsv4_prefill_cube_ub_census.h"
+
 #include "../../../src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
 
 namespace moe::kernels::arch35::dsv4_moe_prefill_cube {
 
 using namespace AscendC;
+
+namespace {
+
+// --- UB PHYSICAL ADDRESS CENSUS -------------------------------------------
+//
+// One entry per InitBuffer, in allocation order, written as two uint32 words
+// into the probe's status buffer. The wire format and the reason it exists
+// are in kernel/dsv4_prefill_cube_ub_census.h.
+//
+// GetPhyAddr() is a pure read of the address TPipe assigned at InitBuffer
+// time, so it is valid even when the layout over-commits -- which is the case
+// this is for. It costs scalar stores and no UB traffic, so it cannot itself
+// perturb the thing being measured.
+__aicore__ inline void WriteCensusEntry(GlobalTensor<uint32_t>& census,
+                                        std::uint32_t slot, std::uint64_t addr) {
+    census.SetValue(kUbCensusHeaderWords + 2u * slot,
+                    static_cast<uint32_t>(addr & 0xFFFFFFFFull));
+    census.SetValue(kUbCensusHeaderWords + 2u * slot + 1u,
+                    static_cast<uint32_t>(addr >> 32));
+}
+
+__aicore__ inline GlobalTensor<uint32_t> CensusTensor(GM_ADDR status_out) {
+    GlobalTensor<uint32_t> census;
+    census.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(status_out),
+                           kUbCensusStatusWords);
+    return census;
+}
+
+// Written BEFORE any stage work, because the addresses are fixed the moment
+// InitBuffer returns and a stage that does not retire would otherwise take the
+// census down with it. The magic word goes last so a torn census is
+// distinguishable from no census.
+__aicore__ inline void DumpUbCensus(const Buffers& buf, GM_ADDR status_out) {
+    GlobalTensor<uint32_t> census = CensusTensor(status_out);
+    WriteCensusEntry(census,  0, buf.activation_resident.GetPhyAddr());
+    WriteCensusEntry(census,  1, buf.gate_accumulator.GetPhyAddr());
+    WriteCensusEntry(census,  2, buf.up_accumulator.GetPhyAddr());
+    WriteCensusEntry(census,  3, buf.subgemm_fwd.GetPhyAddr());
+    WriteCensusEntry(census,  4, buf.tokens_f32_ping.GetPhyAddr());
+    WriteCensusEntry(census,  5, buf.tokens_f32_pong.GetPhyAddr());
+    WriteCensusEntry(census,  6, buf.tokens_sub_bf16_ping.GetPhyAddr());
+    WriteCensusEntry(census,  7, buf.tokens_sub_bf16_pong.GetPhyAddr());
+    WriteCensusEntry(census,  8, buf.down_accumulator.GetPhyAddr());
+    WriteCensusEntry(census,  9, buf.subgemm_down.GetPhyAddr());
+    WriteCensusEntry(census, 10, buf.activation_sub_bf16.GetPhyAddr());
+    WriteCensusEntry(census, 11, buf.weight_nibbles.GetPhyAddr());
+    WriteCensusEntry(census, 12, buf.weight_expanded.GetPhyAddr());
+    WriteCensusEntry(census, 13, buf.weight_scales.GetPhyAddr());
+    WriteCensusEntry(census, 14, buf.scale_plane.GetPhyAddr());
+    WriteCensusEntry(census, 15, buf.scale_temporary.GetPhyAddr());
+    census.SetValue(2u, kUbCensusTotalEntries);
+    census.SetValue(3u, 0u);
+    census.SetValue(1u, kUbCensusMagic);
+    DataCacheCleanAndInvalid<uint32_t, CacheLine::ENTIRE_DATA_CACHE,
+                             DcciDst::CACHELINE_OUT>(census);
+}
+
+}  // namespace
 
 extern "C" __global__ __aicore__ void test_subgemm_stage_kernel(
     GM_ADDR gate_weights_packed, GM_ADDR gate_weight_scales,
@@ -141,6 +208,41 @@ extern "C" __global__ __aicore__ void test_subgemm_stage_kernel(
 
     const bool drives_cube = (GetSubBlockIdx() % GetSubBlockNum()) == 0;
 
+    // One writer only: both paired AIVs run this body and both would target
+    // the same GM words. Their layouts are identical -- the allocation is
+    // static and neither sub-core's InitBuffer sequence differs -- so the
+    // second writer would add nothing but a race.
+    if (drives_cube && status_out != nullptr) {
+        DumpUbCensus(buf, status_out);
+
+        // THE RING SLOTS, ALL FOUR, BEFORE ANY STAGE WORK.
+        //
+        // Both slots of each queue have to be live at once to see both
+        // addresses, which is what a depth-2 TQue is for, so this is an
+        // ordinary double-buffer alloc and not an abuse of the ring. The
+        // Alloc/Free pairs balance and nothing is EnQued, which is exactly
+        // the shape the `effective_stage < 5` path below already uses -- so
+        // the ring is handed back in the state it was found in. The stage
+        // loop re-reads slot 0 into the same census entry; if the two
+        // readings disagree, this probe moved the ring and the measurement,
+        // not the kernel, is what to fix.
+        GlobalTensor<uint32_t> census = CensusTensor(status_out);
+        LocalTensor<bfloat16_t> fwd0  = q_weight_fwd.AllocTensor<bfloat16_t>();
+        LocalTensor<bfloat16_t> fwd1  = q_weight_fwd.AllocTensor<bfloat16_t>();
+        LocalTensor<bfloat16_t> down0 = q_weight_down.AllocTensor<bfloat16_t>();
+        LocalTensor<bfloat16_t> down1 = q_weight_down.AllocTensor<bfloat16_t>();
+        WriteCensusEntry(census, kUbCensusTscmEntry + 0u, fwd0.GetPhyAddr());
+        WriteCensusEntry(census, kUbCensusTscmEntry + 1u, fwd1.GetPhyAddr());
+        WriteCensusEntry(census, kUbCensusTscmEntry + 2u, down0.GetPhyAddr());
+        WriteCensusEntry(census, kUbCensusTscmEntry + 3u, down1.GetPhyAddr());
+        q_weight_down.FreeTensor(down1);
+        q_weight_down.FreeTensor(down0);
+        q_weight_fwd.FreeTensor(fwd1);
+        q_weight_fwd.FreeTensor(fwd0);
+        DataCacheCleanAndInvalid<uint32_t, CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(census);
+    }
+
     // STAGES 8 AND 9 ARE STAGE 7, REPLAYED.
     //
     // Stage 7 -- one complete sub-GEMM -- retires in 94 s, and six of them
@@ -163,6 +265,12 @@ extern "C" __global__ __aicore__ void test_subgemm_stage_kernel(
         const std::uint32_t k_sub  = geom.hidden_sub_fwd;
 
         LocalTensor<bfloat16_t> slot_weight = q_weight_fwd.AllocTensor<bfloat16_t>();
+        if (rep == 0u && status_out != nullptr) {
+            GlobalTensor<uint32_t> census = CensusTensor(status_out);
+            WriteCensusEntry(census, kUbCensusTscmEntry, slot_weight.GetPhyAddr());
+            DataCacheCleanAndInvalid<uint32_t, CacheLine::ENTIRE_DATA_CACHE,
+                                     DcciDst::CACHELINE_OUT>(census);
+        }
 
         AsyncLoadWeightsSubTile(
             reinterpret_cast<__gm__ std::uint8_t*>(gate_weights_packed),
@@ -213,9 +321,13 @@ extern "C" __global__ __aicore__ void test_subgemm_stage_kernel(
     // Liveness: reached only if every stage above returned.
     if (drives_cube && status_out != nullptr) {
         GlobalTensor<int32_t> status_gm;
-        status_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(status_out), 8);
+        status_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(status_out),
+                                  kUbCensusStatusWords);
         status_gm.SetValue(0, static_cast<int32_t>(stage));
-        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE,
+        // ENTIRE_DATA_CACHE rather than the single line word 0 sits in: the
+        // census shares this buffer, and the TSCM entry was written from
+        // inside the loop after the first flush.
+        DataCacheCleanAndInvalid<int32_t, CacheLine::ENTIRE_DATA_CACHE,
                                  DcciDst::CACHELINE_OUT>(status_gm);
     }
 

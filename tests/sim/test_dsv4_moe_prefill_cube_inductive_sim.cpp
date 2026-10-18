@@ -81,6 +81,13 @@ static_assert(kHidden % moe::kernels::arch35::kPrefillCubeKSub == 0u &&
               "the sim fixture's axes must be whole multiples of every "
               "sub-tile extent, or MakeDsv4MoePrefillCubeTiling rejects the "
               "shape and this gate never reaches the kernel");
+// The resident act plane is a FIXED [M_TILE, inter_cap] UB allocation, so the
+// cap is also a shape bound. Asserted here rather than left to the runtime
+// rejection: narrowing the cap below this fixture's `inter` would turn this
+// gate into an unsupported_shape return, which reads as a clean failure and
+// is really a gate that stopped testing anything.
+static_assert(kInter <= moe::kernels::arch35::kPrefillCubeInterCap,
+              "the sim fixture's inter exceeds the act plane's capacity");
 constexpr std::uint32_t kMTile = moe::kernels::arch35::kPrefillCubeMTile;
 
 constexpr std::uint32_t kTotalTokens = 1020;
