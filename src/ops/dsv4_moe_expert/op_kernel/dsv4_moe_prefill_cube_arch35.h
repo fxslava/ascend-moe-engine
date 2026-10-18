@@ -475,6 +475,49 @@ static_assert(kCubeL0BElems >= kCubeRSub2 * kCubeHSub,
 // in every contraction is to wait on kCubeFlagStepReady, which the AIVs set.
 inline constexpr std::uint8_t kCubeSyncMode = 0x2;
 
+// --- THE AIC -> AIV DIRECTION IS MODE 4, AND MODE 2 THERE IS A ~50% HANG ---
+//
+// Mode 2 gives ONE flag for "the AIC and all AIVs of one AI Core". MEASURED on
+// the dav-3510 CAModel, 2026-10-18/19, by the STEP 1 probe, which carried
+// exactly that: a single CrossCoreSetFlag against two waiting AIVs retires
+// about HALF the time. A four-rung bisection put the flake precisely there --
+// the AIV -> AIC direction retires 4/4 and the GM copy-out is exonerated --
+// and four candidate repairs failed (one set per waiter 2/5, bare wait 2/5,
+// explicit wait 3/6, an AIV0 -> AIV1 relay 0/5).
+//
+// MODE 4 FIXES IT: 15/15, 14.5-16.0 s, with every simulator diagnostic at
+// zero. It is not a different policy on the same hardware -- NotifyEventImpl
+// routes modeId == 4 to set_intra_block / wait_intra_block instead of
+// ffts_cross_core_sync -- so the AIC gets a DEDICATED CHANNEL PER AIV:
+//
+//   the SETTER addresses sub-block s as flagId + s * kCubeIntraFlagStride
+//   the WAITER on every AIV uses the id WITHOUT that offset
+//
+// Both halves are the shipping Matmul framework's own convention
+// (GetIntraFlagId(instID, eventType, subBlockId) adds subBlockId * INTRA_NUM;
+// waitFixpId = WAIT_FIXP + instIdx carries no sub-block term), and INTRA_MODE
+// is 4. So the asymmetry is deliberate: the AIC names a core, the AIV listens
+// on its own channel.
+//
+// WHY MODE 2 FAILS IS STILL NOT KNOWN. The obvious story -- a single
+// consumable token taken by whichever AIV arrives first -- predicts a 100%
+// hang, not 50%, and feeding the counter once per waiter changed nothing. The
+// fix is measured; the mechanism is open, and it is left open here rather than
+// dressed up.
+//
+// THE AIV -> AIC DIRECTION STAYS MODE 2, because it is measured reliable
+// (4/4) and nothing recommends changing it.
+inline constexpr std::uint8_t  kCubeIntraSyncMode   = 0x4;
+inline constexpr std::uint16_t kCubeIntraFlagStride = 16;  // INTRA_NUM
+#if defined(__MIX_CORE_AIC_RATION__)
+inline constexpr std::uint16_t kCubeAivPerAic = __MIX_CORE_AIC_RATION__;
+#else
+inline constexpr std::uint16_t kCubeAivPerAic = 2;
+#endif
+static_assert(kCubeAivPerAic == 2,
+              "this operator is written for MIX_AIC_1_2: the Fixpipe's M split "
+              "and the number of channels the AIC releases both assume 2");
+
 // ONE READY FLAG PER RING SLOT COVERS THE WHOLE STEP, not one per buffer.
 // A step writes three L1 slots (the token half, W1's half, W3's half); the AIV
 // raises the flag once, after the last push, and MTE3 is in order so that
@@ -529,6 +572,13 @@ static_assert(kCubeFlagStepReady + kCubeRingSlots - 1u < kCubeFlagStepFree &&
 static_assert(kCubeFlagLandingFree < kCubeFlagStepReady,
               "the landing acknowledgement must not fall inside the per-slot "
               "ranges");
+// The AIC-side mode 4 ids are base + s * 16, so the AIC -> AIV bases must
+// leave room for that above them.
+static_assert(kCubeFlagStepFree + kCubeRingSlots - 1u +
+                      (kCubeAivPerAic - 1u) * kCubeIntraFlagStride <= 26 &&
+                  kCubeFlagProduct + (kCubeAivPerAic - 1u) * kCubeIntraFlagStride <= 26,
+              "an AIC-side mode 4 id is base + subBlockId * 16 and must stay "
+              "inside the intra-block id space");
 static_assert(kCubeFlagProduct <= 8 && kCubeFlagStepReady >= 4,
               "flagIds 9-15 have never been exercised green by any probe and "
               "11-14 are reserved by SyncAll: read the note above before "

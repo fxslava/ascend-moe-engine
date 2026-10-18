@@ -49,6 +49,21 @@ namespace Te = AscendC::Te;
 
 namespace {
 
+// Mode 4: a dedicated AIC <-> single-AIV channel, as opposed to mode 2's one
+// flag for the AIC and all AIVs. See dsv4_prefill_cube_dualdst.h.
+inline constexpr std::uint8_t kDualDstIntraSyncMode = 0x4;
+
+// The AIVs paired with one AIC, from the toolkit's own ratio macro rather than
+// a literal: it is how many channels the AIC has to release.
+#if defined(__MIX_CORE_AIC_RATION__)
+inline constexpr std::uint16_t kDualDstAivPerAic = __MIX_CORE_AIC_RATION__;
+#else
+inline constexpr std::uint16_t kDualDstAivPerAic = 2;
+#endif
+static_assert(kDualDstAivPerAic == 2,
+              "this probe is written for MIX_AIC_1_2; a different ratio "
+              "changes both the Fixpipe split and the release count");
+
 // The trait the whole probe exists to exercise.
 constexpr Te::CopyL0C2UBTrait kL0c2UbTrait = {
     Te::RoundMode::DEFAULT,
@@ -199,7 +214,19 @@ extern "C" __global__ __aicore__ void test_fixpipe_dualdst_kernel(
         // ONE flag for BOTH AIVs: mode 2 is "the AIC and all AIVs of this AI
         // Core". See the header for why the wait side takes no template
         // arguments.
-        CrossCoreSetFlag<kDualDstSyncMode, PIPE_FIX>(kDualDstFlagReady);
+        // ONE MODE 4 RELEASE PER AIV, ON ITS OWN CHANNEL.
+        //
+        // Mode 2's single "AIC and all AIVs" flag is what made this gate ~50%
+        // flaky, localized by a four-rung bisection (see the header). Mode 4 is
+        // point-to-point: the AIC addresses sub-block s by adding
+        // s * INTRA_NUM to the flagId, and each AIV waits on the id without
+        // that offset. The shipping Matmul framework releases its own Fixpipe
+        // exactly this way.
+        for (std::uint16_t sub = 0; sub < kDualDstAivPerAic; ++sub) {
+            CrossCoreSetFlag<kDualDstIntraSyncMode, PIPE_FIX>(
+                static_cast<uint16_t>(kDualDstFlagReady +
+                                      sub * kDualDstIntraFlagStride));
+        }
 
         WriteStatus(status_gm, kDualDstAicRegion, kDualDstSlotLive, kDualDstAicDone);
     }
@@ -237,12 +264,12 @@ extern "C" __global__ __aicore__ void test_fixpipe_dualdst_kernel(
             // must gate is the DataCopy below -- a PIPE_V scope would gate
             // nothing here and let the copy-out read the landing zone before
             // the Fixpipe wrote it.
-            if (stage >= kDualDstStageRendezvous) {
-                CrossCoreWaitFlag<kDualDstSyncMode, kDualDstWaitPipeAiv>(
-                    kDualDstFlagReady);
-            } else {
-                CrossCoreWaitFlag(kDualDstFlagReady);
-            }
+            // BOTH AIVs WAIT, SYMMETRICALLY, ON THEIR OWN MODE 4 CHANNEL.
+            // No GetSubBlockIdx() branch: the AIC addressed each core by
+            // flagId, so each core listens on the same local id and the
+            // hardware has already decided which one is being released.
+            CrossCoreWaitFlag<kDualDstIntraSyncMode, kDualDstWaitPipeAiv>(
+                kDualDstFlagReady);
 
             GlobalTensor<bfloat16_t> out;
             out.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(out_gm), kDualDstOutElems);

@@ -697,7 +697,7 @@ __aicore__ inline void RunVectorCore(
                 // slot, and MTE3 is what performs it. Leaving the Vector pipe unblocked is
                 // deliberate -- the dequant below does not touch L1.
                 if (k >= kCubeRingSlots) {
-                    CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAivStep>(
+                    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStep>(
                         static_cast<uint16_t>(kCubeFlagStepFree + slot));
                 }
 
@@ -716,11 +716,11 @@ __aicore__ inline void RunVectorCore(
             // pre-activation is also the one that moves it out and frees the zone.
             const std::uint32_t elems = kCubeMHalf * kCubeRSub;
 
-            CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
+            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
             Mins(buf.gate_acc, buf.landing, geom.swiglu_limit, elems);
             CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
 
-            CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
+            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
             Maxs(buf.up_acc, buf.landing, -geom.swiglu_limit, elems);
             CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
             Mins(buf.up_acc, buf.up_acc, geom.swiglu_limit, elems);
@@ -751,7 +751,7 @@ __aicore__ inline void RunVectorCore(
                 }
 
                 if (r >= kCubeRingSlots) {
-                    CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAivStep>(
+                    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStep>(
                         static_cast<uint16_t>(kCubeFlagStepFree + slot));
                 }
 
@@ -767,7 +767,7 @@ __aicore__ inline void RunVectorCore(
 
             // Scoped to PIPE_MTE3: the store below is what must not run until the Fixpipe has
             // landed the product in this AIV's UB.
-            CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAivStore>(kCubeFlagProduct);
+            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStore>(kCubeFlagProduct);
 
             // THE WAIT IS UNCONDITIONAL AND THE STORE IS NOT. A tail tile can leave this AIV with
             // no real rows (valid_rows <= row_base), but the flag is a rendezvous: skipping the
@@ -805,6 +805,22 @@ __aicore__ inline void RunVectorCore(
 // not a loop over sub-blocks.
 
 namespace {
+
+// THE AIC -> AIV RELEASE, ONE CHANNEL PER AIV.
+//
+// Mode 4 is point-to-point: the AIC names sub-block s by adding
+// s * kCubeIntraFlagStride to the flagId, and each AIV waits on the base id.
+// Mode 2's single flag for all AIVs is a ~50% intermittent hang here -- see
+// the measurement in the UB layout header. `pipe` is a template parameter
+// because the two release sites drain different pipes: the ring slot is freed
+// once MTE1 has read it, the product once the Fixpipe has written it.
+template <pipe_t pipe>
+__aicore__ inline void CubeReleaseToAllAivs(std::uint16_t base_flag) {
+    for (std::uint16_t sub = 0; sub < kCubeAivPerAic; ++sub) {
+        CrossCoreSetFlag<kCubeIntraSyncMode, pipe>(
+            static_cast<uint16_t>(base_flag + sub * kCubeIntraFlagStride));
+    }
+}
 
 // L1 -> L0A. The token tile is NZ on both sides, so this is the non-transpose route.
 __aicore__ inline void CubeLoadTokensToL0A(
@@ -924,7 +940,7 @@ __aicore__ inline void CubeMoveOutAndHandOver(
     // Drain the Fixpipe before the ready flag releases the vector cores onto the rows it is still
     // writing.
     PipeBarrier<PIPE_FIX>();
-    CrossCoreSetFlag<kCubeSyncMode, PIPE_FIX>(kCubeFlagProduct);
+    CubeReleaseToAllAivs<PIPE_FIX>(kCubeFlagProduct);
     // Scoped to PIPE_FIX: what this gates is the NEXT Fixpipe write into the landing zone. It also
     // drains the flag, so none outlives the block. The pipe is named inline rather than through a
     // namespace-scope constant -- see the note on kCubeWaitAicStep.
@@ -999,7 +1015,7 @@ __aicore__ inline void RunCubeCore(
                 // MTE1 has drained it, which this set waits for by construction; holding it until
                 // after the Mmad made them wait a full Cube step for no dependency.
                 if (k + kCubeRingSlots < fwd_steps) {
-                    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE1>(
+                    CubeReleaseToAllAivs<PIPE_MTE1>(
                         static_cast<uint16_t>(kCubeFlagStepFree + slot));
                 }
 
@@ -1051,7 +1067,7 @@ __aicore__ inline void RunCubeCore(
                                      kCubeRSub2, kCubeHSub);
 
                 if (r + kCubeRingSlots < down_steps) {
-                    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE1>(
+                    CubeReleaseToAllAivs<PIPE_MTE1>(
                         static_cast<uint16_t>(kCubeFlagStepFree + slot));
                 }
 

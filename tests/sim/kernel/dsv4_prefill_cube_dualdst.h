@@ -207,6 +207,50 @@ inline constexpr std::uint8_t  kDualDstSyncMode = 0x2;
 // WHAT THIS GATE NEEDS BEFORE IT CAN SETTLE ANYTHING: a repeat count. One run
 // is not a result here, and the intermittency has to be characterised and
 // explained before any single-run A/B over this probe is worth believing.
+//
+// ---------------------------------------------------------------------------
+// THE INTERMITTENCY IS LOCALIZED BUT NOT EXPLAINED, 2026-10-18
+// ---------------------------------------------------------------------------
+// A bisection over the stage ladder, every rung REPEATED rather than sampled
+// once, puts the flake in ONE place: the AIC -> AIV release of
+// kDualDstFlagReady. dav-3510 CAModel, stage 4 unless noted:
+//
+//   RUNG                                              RETIRES
+//   stage 1: AIC Cube chain, no cross-core at all     3 / 3   13.8-14.7 s
+//   + AIV -> AIC rendezvous only, AIVs then exit      4 / 4   15.9-16.6 s
+//   + AIC -> AIV release wait, GM copy-out SKIPPED    2 / 4
+//   full stage 4                                      3 / 6
+//
+// The second rung exonerates the AIV -> AIC direction and the third exonerates
+// the copy-out, so the single AIC -> AIV release is the entire difference
+// between a gate that always retires and one that retires about half the time.
+//
+// THREE CANDIDATE FIXES WERE TRIED AND ALL FAILED, each over a 5-run batch:
+//
+//   one CrossCoreSetFlag per waiting AIV (feed the counter twice)   2 / 5
+//   explicit <mode 2, PIPE_MTE3> wait, one set     (committed)      3 / 6
+//   bare CrossCoreWaitFlag + rendezvous, one set                    2 / 5
+//
+// So it is NOT an under-fed counter and NOT the wait spelling -- the bare and
+// the explicit forms are statistically indistinguishable here, which also
+// means the committed spelling is kept because nothing recommends changing it,
+// not because it is better. "Rendezvous + bare wait" had never been measured
+// before this; it is the shape the shipping turboquant decode kernel uses, and
+// it flakes the same.
+//
+// WHAT IS LEFT. The AIV -> AIC direction of mode 2 is reliable here and the
+// AIC -> AIV direction is not, whatever it is set or waited with. That
+// asymmetry is the finding; its cause is not known, and the untried axis is
+// the MODE rather than the pipe or the count (mode 4 is recorded above as not
+// completing at all, which is its own puzzle). Until this is understood:
+//
+//   * A GREEN RUN OF THIS GATE MEANS LITTLE. At a ~50% rate, five clean runs
+//     happen by luck about 1 in 32.
+//   * Any AIC -> AIV mode 2 release in a SHIPPING kernel is suspect. The
+//     production operator uses exactly this pattern -- a single
+//     CrossCoreSetFlag against two waiters -- for kCubeFlagProduct and
+//     kCubeFlagStepFree, and it has never been executed, so nothing has
+//     exercised it.
 inline constexpr std::uint16_t kDualDstFlagReady    = 0;  // AIC -> both AIVs
 
 // Stage selector, passed in the status buffer by the launcher.
@@ -263,6 +307,46 @@ inline constexpr std::uint32_t kDualDstStageRendezvous = 4;
 
 // The AIV -> AIC direction, used only by stage 4.
 inline constexpr std::uint16_t kDualDstFlagOperands = 1;  // both AIVs -> AIC
+
+// --- MODE 4 IS THE AIC -> AIV RELEASE, AND IT IS POINT-TO-POINT ----------
+//
+// Mode 2 gives one flag for "the AIC and all AIVs"; mode 4 gives the AIC a
+// DEDICATED CHANNEL PER AIV, and the target is encoded in the flagId:
+//
+//   the SETTER adds subBlockId * INTRA_NUM (= 16)
+//   the WAITER uses the id WITHOUT that offset
+//
+// Both halves are read straight off the shipping Matmul framework, which does
+// exactly this for its own Fixpipe release:
+//
+//   AIC   CrossCoreSetFlag<INTRA_MODE, PIPE_FIX>(
+//             GetIntraFlagId(instID, WAIT_FIXP, 0U))       // -> AIV0
+//         CrossCoreSetFlag<INTRA_MODE, PIPE_FIX>(
+//             GetIntraFlagId(instID, WAIT_FIXP, 1U))       // -> AIV1
+//   AIV   CrossCoreWaitFlag<INTRA_MODE, PIPE_MTE2>(waitFixpId)
+//
+// with INTRA_MODE = 4 (mx_matmul_utils.h),
+// GetIntraFlagId(instID, eventType, subBlockId) = instID + eventType +
+// subBlockId * INTRA_NUM (dav_3510/kernel_operator_sync_impl.h), and
+// waitFixpId = WAIT_FIXP + instIdx with NO sub-block term
+// (matmul_utils.h:229). So the asymmetry is deliberate: the AIC addresses a
+// core, the AIV listens on its own channel.
+//
+// MODE 4 ALSO USES DIFFERENT HARDWARE. NotifyEventImpl routes modeId == 4 to
+// set_intra_block / wait_intra_block rather than ffts_cross_core_sync, which
+// is why PIPE_FIX is legal on this set: the "1st parameter must be [1, 1],
+// [4, 5]" constraint that rejects PIPE_S belongs to ffts_cross_core_sync and
+// does not apply here.
+//
+// THIS IS WHY THE EARLIER "mode 4 does not complete" NOTE ABOVE IS WRONG, and
+// it is left standing with this correction rather than deleted. That attempt
+// used the SAME flagId for both AIVs, so under the subBlockId * 16 convention
+// both of the AIC's sets addressed AIV0 and AIV1 was never signalled -- a
+// guaranteed hang, exactly as observed. It was not evidence against mode 4.
+inline constexpr std::uint16_t kDualDstIntraFlagStride = 16;  // INTRA_NUM
+static_assert(kDualDstFlagReady + kDualDstIntraFlagStride <= 31,
+              "the AIC-side id for sub-block 1 is flagId + 16 and must stay "
+              "inside the intra-block id space");
 
 static_assert(kDualDstFlagReady <= 15 && kDualDstFlagOperands <= 15,
               "a mode 2 flagId is 4 bits; a larger value is silently "
