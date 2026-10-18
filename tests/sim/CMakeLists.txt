@@ -745,6 +745,148 @@ if(ENABLE_DSV4_CAMODEL_TEST)
                         "LINKER:-rpath-link,${_dir}")
   endforeach()
 
+  # STEP 2: the three-stage asynchronous pipeline built on STEP 1's epilogue.
+  # Unlike STEP 1 this one DOES textually include the production kernel TU (it
+  # reuses AsyncLoadWeightsSubTile and DequantSubTileVector verbatim), so it
+  # needs the operator's include dirs and the tiling override.
+  set(_dsv4_pipeline_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_dualdst_pipeline_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_dualdst_pipeline_launch.cpp")
+  set(_dsv4_pipeline_objects)
+  foreach(_source IN LISTS _dsv4_pipeline_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_prefill_cube_pipeline.h"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_pipeline_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_pipeline_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_pipeline_objects DEPENDS ${_dsv4_pipeline_objects})
+
+  add_executable(test_dualdst_pipeline_sim
+    test_dualdst_pipeline_sim.cpp
+    ${_dsv4_pipeline_objects}
+    "${_dsv4_lifecycle_tiling_object}"
+    "${_dsv4_lifecycle_common_object}"
+  )
+  add_dependencies(test_dualdst_pipeline_sim dsv4_pipeline_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dualdst_pipeline_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include")
+  target_compile_options(test_dualdst_pipeline_sim PRIVATE -Wall -Wextra)
+  target_compile_definitions(test_dualdst_pipeline_sim PRIVATE DSV4_TILING_TEST_OVERRIDE=1)
+  target_link_libraries(test_dualdst_pipeline_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling moe_emu Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES})
+  set_target_properties(test_dualdst_pipeline_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dualdst_pipeline_sim PRIVATE "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # STEP 1 of the Fixpipe dual-destination refactor: an isolated low-level
+  # GEMM built from Tensor API primitives, with NO Matmul framework in it.
+  # Same device-object recipe as the lifecycle probe. It needs no tiling
+  # object -- its shape is a compile-time constant in the shared header -- but
+  # it does need launch_common for the chevron dispatch and failure record.
+  set(_dsv4_dualdst_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_fixpipe_dualdst_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_fixpipe_dualdst_launch.cpp")
+  set(_dsv4_dualdst_objects)
+  foreach(_source IN LISTS _dsv4_dualdst_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_sim"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_prefill_cube_dualdst.h"
+              "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.hpp"
+              "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/launch.hpp"
+              "${CMAKE_SOURCE_DIR}/include/moe/kernels/arch35/status.hpp"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_dualdst_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_dualdst_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_dualdst_objects DEPENDS ${_dsv4_dualdst_objects})
+
+  add_executable(test_fixpipe_dualdst_sim
+    test_fixpipe_dualdst_sim.cpp
+    ${_dsv4_dualdst_objects}
+    "${_dsv4_lifecycle_common_object}"
+  )
+  add_dependencies(test_fixpipe_dualdst_sim dsv4_dualdst_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_fixpipe_dualdst_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_fixpipe_dualdst_sim PRIVATE -Wall -Wextra)
+  target_link_libraries(test_fixpipe_dualdst_sim PRIVATE
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_fixpipe_dualdst_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}")
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_fixpipe_dualdst_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
   # Variant (b), staged: same device-object recipe as the lifecycle probe.
   set(_dsv4_stage_sources
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/test_subgemm_stage_kernel.cpp"
@@ -807,6 +949,28 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
     target_link_options(test_subgemm_stage_sim PRIVATE "LINKER:-rpath-link,${_dir}")
   endforeach()
+
+  # Stage 4 is the working configuration -- see kernel/dsv4_prefill_cube_dualdst.h
+  # for why the AIV -> AIC rendezvous is not optional.
+  # Stage 3 is the full three-stage overlap and the configuration that
+  # passes; see kernel/dsv4_prefill_cube_pipeline.h for the ladder and what
+  # each rung established. 4 K tiles take ~470 s on the CAModel, so the
+  # timeout is generous rather than a performance statement.
+  add_test(NAME Dsv4DualDstPipelineSim COMMAND test_dualdst_pipeline_sim 3 900)
+  set_tests_properties(Dsv4DualDstPipelineSim PROPERTIES
+    LABELS "sim;arch35;camodel;cube;mix;bringup;fixpipe;pipeline"
+    TIMEOUT 1200
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  add_test(NAME Dsv4FixpipeDualDstSim COMMAND test_fixpipe_dualdst_sim 4 200)
+  set_tests_properties(Dsv4FixpipeDualDstSim PROPERTIES
+    LABELS "sim;arch35;camodel;cube;mix;bringup;fixpipe"
+    TIMEOUT 600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
 
   add_test(NAME KfcLifecycleSim COMMAND test_kfc_lifecycle_sim)
   set_tests_properties(KfcLifecycleSim PROPERTIES
