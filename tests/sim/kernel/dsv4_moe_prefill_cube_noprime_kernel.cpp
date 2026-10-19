@@ -175,8 +175,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_noprime_sim(
     // for flag -- the delta is AIV-side only, so an AIC difference could not
     // be a confound.
     if ASCEND_IS_AIC {
-        RunCubeCore(geom, token_to_expert_lut, shared_workspace,
-                    l1a_buf, l1w_buf, l1a2_buf, l1w2_buf);
+        RunCubeCore(geom, token_to_expert_lut, l1a_buf, l1w_buf, l1a2_buf, l1w2_buf);
     }
 
     if ASCEND_IS_AIV {
@@ -279,7 +278,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_noprime_sim(
         const std::uint32_t sub_idx = static_cast<std::uint32_t>(GetSubBlockIdx()) %
                                       static_cast<std::uint32_t>(GetSubBlockNum());
 
-        RunVectorCore(geom, sub_idx, shared_workspace,
+        RunVectorCore(geom, sub_idx,
                       gate_weights_packed, gate_weight_scales,
                       up_weights_packed,   up_weight_scales,
                       down_weights_packed, down_weight_scales,

@@ -57,8 +57,11 @@ namespace {
 
 constexpr int kProbeBudgetSeconds = 120;
 
-int RunProbe(std::uint32_t waits) {
+int RunProbe(std::uint32_t control) {
   using namespace moe::kernels::arch35;
+
+  const bool handshake_mode = (control == 0xFFFFFFFFu);
+  const std::uint32_t waits = handshake_mode ? 0u : control;
 
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -67,15 +70,17 @@ int RunProbe(std::uint32_t waits) {
   // for, and the grep matched the banner instead of a device record -- the
   // driver fed its own instructions back as data.
   std::printf(
-      "dsv4_crosscore_wait_probe -- does a mode-2 CrossCoreWaitFlag block when "
-      "nothing sets the flag?\n"
-      "  waits = %u on the operator's own flag id, mode and pipe; nothing ever "
-      "sets it\n"
+      "dsv4_crosscore_wait_probe\n"
+      "  mode: %s\n"
       "  grid: block_dim 1 (MIX_AIC_1_2 = 1 AIC + 2 AIV), the topology the "
       "measurement came from\n"
-      "  THE READING IS WHETHER THIS PROCESS RETURNS. exit 0 = all %u waits "
-      "cleared unmatched; exit 3 = it blocked.\n",
-      waits, waits);
+      "  THE READING IS WHETHER THIS PROCESS RETURNS (exit 0) OR BLOCKS "
+      "(exit 3).\n",
+      handshake_mode
+          ? "GM HANDSHAKE ALONE -- both AIVs write and flush their word, the "
+            "Cube spins until it observes both"
+          : "UNMATCHED CROSS-CORE WAITS on the operator's own flag id, mode "
+            "and pipe; nothing ever sets it");
 
   const DumpCensus before = ExceptionDumps();
 
@@ -83,12 +88,15 @@ int RunProbe(std::uint32_t waits) {
     Runtime runtime;
     LaunchWatchdog watchdog(kProbeBudgetSeconds, "[CROSSCORE-WAIT-PROBE]");
 
-    // One page is plenty: the kernel reads the wait count from offset 0 and
-    // otherwise only null-checks the pointer.
+    // One page is plenty: the kernel reads the control word from offset 0 and
+    //, in handshake mode, two ready words at 256 and 384. ZEROED, which the
+    // handshake depends on -- the Cube spins until both words are nonzero, so a
+    // stale nonzero byte would release it immediately and the probe would
+    // report success without having tested anything.
     DeviceBuffer scratch(4096);
     {
       std::vector<std::uint8_t> init(4096, 0u);
-      std::memcpy(init.data(), &waits, sizeof(waits));
+      std::memcpy(init.data(), &control, sizeof(control));
       CopyToDevice(scratch, init);
     }
 
@@ -116,10 +124,20 @@ int RunProbe(std::uint32_t waits) {
     // The flag id is NOT named here: it lives in the operator-private UB
     // header, which a test may not include (CLAUDE.md section 1.2). The kernel
     // prints it on the runs that flush.
-    std::printf(
-        "\n[DONE] the kernel RETURNED with waits = %u, so all %u mode-2 waits "
-        "cleared with no matching CrossCoreSetFlag. Wall %.1f s.\n",
-        waits, waits, seconds);
+    if (handshake_mode) {
+      std::printf(
+          "\n[DONE] RETURNED in GM-handshake mode: the Cube OBSERVED both AIVs' "
+          "GM writes. The working form is a COMPILER BARRIER around the dcci "
+          "plus a volatile __gm__ read; dcci alone with GlobalTensor::GetValue "
+          "deadlocks, because the load is hoisted out of the spin. Wall %.1f "
+          "s.\n",
+          seconds);
+    } else {
+      std::printf(
+          "\n[DONE] RETURNED with waits = %u, so all %u mode-2 waits cleared "
+          "with no matching CrossCoreSetFlag. Wall %.1f s.\n",
+          waits, waits, seconds);
+    }
     return 0;
   } catch (const std::exception& error) {
     std::printf("\n[FAIL] %s\n", error.what());
@@ -129,11 +147,20 @@ int RunProbe(std::uint32_t waits) {
 
 }  // namespace
 
+// argv[1]: a wait count (MODE 0), or "gm" to run the GM handshake alone
+// (MODE 1). MODE 1 answers whether DataCacheCleanAndInvalid plus GetValue makes
+// an AIV's GM write visible to the Cube -- the primitive the operator's new
+// startup rendezvous is built on, and the prime suspect for the deadlock that
+// replaced the flag collisions.
 int main(int argc, char** argv) {
-  std::uint32_t waits = 1;
+  std::uint32_t control = 1;
   if (argc > 1) {
-    const long value = std::strtol(argv[1], nullptr, 10);
-    if (value > 0) waits = static_cast<std::uint32_t>(value);
+    if (std::strcmp(argv[1], "gm") == 0) {
+      control = 0xFFFFFFFFu;
+    } else {
+      const long value = std::strtol(argv[1], nullptr, 10);
+      if (value > 0) control = static_cast<std::uint32_t>(value);
+    }
   }
-  return RunProbe(waits);
+  return RunProbe(control);
 }

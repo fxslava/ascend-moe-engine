@@ -1115,6 +1115,19 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   target_compile_definitions(test_dsv4_crosscore_wait_probe_sim PRIVATE
     DSV4_TILING_TEST_OVERRIDE=1
   )
+  # DSV4_PROBE_SILENT IS THE REGISTERED CONFIGURATION, and that is a soundness
+  # requirement rather than a preference. This probe reads its answer from
+  # whether the process TERMINATES, and both of its modes print immediately
+  # before the operation they measure. Commit ab32d17 records that device printf
+  # needs --cce-enable-print, which these objects do not pass; if an unenabled
+  # printf stalls instead of no-opping, a "it blocked" reading would be a stall
+  # in the instrumentation rather than in the primitive. Compiling the prints
+  # out removes that confound. MEASURED with them out: mode 0 (N=1) exit 3, the
+  # unmatched wait really does block; GM-handshake mode exit 0 in 33.1 s once
+  # the spin carries a compiler barrier and a volatile read.
+  target_compile_definitions(test_dsv4_crosscore_wait_probe_sim PRIVATE
+    DSV4_PROBE_SILENT=1
+  )
   target_link_libraries(test_dsv4_crosscore_wait_probe_sim PRIVATE
     moe_emu
     Threads::Threads

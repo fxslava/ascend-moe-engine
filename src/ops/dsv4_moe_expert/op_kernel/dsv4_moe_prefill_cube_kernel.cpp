@@ -626,99 +626,10 @@ __aicore__ inline void AivApplySwiGLU(const AivBuffers& buf, std::uint32_t inter
 }  // namespace
 
 // =================================================================================================
-// THE STARTUP RENDEZVOUS
-// =================================================================================================
-// WHY THIS EXISTS, AND WHY IT IS NOT BUILT ON A CROSS-CORE FLAG.
-//
-// MEASURED on the dav-3510 CAModel, 2026-10-19, by the cycle-stamped progress trace at
-// hidden 128 / inter 256 (one contraction step, two inter blocks):
-//
-//     60632  AIC   WAIT StepReady slot=0
-//     66922  AIC   GOT StepReady
-//     73953  AIC   loaded L0A/L0B
-//     80084  AIC   mmad init=1
-//     86567  AIV1  prologue prefetch done        <-- no AIV has pushed anything yet
-//    100521..157346 AIC  fix1 and fix2, INCLUDING BOTH LandingFree waits
-//    164868  AIV1  k=0 pushed slot=0             <-- the FIRST L1 push
-//    171862  AIV1  k=0 SET StepReady slot=0      <-- the FIRST set
-//
-// The Cube completed an ENTIRE inter block -- the contraction, both Fixpipe move-outs and both
-// LandingFree waits -- before either vector core had written a byte of L1. One StepReady wait and
-// TWO LandingFree waits cleared with no matching CrossCoreSetFlag, on two different flag ids. The
-// AIVs then consumed a product from a Fixpipe that ran before their operands existed, and from
-// there the two sides stay one block apart: the AIVs' epilogue sets land on flags nobody is
-// waiting on, which is the `pem_ccu.cc:2277 execute_set_flag already has same set_flag!` pair that
-// survived every other change.
-//
-// SO THE SCHEDULE HAD NO STARTUP BARRIER. It relied on the FIRST CrossCoreWaitFlag blocking to
-// hold the Cube back until slot 0 was full, and that does not hold here.
-//
-// THE MECHANISM OF THE FREE CLEARS IS NOT EXPLAINED, AND THIS DOES NOT CLAIM TO EXPLAIN IT. A
-// dedicated probe (tests/sim/kernel/dsv4_crosscore_wait_probe_kernel.cpp) issued ONE mode-2 wait
-// on this very flag id, mode and pipe with nothing setting it and HUNG for 120 s, which is the
-// opposite behaviour. Two real measurements that have not been reconciled. This barrier is
-// therefore built so that it does not depend on which of them generalises:
-//
-//   * GM, not a cross-core flag, so the suspect primitive is not in the path at all. The pattern
-//     is CANN's own -- adv_api/matmul/matmul_client.h gates the KFC message queue with exactly
-//     `DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>`
-//     -- so this is the toolkit's sanctioned way to order two cores through memory.
-//   * ONE WORD PER AIV, each on its OWN 128-byte line, so the two writers never share a cache
-//     line and neither can lose the other's update.
-//   * ONCE PER LAUNCH, outside every loop. It costs one GM round trip, against a whole
-//     contraction; it is not in the steady-state path and does not touch the three-stage overlap.
-//
-// THE CALLER-VISIBLE PRECONDITION IS NEW: the first kCubeStartupBytes of the workspace must be
-// ZERO at launch. The host wrapper now zeroes them on the stream before the dispatch rather than
-// requiring it of callers, because launch.hpp has always documented the workspace as needing no
-// initialization and that promise is kept.
-inline constexpr std::uint32_t kCubeStartupLineBytes = 128;
-inline constexpr std::uint32_t kCubeStartupBytes = kCubeAivPerAic * kCubeStartupLineBytes;
-
-__aicore__ inline void StartupWord(GM_ADDR shared_workspace, std::uint32_t idx,
-                                   GlobalTensor<int64_t>& word) {
-    word.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int64_t*>(Bytes(shared_workspace) + idx * kCubeStartupLineBytes),
-        1);
-}
-
-// AIV side: "my half of slot 0 is in L1". Called exactly once, immediately after the first
-// contraction step's push has been handed to the Cube.
-__aicore__ inline void AivSignalStartup(GM_ADDR shared_workspace, std::uint32_t sub_idx) {
-    GlobalTensor<int64_t> word;
-    StartupWord(shared_workspace, sub_idx, word);
-    word.SetValue(0, 1);
-    DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(word);
-}
-
-// AIC side: block until EVERY paired AIV has signalled. Spun rather than waited on, for the reason
-// above. There is no timeout: a core that never signals is a defect, and a silent timeout would
-// convert it back into the wrong answer this barrier exists to stop.
-__aicore__ inline void CubeWaitStartup(GM_ADDR shared_workspace) {
-    GlobalTensor<int64_t> word[kCubeAivPerAic];
-    for (std::uint32_t s = 0; s < kCubeAivPerAic; ++s) {
-        StartupWord(shared_workspace, s, word[s]);
-    }
-    for (;;) {
-        bool all_ready = true;
-        for (std::uint32_t s = 0; s < kCubeAivPerAic; ++s) {
-            DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-                word[s]);
-            if (word[s].GetValue(0) == 0) {
-                all_ready = false;
-            }
-        }
-        if (all_ready) {
-            return;
-        }
-    }
-}
-
-// =================================================================================================
 // THE VECTOR CORE
 // =================================================================================================
 __aicore__ inline void RunVectorCore(
-    const Geometry& geom, std::uint32_t sub_idx, GM_ADDR shared_workspace,
+    const Geometry& geom, std::uint32_t sub_idx,
     GM_ADDR gate_weights_packed, GM_ADDR gate_weight_scales,
     GM_ADDR up_weights_packed,   GM_ADDR up_weight_scales,
     GM_ADDR down_weights_packed, GM_ADDR down_weight_scales,
@@ -769,8 +680,6 @@ __aicore__ inline void RunVectorCore(
     const std::uint32_t row_base = sub_idx * kCubeMHalf;
 
     AivRingState ring;
-    // Raised once, after the first step's operands are in L1. See THE STARTUP RENDEZVOUS.
-    bool startup_signalled = false;
 
     for (std::uint32_t tile_idx = core_idx; tile_idx < total_tiles; tile_idx += geom.block_dim) {
         const std::uint32_t token_row_start = tile_idx * geom.token_tile;
@@ -832,16 +741,7 @@ __aicore__ inline void RunVectorCore(
                 CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(
                     static_cast<uint16_t>(kCubeFlagStepReady + slot));
 
-                // THE STARTUP RENDEZVOUS, released here and nowhere earlier. The Cube is held
-                // until this point because this is the first instant at which slot 0 actually
-                // holds this AIV's operands -- the push above is what put them there, and the
-                // CrossCoreSetFlag that precedes it is scoped to PIPE_MTE3 so the flag itself is
-                // not raised until that push drains.
-                if (!startup_signalled) {
-                    AivSignalStartup(shared_workspace, sub_idx);
-                    startup_signalled = true;
-                }
-            }
+           }
 
             AivDrainRing(ring);
 
@@ -1101,7 +1001,7 @@ __aicore__ inline void CubeMoveOutAndHandOver(
 // the L0 buffers, so every fence here is an immediate pair.
 __aicore__ inline void RunCubeCore(
     const Geometry& geom,
-    GM_ADDR token_to_expert_lut, GM_ADDR shared_workspace,
+    GM_ADDR token_to_expert_lut,
     TBuf<TPosition::A1> (&l1a_buf)[kCubeRingSlots],
     TBuf<TPosition::B1> (&l1w_buf)[kCubeRingSlots][kCubeWeightStreams],
     TBuf<TPosition::A1> (&l1a2_buf)[kCubeRingSlots],
@@ -1114,9 +1014,6 @@ __aicore__ inline void RunCubeCore(
     __cb__ bfloat16_t l0b_up[kCubeL0BElems];
     __cc__ float      l0c_gate[kCubeL0CElems];
     __cc__ float      l0c_up[kCubeL0CElems];
-
-    // Consumed once, before the first StepReady wait. See THE STARTUP RENDEZVOUS.
-    bool startup_awaited = false;
 
     for (std::uint32_t tile_idx = core_idx; tile_idx < total_tiles; tile_idx += geom.block_dim) {
         const std::uint32_t token_row_start = tile_idx * geom.token_tile;
@@ -1134,15 +1031,6 @@ __aicore__ inline void RunCubeCore(
         for (std::uint32_t inter_base = 0; inter_base < geom.inter; inter_base += kCubeRSub) {
             for (std::uint32_t k = 0; k < fwd_steps; ++k) {
                 const std::uint32_t slot = k % kCubeRingSlots;
-
-                // THE STARTUP RENDEZVOUS, consumed before the FIRST wait of the launch and never
-                // again. Placed inside the admitted-tile body deliberately: a grid where no tile
-                // is admitted must not spin here, and the AIVs evaluate the same TileAdmitted
-                // predicate, so if this core has work its paired AIVs have the same work.
-                if (!startup_awaited) {
-                    CubeWaitStartup(shared_workspace);
-                    startup_awaited = true;
-                }
 
                 // ONE wait, not one per AIV. Mode 2's AIV -> AIC direction increments the AIC's
                 // counter once BOTH AIVs have set -- MEASURED in STEP 2: a second wait HANGS.
@@ -1284,8 +1172,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
     }
 
     if ASCEND_IS_AIC {
-        RunCubeCore(geom, token_to_expert_lut, shared_workspace,
-                    l1a_buf, l1w_buf, l1a2_buf, l1w2_buf);
+        RunCubeCore(geom, token_to_expert_lut, l1a_buf, l1w_buf, l1a2_buf, l1w2_buf);
     }
 
     if ASCEND_IS_AIV {
@@ -1391,7 +1278,7 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
         const std::uint32_t sub_idx = static_cast<std::uint32_t>(GetSubBlockIdx()) %
                                       static_cast<std::uint32_t>(GetSubBlockNum());
 
-        RunVectorCore(geom, sub_idx, shared_workspace,
+        RunVectorCore(geom, sub_idx,
                       gate_weights_packed, gate_weight_scales,
                       up_weights_packed,   up_weight_scales,
                       down_weights_packed, down_weight_scales,

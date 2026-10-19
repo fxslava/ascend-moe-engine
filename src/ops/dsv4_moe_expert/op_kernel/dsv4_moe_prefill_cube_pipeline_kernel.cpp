@@ -480,11 +480,17 @@ __aicore__ inline void StartupWord(GM_ADDR shared_workspace, std::uint32_t idx,
     word.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(Bytes(shared_workspace) + idx * kStartupLineBytes), 1);
 }
 
+// THE COMPILER BARRIERS ARE LOAD-BEARING; see CubeWaitStartup for the
+// measurement. The store side is ordered the way the toolkit's own dav-3510 KFC
+// server orders its scalar GM writes (kfc_comm_server_gm.h, FreeUB: Barrier,
+// raw store, dcci).
 __aicore__ inline void AivSignalStartup(GM_ADDR shared_workspace, std::uint32_t sub_idx) {
     GlobalTensor<int64_t> word;
     StartupWord(shared_workspace, sub_idx, word);
+    __asm__ __volatile__("" ::: "memory");
     word.SetValue(0, 1);
     DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(word);
+    __asm__ __volatile__("" ::: "memory");
 }
 
 __aicore__ inline void CubeWaitStartup(GM_ADDR shared_workspace) {
@@ -492,11 +498,36 @@ __aicore__ inline void CubeWaitStartup(GM_ADDR shared_workspace) {
     for (std::uint32_t sub = 0; sub < kCubeAivPerAic; ++sub) {
         StartupWord(shared_workspace, sub, word[sub]);
     }
+    // THE SPIN NEEDS A COMPILER BARRIER AND A VOLATILE READ, AND DEADLOCKS
+    // WITHOUT THEM. MEASURED on the dav-3510 CAModel, 2026-10-19, by
+    // tests/sim/kernel/dsv4_crosscore_wait_probe_kernel.cpp in GM-handshake
+    // mode -- this barrier and nothing else:
+    //
+    //     dcci + GlobalTensor::GetValue     exit 3, never observed the write
+    //     barrier + dcci + volatile read    exit 0, TASK_DONE in 33.1 s
+    //
+    // one variable between the two runs. The cause is NOT cache coherency: a
+    // `for (;;)` whose body the optimiser can prove writes nothing lets it
+    // hoist the load out of the loop, so the Cube spins on a register copy and
+    // can never see the AIV's store. dcci is a CACHE operation, not a sequence
+    // point for the compiler.
+    //
+    // The pattern is the toolkit's own, from the dav-3510 KFC server that polls
+    // a GM word written by an AIV (kfc_comm_gm.h, RcvMessageImpl):
+    //
+    //     Barrier(); dcci(msg, SINGLE_CACHE_LINE, CACHELINE_OUT); Barrier();
+    //     dc_preload(...); ... msg->head        // raw __gm__ dereference
+    //
+    // where Barrier() is exactly `__asm__ __volatile__("" ::: "memory")`.
     for (;;) {
         bool all_ready = true;
         for (std::uint32_t sub = 0; sub < kCubeAivPerAic; ++sub) {
+            __asm__ __volatile__("" ::: "memory");
             DataCacheCleanAndInvalid<int64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(word[sub]);
-            if (word[sub].GetValue(0) == 0) {
+            __asm__ __volatile__("" ::: "memory");
+            const __gm__ volatile int64_t* raw = reinterpret_cast<const __gm__ volatile int64_t*>(
+                Bytes(shared_workspace) + sub * kStartupLineBytes);
+            if (*raw == 0) {
                 all_ready = false;
             }
         }

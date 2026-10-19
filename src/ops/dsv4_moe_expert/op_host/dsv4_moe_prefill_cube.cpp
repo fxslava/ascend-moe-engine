@@ -114,46 +114,6 @@ Status LaunchDsv4MoePrefillCube(
     return staged;
   }
 
-  // THE STARTUP RENDEZVOUS WORDS ARE ZEROED HERE, ON THE STREAM, BEFORE THE
-  // DISPATCH. The kernel's Cube core spins on the first 256 bytes of the
-  // workspace until both of its paired vector cores have signalled that slot 0
-  // of the L1 ring holds their operands -- see "THE STARTUP RENDEZVOUS" in the
-  // kernel for the measurement that made that necessary.
-  //
-  // THE WRAPPER DOES IT RATHER THAN THE CALLER. launch.hpp has always
-  // documented this workspace as needing no initialization, and that promise is
-  // worth more than the two lines it costs to keep: a caller that handed over
-  // recycled GM with a nonzero byte in the first 256 would otherwise release
-  // the Cube before any operand existed, which is precisely the silent wrong
-  // answer the barrier was added to prevent.
-  //
-  // AN H2D COPY, NOT aclrtMemsetAsync, AND THAT IS A CAModel CONSTRAINT RATHER
-  // THAN A PREFERENCE. MEASURED 2026-10-19: aclrtMemsetAsync on the stream
-  // aborts the dav-3510 simulator outright --
-  //
-  //     ESL Model not support memset in sdma!
-  //     sdmaa.cpp:282: ... Assertion `... "Invalid sdmaOpcode in SplitQ!"'
-  //
-  // exit 134, before the kernel runs at all. The ESL SDMA model implements
-  // PREFETCH / WRITE_BACK / INVALIDATE / FLUSH and not memset, so the hardware
-  // path and the simulated path differ here; a synchronous H2D copy works on
-  // both and is what this wrapper already does for the tiling blob.
-  //
-  // SYNCHRONOUS, so it is ordered before the dispatch without a stream fence.
-  // 256 bytes is kCubeAivPerAic * 128, one cache line per AIV; the kernel's own
-  // constant is operator-private, so the size is restated here and the two are
-  // kept in step by this comment.
-  constexpr std::size_t kStartupBytes = 256;
-  const unsigned char zeroed_startup[kStartupBytes] = {};
-  const aclError cleared =
-      aclrtMemcpy(workspace_gm, kStartupBytes, zeroed_startup, kStartupBytes,
-                  ACL_MEMCPY_HOST_TO_DEVICE);
-  if (cleared != ACL_SUCCESS) {
-    detail::RecordAclFailure(kCubeOp, "aclrtMemcpy(startup rendezvous)",
-                             static_cast<int>(cleared));
-    return Status::launch_error;
-  }
-
   // dyn_ub_size is ZERO here, and that is not an oversight. The AIV block
   // kernels hand __ubuf__ pointers to a SIMT VF, which must come from the
   // DYNAMIC region the chevron declares. This kernel has no VF: its UB is
