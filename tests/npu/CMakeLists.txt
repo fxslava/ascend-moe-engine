@@ -261,28 +261,50 @@ if(COMMAND ascendc_library)
   # -------------------------------------------------------------------------
   # Release-mode device printf
   # -------------------------------------------------------------------------
-  # Four things have to line up, and two of them are defeated by a Release
-  # configuration on their own:
+  # Four knobs, and only two of them are load-bearing on this release:
   #
-  #   --cce-enable-print   BiSheng emits the print machinery only when asked.
-  #                        The flag is spelled --cce-enable-print, NOT
-  #                        --cce-enable-printf; it appears under
-  #                        `bisheng --help-hidden` as "Enable CCE print", and
-  #                        it is load-bearing rather than cosmetic -- MEASURED
-  #                        on dav-3510, the pipeline kernel object grows
-  #                        292,128 B -> 312,792 B when it is added.
-  #   ASCENDC_DUMP=1       impl/utils/debug/asc_aicore_printf_impl.h compiles
-  #                        the whole body away under `ASCENDC_DUMP == 0`.
-  #   -UNDEBUG             a Release build adds -DNDEBUG; cancelled here so
-  #                        nothing downstream can key on it.
-  #   ENABLE_KERNEL_PRINTF the kernel's own DSV4_PIPELINE_TRACE macro.
+  #   ASCENDC_DUMP=1       REQUIRED. impl/utils/debug/asc_aicore_printf_impl.h
+  #                        compiles its whole body away under
+  #                        `ASCENDC_DUMP == 0`.
+  #   ENABLE_KERNEL_PRINTF REQUIRED. The kernel's own DSV4_PIPELINE_TRACE macro
+  #                        expands to nothing without it.
+  #   -UNDEBUG             Belt and braces. A Release build adds -DNDEBUG;
+  #                        cancelled so nothing downstream can key on it. No
+  #                        header in 9.2.0 was observed to.
+  #   --cce-enable-print   NOT required for output on this release. Spelled
+  #                        --cce-enable-print, not --cce-enable-printf; absent
+  #                        from `bisheng --help`, and under `--help-hidden` as
+  #                        "Enable CCE print".
+  #
+  # WHAT THE FLAG DOES AND DOES NOT DO -- MEASURED on the dav-3510 CAModel,
+  # 2026-10-19, with a minimal AIV-only probe that does nothing but printf
+  # (KERNEL_TYPE_MIX_AIV_1_0, one block, plus a GM witness word to prove the
+  # kernel retired). Built twice, once with the flag and once with only the
+  # macros, and run on the simulator:
+  #
+  #   BOTH runs printed all four records, correctly formatted ("float=1.500000
+  #   uint=4242"), tagged [AIV Block 0/1], and both returned witness 1234.
+  #
+  # So device printf WORKS WITHOUT the flag here. What the flag changes is code
+  # generation: the TU gains cce::internal::PrintPayload::PrintFormatString<>
+  # instantiations for char*/void*/char/float/long long (2 -> 14 print symbols;
+  # probe object 32,144 B -> 51,616 B, pipeline kernel 281,920 B -> 320,632 B)
+  # and the simulator emits a "HiIPU Print" collection block at teardown.
+  #
+  # AN EARLIER REVISION OF THIS COMMENT READ THE SIZE DELTA AS PROOF THE FLAG
+  # WAS REQUIRED. It is not: the delta proves code was emitted, not that the
+  # output depends on it. The flag is KEPT anyway -- it is the toolchain's
+  # documented way to ask for print, it costs only object size in a debug
+  # configuration, and whether real HARDWARE needs it has not been observed
+  # (CLAUDE.md section 5.7). CAModel is not hardware.
   #
   # NOTHING IS NEEDED ON THE HOST SIDE. Earlier CANN releases wanted the
   # runtime's debug channel opened explicitly (aclrtDbgInit / aclrtDbgFinalize)
   # before the records would be collected; 9.2.0 does not, and the symbol is
   # declared in no header under x86_64-linux/include/acl/ and exported by no
-  # shared object under /usr/local/Ascend. So the gtest driver stays free of it
-  # and these four flags are the whole of the contract.
+  # shared object under /usr/local/Ascend -- checked with nm across all three
+  # install roots. The probe confirms it: records appeared with no host-side
+  # call of any kind.
   if(ENABLE_KERNEL_PRINTF)
     target_compile_definitions(${_pipeline_device} PRIVATE
       ENABLE_KERNEL_PRINTF=1
