@@ -181,14 +181,526 @@ namespace {
 }  // namespace
 
 // =================================================================================================
-// THE VECTOR CORE, transcribed as a strict synchronous lockstep pipeline
+// HOW THIS FILE IS LAID OUT
 // =================================================================================================
-// Stage numbering, used in both phases and in the AIC below:
+// Three layers, bottom up:
+//
+//   1. TWO CONTEXT STRUCTS, AivStepContext and CubeStepContext, which carry
+//      everything a step needs that is not the step number: the geometry, the
+//      UB and L1 buffers, the L0 buffers, the GM operand bases and the handful
+//      of per-tile values derived from the expert LUT. They are plain
+//      aggregates with reference members, built once per core and refreshed
+//      per admitted tile by AivAdmitTile / CubeAdmitTile.
+//
+//   2. ONE `Step*_` HELPER PER DISCRETE PHASE, each owning its own bounding
+//      `PipeBarrier<PIPE_ALL>()` calls and its own trace records. A barrier
+//      belongs to the step whose effects it publishes, so no caller has to
+//      remember to fence anything -- which is the property that made the
+//      previous flat transcription hard to audit.
+//
+//   3. THE TWO ROOT FUNCTIONS, which are nothing but loop nests over those
+//      helpers. They are meant to be read SIDE BY SIDE: phase 1 step k on the
+//      AIV is Prefetch/Push/Wait and on the AIC is Wait/Mmad/Release, so the
+//      lockstep is visible as two three-line bodies rather than inferred from
+//      two hundred lines of interleaved indexing.
+//
+// The stage numbering the records use, unchanged:
 //
 //   STAGE 1  prefetch (MTE2), barrier, dequant + Cast (V), barrier
 //   STAGE 2  push UB -> L1 (MTE3), barrier, set StepReady
 //   STAGE 3  (AIC) wait StepReady, L1 -> L0A/L0B, Mmad, barrier, release StepFree
 //   STAGE 4  wait StepFree, barrier -- after which all three cores are at step k
+//
+// NOTHING ABOUT THE SCHEDULE CHANGES HERE. Every instruction, every flag, every
+// barrier and every trace record is the one the flat lockstep transcription
+// already carried; only the nesting is different. The flag and event budget is
+// therefore the same, and the argument for it still stands: per contraction
+// step one MTE2_V token raised by the prefetch and consumed by the first
+// dequant, one StepReady set per AIV against one AIC wait, one StepFree release
+// per AIV against one wait on each; per inter block three LandingFree sets per
+// AIV against three AIC waits and two Product releases against two waits.
+
+// =================================================================================================
+// THE AIV's CONTEXT
+// =================================================================================================
+// A plain aggregate, so it is initialized once with a brace list and never
+// copied. The reference members are what keep it free: `geom`, `buf` and the
+// four L1 buffer arrays are the caller's, and a reference member reached
+// through a `const AivStepContext&` is still a non-const reference to its
+// target, which is why the step helpers can take the context by const
+// reference and still push into L1 and still hand `ring` to a production
+// helper that wants it mutable.
+//
+// THE OPERAND BASES ARE STORED UNOFFSET and the per-expert offset is applied
+// by the six accessors below. Keeping `expert_id` rather than a byte offset is
+// what lets the trace print it, and the accessors widen before multiplying
+// (CLAUDE.md section 2.7) so a large expert index cannot wrap a stride.
+struct AivStepContext {
+    // --- invariant for the whole launch ---
+    const Geometry&            geom;
+    const AivBuffers&          buf;
+    AivRingState&              ring;
+    const GlobalTensor<float>& tokens_in;
+    const GlobalTensor<float>& tokens_out;
+    TBuf<TPosition::A1> (&l1a)[kCubeRingSlots];
+    TBuf<TPosition::B1> (&l1w)[kCubeRingSlots][kCubeWeightStreams];
+    TBuf<TPosition::A1> (&l1a2)[kCubeRingSlots];
+    TBuf<TPosition::B1> (&l1w2)[kCubeRingSlots];
+    GM_ADDR gate_packed_base;
+    GM_ADDR gate_scales_base;
+    GM_ADDR up_packed_base;
+    GM_ADDR up_scales_base;
+    GM_ADDR down_packed_base;
+    GM_ADDR down_scales_base;
+    GM_ADDR lut;
+    std::uint32_t sub_idx;
+    std::uint32_t row_base;   // sub_idx * kCubeMHalf -- this AIV's token rows
+
+    // --- refreshed per admitted tile by AivAdmitTile ---
+    std::uint32_t token_row_start;
+    std::uint32_t valid_rows;
+    std::uint32_t store_rows;
+    std::uint32_t expert_id;
+
+    // THE STEP COUNTER IS WHAT THE NARRATION IS FOR. It runs monotonically
+    // across blocks AND across both phases, and all three cores walk identical
+    // loop bounds -- same geometry, same admitted tiles, same block and step
+    // counts -- so "Step 7" means the same step on AIV0, AIV1 and the AIC. That
+    // is the alignment this probe exists to check, so a merged log in which the
+    // three Step 7 lines do NOT sit together is itself the finding.
+    std::uint32_t step_no;
+
+    __aicore__ inline __gm__ std::uint8_t* GatePacked() const {
+        return Bytes(gate_packed_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.gate_up_packed_stride;
+    }
+    __aicore__ inline __gm__ std::uint8_t* GateScales() const {
+        return Bytes(gate_scales_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.gate_up_scale_stride;
+    }
+    __aicore__ inline __gm__ std::uint8_t* UpPacked() const {
+        return Bytes(up_packed_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.gate_up_packed_stride;
+    }
+    __aicore__ inline __gm__ std::uint8_t* UpScales() const {
+        return Bytes(up_scales_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.gate_up_scale_stride;
+    }
+    __aicore__ inline __gm__ std::uint8_t* DownPacked() const {
+        return Bytes(down_packed_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.down_packed_stride;
+    }
+    __aicore__ inline __gm__ std::uint8_t* DownScales() const {
+        return Bytes(down_scales_base) +
+               static_cast<std::uint64_t>(expert_id) * geom.down_scale_stride;
+    }
+};
+
+// Refresh the per-tile fields, or report the tile is not this expert's.
+// `store_rows` is derived here rather than in phase 2 so the whole of the
+// tile's geometry is settled in one place.
+__aicore__ inline bool AivAdmitTile(AivStepContext& ctx, std::uint32_t tile_idx) {
+    const std::uint32_t token_row_start = tile_idx * ctx.geom.token_tile;
+    std::uint32_t expert_id = 0;
+    if (!TileAdmitted(ctx.lut, token_row_start, ctx.geom.num_experts, expert_id)) {
+        return false;
+    }
+    const std::uint32_t remaining = ctx.geom.total_tokens - token_row_start;
+    const std::uint32_t valid_rows =
+        remaining < ctx.geom.token_tile ? remaining : ctx.geom.token_tile;
+    const std::uint32_t owned = valid_rows > ctx.row_base ? (valid_rows - ctx.row_base) : 0u;
+
+    ctx.token_row_start = token_row_start;
+    ctx.valid_rows      = valid_rows;
+    ctx.store_rows      = owned < kCubeMHalf ? owned : kCubeMHalf;
+    ctx.expert_id       = expert_id;
+    return true;
+}
+
+// =================================================================================================
+// THE AIV's STEPS
+// =================================================================================================
+
+// STAGE 1, phase 1. The FIRST dequant consumes the MTE2_V token the prefetch's
+// last burst raised; the second passes -1 because one token covered both weight
+// bursts. The barrier above it has already ordered MTE2 against V, so that
+// WaitFlag is redundant as a fence -- it is there to CONSUME the token, which is
+// not optional: an unconsumed binary flag is the double-set on the next lap
+// through this slot.
+__aicore__ inline void StepAiv_PrefetchAndDequant(
+    const AivStepContext& ctx, std::uint32_t slot,
+    std::uint32_t inter_base, std::uint32_t k) {
+    AivPrefetchFwdStep(ctx.tokens_in, ctx.token_row_start,
+                       ctx.GatePacked(), ctx.GateScales(), ctx.UpPacked(), ctx.UpScales(),
+                       inter_base, k * kCubeKSub, ctx.valid_rows,
+                       ctx.sub_idx, ctx.geom, ctx.buf, slot, ctx.ring);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s1 k=%u prefetched slot=%u\n", k, slot);
+
+    DequantSubTileVector(kCubeRSub, kCubeKHalf, ctx.buf.w[slot][0], kEvCubeSlotFull[slot]);
+    DequantSubTileVector(kCubeRSub, kCubeKHalf, ctx.buf.w[slot][1], -1);
+    Cast(ctx.buf.x_bf16[slot], ctx.buf.x_f32[slot], RoundMode::CAST_RINT,
+         kCubeMTile * kCubeKHalf);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s1 k=%u dequant+cast done\n", k);
+}
+
+// STAGE 2, phase 1. AivConvertAndPushFwdStep's push sequence, instruction for
+// instruction, minus its deferred SetFlag<V_MTE2> and SetFlag<MTE3_V> and minus
+// its immediate V_MTE3 pair, all three of which the barriers subsume.
+__aicore__ inline void StepAiv_PushL1AndSignalReady(
+    const AivStepContext& ctx, std::uint32_t slot,
+    std::uint32_t col_base, std::uint32_t k) {
+    PushUbTileToL1Nz(ctx.l1a[slot].Get<bfloat16_t>(), ctx.buf.x_bf16[slot],
+                     kCubeMTile, kCubeKHalf, kCubeKHalf, kCubeMTile, col_base, 0);
+    PushUbTileToL1Nz(ctx.l1w[slot][0].Get<bfloat16_t>(), ctx.buf.w[slot][0].weight_expanded,
+                     kCubeRSub, kCubeKHalf, kCubeKHalf, kCubeRSub, col_base, 0);
+    PushUbTileToL1Nz(ctx.l1w[slot][1].Get<bfloat16_t>(), ctx.buf.w[slot][1].weight_expanded,
+                     kCubeRSub, kCubeKHalf, kCubeKHalf, kCubeRSub, col_base, 0);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s2 k=%u pushed slot=%u\n", k, slot);
+
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(
+        static_cast<uint16_t>(kCubeFlagStepReady + slot));
+    DSV4_TRACE("V s2 k=%u SET StepReady slot=%u\n", k, slot);
+}
+
+// STAGE 4, both phases. Unconditional, 1:1 against the AIC's unconditional
+// release. The wait is scoped to PIPE_MTE3 -- what StepFree protects is this
+// AIV's push INTO the slot -- and a scoped wait on 950PR blocks only that pipe,
+// so the barrier after it is what makes the whole core park, and what makes the
+// record below true rather than a claim about the scalar unit.
+__aicore__ inline void StepAiv_WaitStepComplete(
+    const AivStepContext& ctx, std::uint32_t slot, std::uint32_t k) {
+    (void)ctx;  // present for signature symmetry with the other StepAiv_ steps
+    DSV4_TRACE("V s4 k=%u WAIT StepFree slot=%u\n", k, slot);
+    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStep>(
+        static_cast<uint16_t>(kCubeFlagStepFree + slot));
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s4 k=%u GOT StepFree slot=%u\n", k, slot);
+}
+
+// PHASE 1 EPILOGUE, first half: the gate pre-activation arrives in the landing
+// zone, is clamped ABOVE by the limit only, and the landing zone is released.
+__aicore__ inline void StepAiv_EpilogueGate(
+    const AivStepContext& ctx, std::uint32_t inter_base) {
+    const std::uint32_t elems = kCubeMHalf * kCubeRSub;
+    DSV4_TRACE("V p1 e1 WAIT Product gate ib=%u\n", inter_base);
+    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V p1 e1 GOT Product gate\n");
+
+    Mins(ctx.buf.gate_acc, ctx.buf.landing, ctx.geom.swiglu_limit, elems);
+    PipeBarrier<PIPE_ALL>();
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
+    DSV4_TRACE("V p1 e1 SET LandingFree gate\n");
+}
+
+// PHASE 1 EPILOGUE, second half: the up pre-activation, clamped to
+// [-limit, limit]. The LOWER clamp is the operation that also moves it out of
+// the landing zone, so it comes before the release; the UPPER clamp reads
+// `up_acc` and not the landing zone, so it comes after, and holding the Cube
+// for it would be a stall for nothing.
+__aicore__ inline void StepAiv_EpilogueUp(
+    const AivStepContext& ctx, std::uint32_t inter_base) {
+    const std::uint32_t elems = kCubeMHalf * kCubeRSub;
+    DSV4_TRACE("V p1 e2 WAIT Product up ib=%u\n", inter_base);
+    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V p1 e2 GOT Product up\n");
+
+    Maxs(ctx.buf.up_acc, ctx.buf.landing, -ctx.geom.swiglu_limit, elems);
+    PipeBarrier<PIPE_ALL>();
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
+    DSV4_TRACE("V p1 e2 SET LandingFree up\n");
+
+    Mins(ctx.buf.up_acc, ctx.buf.up_acc, ctx.geom.swiglu_limit, elems);
+    PipeBarrier<PIPE_ALL>();
+}
+
+// PHASE 1 BLOCK RENDEZVOUS. A THIRD LandingFree, raised only once SwiGLU and
+// its plane store have completely finished, against a third AIC wait. This is
+// what stops the Cube advancing to the next inter block -- or into phase 2 --
+// while an AIV is still in this one. LandingFree is reused rather than a new
+// flag id because ids 9..15 have never been exercised green by any probe (see
+// the allocation note in the arch35 header) and because the AIC is already
+// parked in its second LandingFree wait long before this set can be issued: it
+// enters that wait immediately after releasing Product, which is the token this
+// AIV needed before it could even run Maxs.
+__aicore__ inline void StepAiv_BlockRendezvous(
+    const AivStepContext& ctx, std::uint32_t inter_base) {
+    AivApplySwiGLU(ctx.buf, inter_base, ctx.geom);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V p1 swiglu done ib=%u\n", inter_base);
+
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(kCubeFlagLandingFree);
+    DSV4_TRACE("V p1 SET BlockDone ib=%u\n", inter_base);
+}
+
+// STAGE 1, phase 2. One weight stream and no token burst -- phase 2 reads its A
+// operand out of the resident activation plane.
+__aicore__ inline void StepAiv_PrefetchDown(
+    const AivStepContext& ctx, std::uint32_t slot,
+    std::uint32_t hidden_base, std::uint32_t r) {
+    AivPrefetchDownStep(ctx.DownPacked(), ctx.DownScales(), hidden_base, r * kCubeRSub2,
+                        ctx.sub_idx, ctx.geom, ctx.buf, slot, ctx.ring);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s1 r=%u prefetched slot=%u\n", r, slot);
+
+    DequantSubTileVector(kCubeHSub, kCubeRHalf2, ctx.buf.w[slot][0], kEvCubeSlotFull[slot]);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s1 r=%u dequant done\n", r);
+}
+
+// STAGE 2, phase 2. AivConvertAndPushDownStep's two pushes, same order, same
+// split -- and the split is the one place the two bisections meet:
+//   the weight half is a CONTRACTION half -> a C0-block range, row_base 0
+//   the token half   is a TOKEN-ROW half  -> a row range of every block, col_base 0
+__aicore__ inline void StepAiv_PushDownAndSignalReady(
+    const AivStepContext& ctx, std::uint32_t slot, std::uint32_t r) {
+    PushUbTileToL1Nz(ctx.l1w2[slot].Get<bfloat16_t>(), ctx.buf.w[slot][0].weight_expanded,
+                     kCubeHSub, kCubeRHalf2, kCubeRHalf2,
+                     kCubeHSub, ctx.sub_idx * kCubeRHalf2, 0);
+    PushUbTileToL1Nz(ctx.l1a2[slot].Get<bfloat16_t>(), ctx.buf.act[r * kCubeRSub2],
+                     kCubeMHalf, kCubeRSub2, ctx.geom.inter,
+                     kCubeMTile, 0, ctx.sub_idx * kCubeMHalf);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V s2 r=%u pushed slot=%u\n", r, slot);
+
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(
+        static_cast<uint16_t>(kCubeFlagStepReady + slot));
+    DSV4_TRACE("V s2 r=%u SET StepReady slot=%u\n", r, slot);
+}
+
+// This AIV's M/2 rows of one hidden block, out of the landing zone and into GM.
+// `store_rows` is zero when the tile's tail does not reach this AIV's half, and
+// then nothing is stored -- the rows past the tail carry the zeros the setup
+// Duplicate left, and a zero A row produces a zero C row.
+__aicore__ inline void StepAiv_StoreLandingPlane(
+    const AivStepContext& ctx, std::uint32_t hidden_base) {
+    if (ctx.store_rows == 0u) {
+        return;
+    }
+    DataCopyParams out_burst;
+    out_burst.blockCount = static_cast<std::uint16_t>(ctx.store_rows);
+    out_burst.blockLen   = static_cast<std::uint16_t>((kCubeHSub * 4u) / 32u);
+    out_burst.srcStride  = 0;
+    out_burst.dstStride  =
+        static_cast<std::uint16_t>(((ctx.geom.hidden - kCubeHSub) * 4u) / 32u);
+    DataCopy(ctx.tokens_out[(static_cast<std::uint64_t>(ctx.token_row_start + ctx.row_base) *
+                             ctx.geom.hidden) + hidden_base],
+             ctx.buf.landing, out_burst);
+}
+
+// PHASE 2 BLOCK RENDEZVOUS. No separate flag is needed here: the GM store is
+// the AIV's last act in the block, so draining it before the single LandingFree
+// set makes that flag itself the rendezvous -- the AIC's fix3 wait cannot clear
+// until both AIVs have finished storing, and it is the last thing the AIC does
+// in the block.
+__aicore__ inline void StepAiv_StoreGMAndBlockDone(
+    const AivStepContext& ctx, std::uint32_t hidden_base) {
+    DSV4_TRACE("V p2 WAIT Product hb=%u\n", hidden_base);
+    CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStore>(kCubeFlagProduct);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V p2 GOT Product\n");
+
+    StepAiv_StoreLandingPlane(ctx, hidden_base);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("V p2 stored hb=%u rows=%u\n", hidden_base, ctx.store_rows);
+
+    CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(kCubeFlagLandingFree);
+    DSV4_TRACE("V p2 SET BlockDone hb=%u\n", hidden_base);
+}
+
+// =================================================================================================
+// THE CUBE's CONTEXT
+// =================================================================================================
+// The L0 buffers are held as address-space-qualified POINTERS. BiSheng permits
+// that and permits passing them on; what it rejects is DEREFERENCING a
+// `__ca__` / `__cb__` / `__cc__` pointer ("only __ubuf__ and __gm__ and local
+// memory pointer can be dereferenced"), which nothing here does -- every use
+// goes through Te::MakeMemPtr inside the production load/Mmad/Fixpipe helpers.
+struct CubeStepContext {
+    const Geometry& geom;
+    TBuf<TPosition::A1> (&l1a)[kCubeRingSlots];
+    TBuf<TPosition::B1> (&l1w)[kCubeRingSlots][kCubeWeightStreams];
+    TBuf<TPosition::A1> (&l1a2)[kCubeRingSlots];
+    TBuf<TPosition::B1> (&l1w2)[kCubeRingSlots];
+    __ca__ bfloat16_t* l0a;
+    __cb__ bfloat16_t* l0b_gate;
+    __cb__ bfloat16_t* l0b_up;
+    __cc__ float*      l0c_gate;
+    __cc__ float*      l0c_up;
+    GM_ADDR lut;
+
+    // --- refreshed per admitted tile by CubeAdmitTile ---
+    std::uint32_t expert_id;
+    // Monotonic across blocks and phases; see AivStepContext::step_no.
+    std::uint32_t step_no;
+};
+
+__aicore__ inline bool CubeAdmitTile(CubeStepContext& ctx, std::uint32_t tile_idx) {
+    const std::uint32_t token_row_start = tile_idx * ctx.geom.token_tile;
+    std::uint32_t expert_id = 0;
+    if (!TileAdmitted(ctx.lut, token_row_start, ctx.geom.num_experts, expert_id)) {
+        return false;
+    }
+    ctx.expert_id = expert_id;
+    return true;
+}
+
+// =================================================================================================
+// THE CUBE's STEPS
+// =================================================================================================
+
+// STAGE 3 head, both phases. ONE wait, not one per AIV: mode 2's AIV -> AIC
+// direction increments the AIC's counter once BOTH AIVs have set. Scoped to
+// PIPE_MTE1, the pipe that reads the slot, then drained so the record is true.
+__aicore__ inline void StepCube_WaitAivReady(
+    const CubeStepContext& ctx, std::uint32_t slot, std::uint32_t k) {
+    (void)ctx;  // present for signature symmetry with the other StepCube_ steps
+    DSV4_TRACE("C s3 k=%u WAIT StepReady slot=%u\n", k, slot);
+    CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAicStep>(
+        static_cast<uint16_t>(kCubeFlagStepReady + slot));
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C s3 k=%u GOT StepReady slot=%u\n", k, slot);
+}
+
+// STAGE 3 body, phase 1: both weight streams against the one token tile.
+// CubeCloseAccumulationStep carries the K-axis accumulation interlock, which is
+// a documented hardware contract below (m/16)*(n/16) < 10 and is NOT subsumed
+// by the PIPE_ALL barrier after it -- it must sit between these Mmads' L0C write
+// and the next step's read.
+__aicore__ inline void StepCube_MmadAccumulate(
+    const CubeStepContext& ctx, std::uint32_t slot, std::uint32_t k, bool is_first) {
+    CubeLoadTokensToL0A(ctx.l0a, ctx.l1a[slot].Get<bfloat16_t>(), kCubeMTile, kCubeKSub);
+    CubeLoadWeightsToL0B(ctx.l0b_gate, ctx.l1w[slot][0].Get<bfloat16_t>(), kCubeKSub, kCubeRSub);
+    CubeLoadWeightsToL0B(ctx.l0b_up, ctx.l1w[slot][1].Get<bfloat16_t>(), kCubeKSub, kCubeRSub);
+    DSV4_TRACE("C s3 k=%u loaded L0A/L0B\n", k);
+
+    SetFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
+    WaitFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
+
+    CubeMmadAccumulate(ctx.l0c_gate, ctx.l0a, ctx.l0b_gate,
+                       kCubeMTile, kCubeRSub, kCubeKSub, is_first);
+    CubeMmadAccumulate(ctx.l0c_up, ctx.l0a, ctx.l0b_up,
+                       kCubeMTile, kCubeRSub, kCubeKSub, is_first);
+    DSV4_TRACE("C s3 k=%u mmad init=%u\n", k, (unsigned)is_first);
+
+    CubeCloseAccumulationStep();
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C s3 k=%u closed\n", k);
+}
+
+// STAGE 3 body, phase 2: one weight stream, and the A operand is the token tile
+// the AIVs pushed out of the resident activation plane.
+__aicore__ inline void StepCube_MmadDown(
+    const CubeStepContext& ctx, std::uint32_t slot, std::uint32_t r, bool is_first) {
+    CubeLoadTokensToL0A(ctx.l0a, ctx.l1a2[slot].Get<bfloat16_t>(), kCubeMTile, kCubeRSub2);
+    CubeLoadWeightsToL0B(ctx.l0b_gate, ctx.l1w2[slot].Get<bfloat16_t>(), kCubeRSub2, kCubeHSub);
+    DSV4_TRACE("C s3 r=%u loaded L0A/L0B\n", r);
+
+    SetFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
+    WaitFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
+
+    CubeMmadAccumulate(ctx.l0c_gate, ctx.l0a, ctx.l0b_gate,
+                       kCubeMTile, kCubeHSub, kCubeRSub2, is_first);
+    DSV4_TRACE("C s3 r=%u mmad init=%u\n", r, (unsigned)is_first);
+
+    CubeCloseAccumulationStep();
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C s3 r=%u closed\n", r);
+}
+
+// STAGE 3 tail, both phases. Production gates this on
+// `k + kCubeRingSlots < fwd_steps`, which hands the token for step k to step
+// k + 2. Here it is unconditional and matches the AIVs' unconditional stage 4
+// wait one for one, so neither side can be a lap ahead.
+__aicore__ inline void StepCube_ReleaseAiv(
+    const CubeStepContext& ctx, std::uint32_t slot, std::uint32_t k) {
+    (void)ctx;  // present for signature symmetry with the other StepCube_ steps
+    CubeReleaseToAllAivs<PIPE_MTE1>(static_cast<uint16_t>(kCubeFlagStepFree + slot));
+    DSV4_TRACE("C s3 k=%u SET StepFree slot=%u\n", k, slot);
+}
+
+// The contraction is complete; let the Fixpipe read L0C.
+__aicore__ inline void StepCube_DrainToFixpipe(
+    const CubeStepContext& ctx, std::uint32_t blk) {
+    (void)ctx;  // present for signature symmetry with the other StepCube_ steps
+    SetFlag<HardEvent::M_FIX>(kEvCubeMToFix);
+    WaitFlag<HardEvent::M_FIX>(kEvCubeMToFix);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C M_FIX done blk=%u\n", blk);
+}
+
+// L0C -> both AIVs' UBs, then the handover and its acknowledgement.
+// CubeMoveOutAndHandOver is INLINED here rather than called, so the trace can
+// print between the Fixpipe, the Product release and the LandingFree wait: the
+// cross-core handover is a prime suspect and a probe that could not print
+// across those three edges would be blind to exactly the edge in question.
+// The destination is UB offset 0 in EACH AIV's own address space and the layout
+// carries the FULL M -- see CubeL0c2UbTraitDualDstM.
+__aicore__ inline void StepCube_FixpipeHandover(
+    const CubeStepContext& ctx, __cc__ float* l0c_mem,
+    std::uint32_t extent_m, std::uint32_t extent_n, std::uint32_t tag) {
+    (void)ctx;  // present for signature symmetry with the other StepCube_ steps
+    auto l0C = Te::MakeTensor(
+        Te::MakeMemPtr(l0c_mem),
+        Te::MakeFrameLayout<Te::NZLayoutPtn, 16>(extent_m, extent_n));
+    auto ub = Te::MakeTensor(
+        Te::MakeMemPtr(reinterpret_cast<__ubuf__ float*>(kCubeLandingUbOffset)),
+        Te::MakeFrameLayout<Te::NDExtLayoutPtn>(extent_m, extent_n));
+    Te::FixpipeParams fixParams;
+    DSV4_TRACE("C fix%u begin n=%u\n", tag, extent_n);
+    Te::Copy(Te::MakeCopy(Te::CopyL0C2UB{}, CubeL0c2UbTraitDualDstM{}).with(fixParams),
+             ub, l0C);
+    PipeBarrier<PIPE_FIX>();
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C fix%u drained\n", tag);
+
+    CubeReleaseToAllAivs<PIPE_FIX>(kCubeFlagProduct);
+    DSV4_TRACE("C fix%u SET Product x%u\n", tag, (unsigned)kCubeAivPerAic);
+    DSV4_TRACE("C fix%u WAIT LandingFree\n", tag);
+    CrossCoreWaitFlag<kCubeSyncMode, PIPE_FIX>(kCubeFlagLandingFree);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C fix%u GOT LandingFree\n", tag);
+}
+
+// The AIVs' third LandingFree, raised only after SwiGLU and its plane store have
+// completely finished. Until it arrives the Cube does not advance `inter_base`
+// and does not enter phase 2, so the activation plane phase 2 reads is complete
+// on both AIVs.
+__aicore__ inline void StepCube_WaitBlockDone(
+    const CubeStepContext& ctx, std::uint32_t inter_base) {
+    (void)ctx;  // present for signature symmetry with the other StepCube_ steps
+    DSV4_TRACE("C p1 WAIT BlockDone ib=%u\n", inter_base);
+    CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAicStep>(kCubeFlagLandingFree);
+    PipeBarrier<PIPE_ALL>();
+    DSV4_TRACE("C p1 GOT BlockDone ib=%u\n", inter_base);
+}
+
+// =================================================================================================
+// THE VECTOR CORE: the root pipeline
+// =================================================================================================
+// TWO THINGS THE LOOP NEST BELOW DOES NOT SAY, BECAUSE SAYING THEM THERE WOULD
+// COST THE READABILITY THE NEST EXISTS FOR.
+//
+// THE RING STATE IS DEAD, AND IS KEPT ONLY TO SATISFY THE TWO PRODUCTION
+// PREFETCH SIGNATURES. AivPrefetchFwdStep and AivPrefetchDownStep CONSUME
+// `stage_live[slot]` -- a deferred WaitFlag<V_MTE2> -- but never raise it; the
+// raise lives in AivConvertAndPushFwdStep, which this lockstep transcription
+// does not call. So one AivResetRing leaves both arrays false for the whole run
+// and the two helpers take no deferred fence, which is what "the ring overlap is
+// removed" means mechanically. AivDrainRing is correspondingly never called:
+// there is nothing outstanding for it to drain, and waiting on an unraised token
+// is the one thing in this file that would hang on its own.
+//
+// BOTH Tile[] INDICES IN THE NARRATION ARE k, AND THAT IS THE POINT. In the
+// production pipeline the copy runs a tile AHEAD of the dequant -- Tile[k+1]
+// copied while Tile[k] converts -- and this lockstep probe removed that overlap,
+// so one step copies and converts the SAME tile. Printing a staggered pair would
+// describe a schedule this file does not run, which is exactly the class of
+// mistake the probe was rewritten to stop making.
 __aicore__ inline void TraceRunVectorCore(
     const Geometry& geom, std::uint32_t sub_idx,
     GM_ADDR gate_weights_packed, GM_ADDR gate_weight_scales,
@@ -207,239 +719,67 @@ __aicore__ inline void TraceRunVectorCore(
     // The id census printed by the entry point is what established that.
     const std::uint32_t core_idx =
         static_cast<std::uint32_t>(GetBlockIdx()) / static_cast<std::uint32_t>(GetSubBlockNum());
-    const std::uint32_t row_base = sub_idx * kCubeMHalf;
-    const std::uint32_t col_base = sub_idx * kCubeKHalf;
+    const std::uint32_t col_base   = sub_idx * kCubeKHalf;
+    const std::uint32_t fwd_steps  = geom.hidden / kCubeKSub;
+    const std::uint32_t down_steps = geom.inter / kCubeRSub2;
+
+    AivRingState ring;  // dead; see the banner above
+    AivResetRing(ring);
+
+    AivStepContext ctx{
+        geom, buf, ring, tokens_in_gm, tokens_out_gm,
+        l1a_buf, l1w_buf, l1a2_buf, l1w2_buf,
+        gate_weights_packed, gate_weight_scales,
+        up_weights_packed,   up_weight_scales,
+        down_weights_packed, down_weight_scales,
+        token_to_expert_lut,
+        sub_idx, sub_idx * kCubeMHalf,
+        /*token_row_start=*/0u, /*valid_rows=*/0u, /*store_rows=*/0u, /*expert_id=*/0u,
+        /*step_no=*/0u,
+    };
 
     DSV4_TRACE("V enter sub=%u tiles=%u h=%u i=%u\n", sub_idx, total_tiles, geom.hidden, geom.inter);
 
-    // THE RING STATE IS DEAD, AND IS KEPT ONLY TO SATISFY THE TWO PRODUCTION
-    // PREFETCH SIGNATURES.
-    //
-    // AivPrefetchFwdStep and AivPrefetchDownStep take an `AivRingState&` and
-    // CONSUME `stage_live[slot]` -- a deferred WaitFlag<V_MTE2> -- but never
-    // raise it; the raise lives in AivConvertAndPushFwdStep, which this
-    // lockstep transcription does not call. So one reset here leaves both
-    // arrays false for the whole run and the two helpers take no deferred
-    // fence, which is what "the ring overlap is removed" means mechanically.
-    // AivDrainRing is correspondingly NOT called anywhere below: there is
-    // nothing outstanding for it to drain, and waiting on an unraised token is
-    // the one thing in this file that would hang on its own.
-    AivRingState ring;
-    AivResetRing(ring);
-
     for (std::uint32_t tile_idx = core_idx; tile_idx < total_tiles; tile_idx += geom.block_dim) {
-        const std::uint32_t token_row_start = tile_idx * geom.token_tile;
-        const std::uint32_t remaining       = geom.total_tokens - token_row_start;
-        const std::uint32_t valid_rows      = remaining < geom.token_tile ? remaining : geom.token_tile;
-
-        std::uint32_t expert_id = 0;
-        if (!TileAdmitted(token_to_expert_lut, token_row_start, geom.num_experts, expert_id)) {
+        if (!AivAdmitTile(ctx, tile_idx)) {
             DSV4_TRACE("V tile=%u SKIP\n", tile_idx);
             continue;
         }
-        DSV4_TRACE("V tile=%u expert=%u rows=%u\n", tile_idx, expert_id, valid_rows);
-        const std::uint64_t expert_offset = static_cast<std::uint64_t>(expert_id);
+        DSV4_TRACE("V tile=%u expert=%u rows=%u\n", tile_idx, ctx.expert_id, ctx.valid_rows);
 
-        __gm__ std::uint8_t* gate_packed = Bytes(gate_weights_packed) + expert_offset * geom.gate_up_packed_stride;
-        __gm__ std::uint8_t* gate_scales = Bytes(gate_weight_scales)  + expert_offset * geom.gate_up_scale_stride;
-        __gm__ std::uint8_t* up_packed   = Bytes(up_weights_packed)   + expert_offset * geom.gate_up_packed_stride;
-        __gm__ std::uint8_t* up_scales   = Bytes(up_weight_scales)    + expert_offset * geom.gate_up_scale_stride;
-        __gm__ std::uint8_t* down_packed = Bytes(down_weights_packed) + expert_offset * geom.down_packed_stride;
-        __gm__ std::uint8_t* down_scales = Bytes(down_weight_scales)  + expert_offset * geom.down_scale_stride;
-
-        // --- PHASE 1 ---------------------------------------------------------------------------
-        const std::uint32_t fwd_steps = geom.hidden / kCubeKSub;
-
+        // --- PHASE 1: x @ W_gate and x @ W_up, then SwiGLU into the plane ----------------------
         for (std::uint32_t inter_base = 0; inter_base < geom.inter; inter_base += kCubeRSub) {
             DSV4_TRACE("V p1 blk ib=%u steps=%u\n", inter_base, fwd_steps);
-
-            // NO PROLOGUE PREFETCH. In the production schedule step 0's burst
-            // is issued before the loop so it can overlap step 0's wait; in
-            // lockstep every step prefetches its own tile inside stage 1, so
-            // the prologue would be a second burst into the same slot with no
-            // consumer -- and its MTE2_V token would be the extra set that
-            // raises `execute_set_flag already has same set_flag!`.
             for (std::uint32_t k = 0; k < fwd_steps; ++k) {
                 const std::uint32_t slot = k % kCubeRingSlots;
-
-                DSV4_TRACE("STEP AIV[%u] blk=%u k=%u START\n", sub_idx, inter_base, k);
-
-                // --- STAGE 1: prefetch this step's own tile, then convert it ---
-                AivPrefetchFwdStep(tokens_in_gm, token_row_start, gate_packed, gate_scales,
-                                   up_packed, up_scales, inter_base, k * kCubeKSub, valid_rows,
-                                   sub_idx, geom, buf, slot, ring);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s1 k=%u prefetched slot=%u\n", k, slot);
-
-                // The FIRST dequant consumes the MTE2_V token the prefetch's
-                // last burst raised; the second must not wait again, because
-                // one token covered both weight bursts. The PIPE_ALL barrier
-                // above has already ordered MTE2 against V, so this WaitFlag
-                // is redundant as a fence -- it is here to CONSUME the token,
-                // which is not optional: an unconsumed binary flag is the
-                // double-set on the next lap through this slot.
-                DequantSubTileVector(kCubeRSub, kCubeKHalf, buf.w[slot][0], kEvCubeSlotFull[slot]);
-                DequantSubTileVector(kCubeRSub, kCubeKHalf, buf.w[slot][1], -1);
-                Cast(buf.x_bf16[slot], buf.x_f32[slot], RoundMode::CAST_RINT,
-                     kCubeMTile * kCubeKHalf);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s1 k=%u dequant+cast done\n", k);
-
-                // --- STAGE 2: the three L1 pushes, then the rendezvous ---
-                // AivConvertAndPushFwdStep's push sequence, instruction for
-                // instruction, minus its deferred SetFlag<V_MTE2> and
-                // SetFlag<MTE3_V> and minus its immediate V_MTE3 pair, all
-                // three of which the barriers subsume.
-                PushUbTileToL1Nz(l1a_buf[slot].Get<bfloat16_t>(), buf.x_bf16[slot],
-                                 kCubeMTile, kCubeKHalf, kCubeKHalf, kCubeMTile, col_base, 0);
-                PushUbTileToL1Nz(l1w_buf[slot][0].Get<bfloat16_t>(),
-                                 buf.w[slot][0].weight_expanded,
-                                 kCubeRSub, kCubeKHalf, kCubeKHalf, kCubeRSub, col_base, 0);
-                PushUbTileToL1Nz(l1w_buf[slot][1].Get<bfloat16_t>(),
-                                 buf.w[slot][1].weight_expanded,
-                                 kCubeRSub, kCubeKHalf, kCubeKHalf, kCubeRSub, col_base, 0);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s2 k=%u pushed slot=%u\n", k, slot);
-
-                CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(
-                    static_cast<uint16_t>(kCubeFlagStepReady + slot));
-                DSV4_TRACE("V s2 k=%u SET StepReady slot=%u\n", k, slot);
-
-                // --- STAGE 4: the step barrier ---
-                // Unconditional, 1:1 against the AIC's unconditional release.
-                // The wait is scoped to PIPE_MTE3 (what StepFree protects is
-                // this AIV's push INTO the slot) and a scoped wait on 950PR
-                // blocks only that pipe, so the barrier after it is what makes
-                // the whole core park -- and makes the record below true.
-                DSV4_TRACE("V s4 k=%u WAIT StepFree slot=%u\n", k, slot);
-                CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStep>(
-                    static_cast<uint16_t>(kCubeFlagStepFree + slot));
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("STEP AIV[%u] blk=%u k=%u END\n", sub_idx, inter_base, k);
+                ++ctx.step_no;
+                DSV4_TRACE("[AIV%u] Step %u blk=%u. Tile[%u]: copy (x,Wg,Wu) GM->UB; "
+                           "Tile[%u]: dequant UB->UB\n",
+                           sub_idx, ctx.step_no, inter_base, k, k);
+                StepAiv_PrefetchAndDequant  (ctx, slot, inter_base, k);
+                StepAiv_PushL1AndSignalReady(ctx, slot, col_base, k);
+                StepAiv_WaitStepComplete    (ctx, slot, k);
             }
-
-            const std::uint32_t elems = kCubeMHalf * kCubeRSub;
-
-            // --- PHASE 1 EPILOGUE, fix1 (gate) then fix2 (up), in that order ---
-            DSV4_TRACE("V p1 e1 WAIT Product gate ib=%u\n", inter_base);
-            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("V p1 e1 GOT Product gate\n");
-            Mins(buf.gate_acc, buf.landing, geom.swiglu_limit, elems);
-            PipeBarrier<PIPE_ALL>();
-            CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
-            DSV4_TRACE("V p1 e1 SET LandingFree gate\n");
-
-            DSV4_TRACE("V p1 e2 WAIT Product up\n");
-            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivVector>(kCubeFlagProduct);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("V p1 e2 GOT Product up\n");
-            Maxs(buf.up_acc, buf.landing, -geom.swiglu_limit, elems);
-            PipeBarrier<PIPE_ALL>();
-            CrossCoreSetFlag<kCubeSyncMode, PIPE_V>(kCubeFlagLandingFree);
-            DSV4_TRACE("V p1 e2 SET LandingFree up\n");
-            Mins(buf.up_acc, buf.up_acc, geom.swiglu_limit, elems);
-            PipeBarrier<PIPE_ALL>();
-
-            AivApplySwiGLU(buf, inter_base, geom);
-            // The barrier the plane store needs before `inter_base` advances:
-            // AivApplySwiGLU ends in a strided UB -> UB burst into the
-            // resident activation plane, and phase 2 reads that plane.
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("V p1 swiglu done ib=%u\n", inter_base);
-
-            // --- THE BLOCK RENDEZVOUS ---
-            // A THIRD LandingFree, raised only once SwiGLU has completely
-            // finished, against a third AIC wait. This is what stops the Cube
-            // advancing to the next inter block -- or into phase 2 -- while an
-            // AIV is still in this one. LandingFree is reused rather than a
-            // new flag id because ids 9..15 have never been exercised green by
-            // any probe (see the allocation note in the arch35 header) and
-            // because the AIC is already parked in its second LandingFree wait
-            // long before this set can be issued: it enters that wait
-            // immediately after releasing Product, which is the token this AIV
-            // needed before it could even run Maxs.
-            CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(kCubeFlagLandingFree);
-            DSV4_TRACE("V p1 SET BlockDone ib=%u\n", inter_base);
+            StepAiv_EpilogueGate   (ctx, inter_base);
+            StepAiv_EpilogueUp     (ctx, inter_base);
+            StepAiv_BlockRendezvous(ctx, inter_base);
         }
 
-        // --- PHASE 2 ---------------------------------------------------------------------------
-        const std::uint32_t down_steps = geom.inter / kCubeRSub2;
-        const std::uint32_t owned      = valid_rows > row_base ? (valid_rows - row_base) : 0u;
-        const std::uint32_t store_rows = owned < kCubeMHalf ? owned : kCubeMHalf;
-
-        DSV4_TRACE("V p2 enter steps=%u store_rows=%u\n", down_steps, store_rows);
-
+        // --- PHASE 2: act @ W_down, out to GM -------------------------------------------------
+        DSV4_TRACE("V p2 enter steps=%u store_rows=%u\n", down_steps, ctx.store_rows);
         for (std::uint32_t hidden_base = 0; hidden_base < geom.hidden; hidden_base += kCubeHSub) {
             DSV4_TRACE("V p2 blk hb=%u\n", hidden_base);
-
             for (std::uint32_t r = 0; r < down_steps; ++r) {
                 const std::uint32_t slot = r % kCubeRingSlots;
-
-                DSV4_TRACE("STEP AIV[%u] blk=%u k=%u START\n", sub_idx, hidden_base, r);
-
-                // --- STAGE 1 ---
-                AivPrefetchDownStep(down_packed, down_scales, hidden_base, r * kCubeRSub2,
-                                    sub_idx, geom, buf, slot, ring);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s1 r=%u prefetched slot=%u\n", r, slot);
-
-                DequantSubTileVector(kCubeHSub, kCubeRHalf2, buf.w[slot][0], kEvCubeSlotFull[slot]);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s1 r=%u dequant done\n", r);
-
-                // --- STAGE 2 ---
-                // AivConvertAndPushDownStep's two pushes, same order, same
-                // split: the weight half is a CONTRACTION half (a C0-block
-                // range, row_base 0), the token half is a TOKEN-ROW half (a
-                // row range of every block, col_base 0).
-                PushUbTileToL1Nz(l1w2_buf[slot].Get<bfloat16_t>(),
-                                 buf.w[slot][0].weight_expanded,
-                                 kCubeHSub, kCubeRHalf2, kCubeRHalf2,
-                                 kCubeHSub, sub_idx * kCubeRHalf2, 0);
-                PushUbTileToL1Nz(l1a2_buf[slot].Get<bfloat16_t>(), buf.act[r * kCubeRSub2],
-                                 kCubeMHalf, kCubeRSub2, geom.inter,
-                                 kCubeMTile, 0, sub_idx * kCubeMHalf);
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("V s2 r=%u pushed slot=%u\n", r, slot);
-
-                CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(
-                    static_cast<uint16_t>(kCubeFlagStepReady + slot));
-                DSV4_TRACE("V s2 r=%u SET StepReady slot=%u\n", r, slot);
-
-                // --- STAGE 4 ---
-                DSV4_TRACE("V s4 r=%u WAIT StepFree slot=%u\n", r, slot);
-                CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStep>(
-                    static_cast<uint16_t>(kCubeFlagStepFree + slot));
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("STEP AIV[%u] blk=%u k=%u END\n", sub_idx, hidden_base, r);
+                ++ctx.step_no;
+                DSV4_TRACE("[AIV%u] Step %u blk=%u. Tile[%u]: copy (Wd) GM->UB; "
+                           "Tile[%u]: dequant UB->UB\n",
+                           sub_idx, ctx.step_no, hidden_base, r, r);
+                StepAiv_PrefetchDown          (ctx, slot, hidden_base, r);
+                StepAiv_PushDownAndSignalReady(ctx, slot, r);
+                StepAiv_WaitStepComplete      (ctx, slot, r);
             }
-
-            DSV4_TRACE("V p2 WAIT Product hb=%u\n", hidden_base);
-            CrossCoreWaitFlag<kCubeIntraSyncMode, kCubeWaitAivStore>(kCubeFlagProduct);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("V p2 GOT Product\n");
-
-            if (store_rows > 0u) {
-                DataCopyParams out_burst;
-                out_burst.blockCount = static_cast<std::uint16_t>(store_rows);
-                out_burst.blockLen   = static_cast<std::uint16_t>((kCubeHSub * 4u) / 32u);
-                out_burst.srcStride  = 0;
-                out_burst.dstStride  = static_cast<std::uint16_t>(((geom.hidden - kCubeHSub) * 4u) / 32u);
-                DataCopy(tokens_out_gm[(static_cast<std::uint64_t>(token_row_start + row_base) *
-                                        geom.hidden) + hidden_base],
-                         buf.landing, out_burst);
-            }
-            // PHASE 2 NEEDS NO SEPARATE RENDEZVOUS FLAG. The GM store is the
-            // AIV's last act in the block, so draining it before the single
-            // LandingFree set makes that flag itself the block rendezvous --
-            // the AIC's fix3 wait cannot clear until both AIVs have finished
-            // storing, and it is the last thing the AIC does in the block.
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("V p2 stored hb=%u rows=%u\n", hidden_base, store_rows);
-
-            CrossCoreSetFlag<kCubeSyncMode, PIPE_MTE3>(kCubeFlagLandingFree);
-            DSV4_TRACE("V p2 SET BlockDone hb=%u\n", hidden_base);
+            StepAiv_StoreGMAndBlockDone(ctx, hidden_base);
         }
         DSV4_TRACE("V tile=%u DONE\n", tile_idx);
     }
@@ -447,33 +787,27 @@ __aicore__ inline void TraceRunVectorCore(
 }
 
 // =================================================================================================
-// THE CUBE CORE, transcribed as a strict synchronous lockstep pipeline
+// THE CUBE CORE: the root pipeline
 // =================================================================================================
-// CubeMoveOutAndHandOver is INLINED below rather than called, so the trace can
-// print between the Fixpipe, the Product release and the LandingFree wait.
-__aicore__ inline void TraceCubeMoveOutAndHandOver(
-    __cc__ float* l0c_mem, std::uint32_t m_extent, std::uint32_t n_extent, std::uint32_t tag) {
-    auto l0C = Te::MakeTensor(
-        Te::MakeMemPtr(l0c_mem),
-        Te::MakeFrameLayout<Te::NZLayoutPtn, 16>(m_extent, n_extent));
-    auto ub = Te::MakeTensor(
-        Te::MakeMemPtr(reinterpret_cast<__ubuf__ float*>(kCubeLandingUbOffset)),
-        Te::MakeFrameLayout<Te::NDExtLayoutPtn>(m_extent, n_extent));
-    Te::FixpipeParams fixParams;
-    DSV4_TRACE("C fix%u begin n=%u\n", tag, n_extent);
-    Te::Copy(Te::MakeCopy(Te::CopyL0C2UB{}, CubeL0c2UbTraitDualDstM{}).with(fixParams),
-             ub, l0C);
-    PipeBarrier<PIPE_FIX>();
-    PipeBarrier<PIPE_ALL>();
-    DSV4_TRACE("C fix%u drained\n", tag);
-    CubeReleaseToAllAivs<PIPE_FIX>(kCubeFlagProduct);
-    DSV4_TRACE("C fix%u SET Product x%u\n", tag, (unsigned)kCubeAivPerAic);
-    DSV4_TRACE("C fix%u WAIT LandingFree\n", tag);
-    CrossCoreWaitFlag<kCubeSyncMode, PIPE_FIX>(kCubeFlagLandingFree);
-    PipeBarrier<PIPE_ALL>();
-    DSV4_TRACE("C fix%u GOT LandingFree\n", tag);
-}
-
+// Read this against TraceRunVectorCore line by line. Phase 1 step k is
+// Prefetch / Push / Wait there and Wait / Mmad / Release here, and the two
+// epilogues pair off the same way: three AIV LandingFree sets against the two
+// Fixpipe handovers plus the block rendezvous.
+//
+// THE AIC BRACKETS THE STEP, which is why [STEP n Begin] and [STEP n Completed]
+// are printed here and on no other core: the AIC is the one core there is
+// exactly one of per group, and the one that ENDS the step -- the AIVs leave
+// step k only when its StepFree release reaches them. The next iteration's
+// Begin is the (n+1) line.
+//
+// THE TWO PHASE 1 HANDOVERS ARE ORDERED, fix1 (gate) then fix2 (up), each
+// closed by its own full drain, so the order the two Products reach the AIVs is
+// fixed rather than whatever the Fixpipe queue happens to retire first. The
+// AIVs consume them in exactly that order -- Mins on gate, then Maxs on up --
+// and getting them the other way round is a wrong answer, not a hang. Phase 2's
+// single handover needs no such ordering, and its LandingFree wait IS the block
+// rendezvous: the AIVs raise it only once their GM store has drained, so the
+// Cube leaves the block no earlier than they do.
 __aicore__ inline void TraceRunCubeCore(
     const Geometry& geom,
     GM_ADDR token_to_expert_lut,
@@ -483,6 +817,8 @@ __aicore__ inline void TraceRunCubeCore(
     TBuf<TPosition::B1> (&l1w2_buf)[kCubeRingSlots]) {
     const std::uint32_t total_tiles = (geom.total_tokens + geom.token_tile - 1u) / geom.token_tile;
     const std::uint32_t core_idx    = static_cast<std::uint32_t>(GetBlockIdx());
+    const std::uint32_t fwd_steps   = geom.hidden / kCubeKSub;
+    const std::uint32_t down_steps  = geom.inter / kCubeRSub2;
 
     __ca__ bfloat16_t l0a[kCubeL0AElems];
     __cb__ bfloat16_t l0b_gate[kCubeL0BElems];
@@ -490,146 +826,61 @@ __aicore__ inline void TraceRunCubeCore(
     __cc__ float      l0c_gate[kCubeL0CElems];
     __cc__ float      l0c_up[kCubeL0CElems];
 
+    CubeStepContext ctx{
+        geom,
+        l1a_buf, l1w_buf, l1a2_buf, l1w2_buf,
+        l0a, l0b_gate, l0b_up, l0c_gate, l0c_up,
+        token_to_expert_lut,
+        /*expert_id=*/0u, /*step_no=*/0u,
+    };
+
     DSV4_TRACE("C enter tiles=%u h=%u i=%u\n", total_tiles, geom.hidden, geom.inter);
 
     for (std::uint32_t tile_idx = core_idx; tile_idx < total_tiles; tile_idx += geom.block_dim) {
-        const std::uint32_t token_row_start = tile_idx * geom.token_tile;
-
-        std::uint32_t expert_id = 0;
-        if (!TileAdmitted(token_to_expert_lut, token_row_start, geom.num_experts, expert_id)) {
+        if (!CubeAdmitTile(ctx, tile_idx)) {
             DSV4_TRACE("C tile=%u SKIP\n", tile_idx);
             continue;
         }
-        DSV4_TRACE("C tile=%u expert=%u\n", tile_idx, expert_id);
+        DSV4_TRACE("C tile=%u expert=%u\n", tile_idx, ctx.expert_id);
 
-        // --- PHASE 1 ---------------------------------------------------------------------------
-        const std::uint32_t fwd_steps = geom.hidden / kCubeKSub;
-
+        // --- PHASE 1 --------------------------------------------------------------------------
         for (std::uint32_t inter_base = 0; inter_base < geom.inter; inter_base += kCubeRSub) {
             DSV4_TRACE("C p1 blk ib=%u steps=%u\n", inter_base, fwd_steps);
             for (std::uint32_t k = 0; k < fwd_steps; ++k) {
                 const std::uint32_t slot = k % kCubeRingSlots;
-
-                DSV4_TRACE("STEP AIC blk=%u k=%u START\n", inter_base, k);
-
-                // --- STAGE 3: wait for BOTH AIVs' pushes, then compute ---
-                DSV4_TRACE("C s3 k=%u WAIT StepReady slot=%u\n", k, slot);
-                CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAicStep>(
-                    static_cast<uint16_t>(kCubeFlagStepReady + slot));
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("C s3 k=%u GOT StepReady\n", k);
-
-                CubeLoadTokensToL0A(l0a, l1a_buf[slot].Get<bfloat16_t>(), kCubeMTile, kCubeKSub);
-                CubeLoadWeightsToL0B(l0b_gate, l1w_buf[slot][0].Get<bfloat16_t>(),
-                                     kCubeKSub, kCubeRSub);
-                CubeLoadWeightsToL0B(l0b_up, l1w_buf[slot][1].Get<bfloat16_t>(),
-                                     kCubeKSub, kCubeRSub);
-                DSV4_TRACE("C s3 k=%u loaded L0A/L0B\n", k);
-
-                SetFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
-                WaitFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
-
-                CubeMmadAccumulate(l0c_gate, l0a, l0b_gate,
-                                   kCubeMTile, kCubeRSub, kCubeKSub, k == 0u);
-                CubeMmadAccumulate(l0c_up, l0a, l0b_up,
-                                   kCubeMTile, kCubeRSub, kCubeKSub, k == 0u);
-                DSV4_TRACE("C s3 k=%u mmad init=%u\n", k, (unsigned)(k == 0u));
-
-                // The K-axis accumulation interlock is a documented hardware
-                // contract below (m/16)*(n/16) < 10 and is NOT subsumed by the
-                // PIPE_ALL barrier that follows it: it must sit between the two
-                // Mmads' L0C write and the next step's read. Kept verbatim.
-                CubeCloseAccumulationStep();
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("C s3 k=%u closed\n", k);
-
-                // --- STAGE 3 TAIL: release both AIVs immediately, EVERY step ---
-                // Production gates this on `k + kCubeRingSlots < fwd_steps`,
-                // which hands the token for step k to step k + 2. Here it is
-                // unconditional and matches the AIVs' unconditional stage 4
-                // wait one for one, so neither side can be a lap ahead.
-                CubeReleaseToAllAivs<PIPE_MTE1>(
-                    static_cast<uint16_t>(kCubeFlagStepFree + slot));
-                DSV4_TRACE("C s3 k=%u SET StepFree slot=%u\n", k, slot);
-                DSV4_TRACE("STEP AIC blk=%u k=%u END\n", inter_base, k);
+                ++ctx.step_no;
+                DSV4_TRACE("[STEP%u Begin]\n", ctx.step_no);
+                DSV4_TRACE("[AIC0] Step %u blk=%u. Tile[%u]: gemm (x*Wg, x*Wu)\n",
+                           ctx.step_no, inter_base, k);
+                StepCube_WaitAivReady  (ctx, slot, k);
+                StepCube_MmadAccumulate(ctx, slot, k, k == 0u);
+                StepCube_ReleaseAiv    (ctx, slot, k);
+                DSV4_TRACE("[STEP%u Completed]\n", ctx.step_no);
             }
-
-            SetFlag<HardEvent::M_FIX>(kEvCubeMToFix);
-            WaitFlag<HardEvent::M_FIX>(kEvCubeMToFix);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("C p1 M_FIX done ib=%u\n", inter_base);
-
-            // fix1 (gate) then fix2 (up), separated by a full drain so the
-            // order the two Products reach the AIVs is fixed rather than
-            // whatever the Fixpipe queue happens to retire first. The AIVs
-            // consume them in exactly this order (Mins on gate, then Maxs on
-            // up), and getting them the other way round is a wrong answer, not
-            // a hang.
-            TraceCubeMoveOutAndHandOver(l0c_gate, kCubeMTile, kCubeRSub, 1u);
-            PipeBarrier<PIPE_ALL>();
-            TraceCubeMoveOutAndHandOver(l0c_up, kCubeMTile, kCubeRSub, 2u);
-            PipeBarrier<PIPE_ALL>();
-
-            // --- THE BLOCK RENDEZVOUS ---
-            // The AIVs' third LandingFree, raised only after SwiGLU and its
-            // plane store have completely finished. Until it arrives the Cube
-            // does not advance `inter_base` and does not enter phase 2, so the
-            // activation plane phase 2 reads is complete on both AIVs.
-            DSV4_TRACE("C p1 WAIT BlockDone ib=%u\n", inter_base);
-            CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAicStep>(kCubeFlagLandingFree);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("C p1 GOT BlockDone ib=%u\n", inter_base);
+            StepCube_DrainToFixpipe(ctx, inter_base);
+            StepCube_FixpipeHandover(ctx, l0c_gate, kCubeMTile, kCubeRSub, 1u);
+            StepCube_FixpipeHandover(ctx, l0c_up,   kCubeMTile, kCubeRSub, 2u);
+            StepCube_WaitBlockDone  (ctx, inter_base);
             DSV4_TRACE("C p1 blk ib=%u DONE\n", inter_base);
         }
 
-        // --- PHASE 2 ---------------------------------------------------------------------------
-        const std::uint32_t down_steps = geom.inter / kCubeRSub2;
+        // --- PHASE 2 --------------------------------------------------------------------------
         DSV4_TRACE("C p2 enter steps=%u\n", down_steps);
-
         for (std::uint32_t hidden_base = 0; hidden_base < geom.hidden; hidden_base += kCubeHSub) {
             DSV4_TRACE("C p2 blk hb=%u\n", hidden_base);
             for (std::uint32_t r = 0; r < down_steps; ++r) {
                 const std::uint32_t slot = r % kCubeRingSlots;
-
-                DSV4_TRACE("STEP AIC blk=%u k=%u START\n", hidden_base, r);
-
-                DSV4_TRACE("C s3 r=%u WAIT StepReady slot=%u\n", r, slot);
-                CrossCoreWaitFlag<kCubeSyncMode, kCubeWaitAicStep>(
-                    static_cast<uint16_t>(kCubeFlagStepReady + slot));
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("C s3 r=%u GOT StepReady\n", r);
-
-                CubeLoadTokensToL0A(l0a, l1a2_buf[slot].Get<bfloat16_t>(),
-                                    kCubeMTile, kCubeRSub2);
-                CubeLoadWeightsToL0B(l0b_gate, l1w2_buf[slot].Get<bfloat16_t>(),
-                                     kCubeRSub2, kCubeHSub);
-                DSV4_TRACE("C s3 r=%u loaded L0A/L0B\n", r);
-
-                SetFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
-                WaitFlag<HardEvent::MTE1_M>(kEvCubeMte1ToM);
-
-                CubeMmadAccumulate(l0c_gate, l0a, l0b_gate,
-                                   kCubeMTile, kCubeHSub, kCubeRSub2, r == 0u);
-                CubeCloseAccumulationStep();
-                PipeBarrier<PIPE_ALL>();
-                DSV4_TRACE("C s3 r=%u closed\n", r);
-
-                CubeReleaseToAllAivs<PIPE_MTE1>(
-                    static_cast<uint16_t>(kCubeFlagStepFree + slot));
-                DSV4_TRACE("C s3 r=%u SET StepFree slot=%u\n", r, slot);
-                DSV4_TRACE("STEP AIC blk=%u k=%u END\n", hidden_base, r);
+                ++ctx.step_no;
+                DSV4_TRACE("[STEP%u Begin]\n", ctx.step_no);
+                DSV4_TRACE("[AIC0] Step %u blk=%u. Tile[%u]: gemm (act*Wd)\n",
+                           ctx.step_no, hidden_base, r);
+                StepCube_WaitAivReady(ctx, slot, r);
+                StepCube_MmadDown    (ctx, slot, r, r == 0u);
+                StepCube_ReleaseAiv  (ctx, slot, r);
+                DSV4_TRACE("[STEP%u Completed]\n", ctx.step_no);
             }
-
-            SetFlag<HardEvent::M_FIX>(kEvCubeMToFix);
-            WaitFlag<HardEvent::M_FIX>(kEvCubeMToFix);
-            PipeBarrier<PIPE_ALL>();
-            DSV4_TRACE("C p2 M_FIX done hb=%u\n", hidden_base);
-
-            // fix3's LandingFree wait IS this block's rendezvous: the AIVs
-            // raise it only once their GM store has drained, so the Cube
-            // leaves the block no earlier than they do.
-            TraceCubeMoveOutAndHandOver(l0c_gate, kCubeMTile, kCubeHSub, 3u);
-            PipeBarrier<PIPE_ALL>();
+            StepCube_DrainToFixpipe(ctx, hidden_base);
+            StepCube_FixpipeHandover(ctx, l0c_gate, kCubeMTile, kCubeHSub, 3u);
             DSV4_TRACE("C p2 blk hb=%u DONE\n", hidden_base);
         }
         DSV4_TRACE("C tile=%u DONE\n", tile_idx);
