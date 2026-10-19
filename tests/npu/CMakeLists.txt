@@ -261,19 +261,37 @@ if(COMMAND ascendc_library)
   # -------------------------------------------------------------------------
   # Release-mode device printf
   # -------------------------------------------------------------------------
-  # __asc_aicore::printf compiles away when ASCENDC_DUMP is defined to 0, and a
-  # Release configuration also carries -DNDEBUG. Both are neutralised here so
-  # the trace survives -DCMAKE_BUILD_TYPE=Release: the kernel's
-  # DSV4_PIPELINE_TRACE macro is keyed on ENABLE_KERNEL_PRINTF alone.
+  # Four things have to line up, and two of them are defeated by a Release
+  # configuration on their own:
+  #
+  #   --cce-enable-print   BiSheng emits the print machinery only when asked.
+  #                        The flag is spelled --cce-enable-print, NOT
+  #                        --cce-enable-printf; it appears under
+  #                        `bisheng --help-hidden` as "Enable CCE print", and
+  #                        it is load-bearing rather than cosmetic -- MEASURED
+  #                        on dav-3510, the pipeline kernel object grows
+  #                        292,128 B -> 312,792 B when it is added.
+  #   ASCENDC_DUMP=1       impl/utils/debug/asc_aicore_printf_impl.h compiles
+  #                        the whole body away under `ASCENDC_DUMP == 0`.
+  #   -UNDEBUG             a Release build adds -DNDEBUG; cancelled here so
+  #                        nothing downstream can key on it.
+  #   ENABLE_KERNEL_PRINTF the kernel's own DSV4_PIPELINE_TRACE macro.
+  #
+  # NOTHING IS NEEDED ON THE HOST SIDE. Earlier CANN releases wanted the
+  # runtime's debug channel opened explicitly (aclrtDbgInit / aclrtDbgFinalize)
+  # before the records would be collected; 9.2.0 does not, and the symbol is
+  # declared in no header under x86_64-linux/include/acl/ and exported by no
+  # shared object under /usr/local/Ascend. So the gtest driver stays free of it
+  # and these four flags are the whole of the contract.
   if(ENABLE_KERNEL_PRINTF)
     target_compile_definitions(${_pipeline_device} PRIVATE
       ENABLE_KERNEL_PRINTF=1
       ASCENDC_DUMP=1
     )
-    target_compile_options(${_pipeline_device} PRIVATE -UNDEBUG)
+    target_compile_options(${_pipeline_device} PRIVATE --cce-enable-print -UNDEBUG)
     message(STATUS
       "test_npu_dsv4_moe_prefill_cube_standalone: device printf ENABLED "
-      "(ASCENDC_DUMP=1, -UNDEBUG)")
+      "(--cce-enable-print, ASCENDC_DUMP=1, -UNDEBUG)")
   endif()
 
   add_executable(${_standalone_target} npu_dsv4_moe_prefill_cube_standalone.cpp)
