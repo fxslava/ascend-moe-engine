@@ -965,6 +965,7 @@ if(ENABLE_DSV4_CAMODEL_TEST)
               "-I${ASCEND_HOME_PATH}/x86_64-linux/asc/include"
               -c "${_source}" -o "${_object}"
       DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_common.h"
               "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
               "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
               "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_legacy_matmul.h"
