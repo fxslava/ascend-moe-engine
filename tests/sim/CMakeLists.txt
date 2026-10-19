@@ -663,6 +663,487 @@ if(ENABLE_DSV4_CAMODEL_TEST)
   endforeach()
 
   # ---------------------------------------------------------------------
+  # SPARSE BOUNDARY GATE: the PRODUCTION entry point, nothing sim-only
+  # ---------------------------------------------------------------------
+  # THE ONLY TARGET IN THIS FILE WHOSE DEVICE SIDE IS ENTIRELY PRODUCTION
+  # SOURCE. The two gates above link kernel/dsv4_moe_prefill_cube_inductive_*,
+  # whose entry point runs the QUARANTINED Matmul-framework path; the STEP 1
+  # and STEP 2 probes link hand-written reproductions of one primitive each.
+  # This one links:
+  #
+  #   op_kernel/dsv4_moe_prefill_cube_kernel.cpp   the shipping kernel TU,
+  #       which defines the `dsv4_moe_prefill_cube` __global__ entry
+  #   op_host/dsv4_moe_prefill_cube.cpp            the shipping host wrapper,
+  #       verbatim -- same tiling builder, same QueryAivCoreCount(), same
+  #       chevron. No `aiv_count` parameter is threaded in, because at
+  #       total_tokens == M_TILE the grid is min(1, aiv) == 1 whatever the
+  #       simulated part reports, so there is nothing to pin.
+  #
+  # so a pass is a statement about the operator and not about a copy of it.
+  #
+  # It cannot share the inductive gate's objects: that TU textually includes
+  # the production kernel, so it ALSO defines `dsv4_moe_prefill_cube`, and two
+  # such objects cannot be linked into one binary. It does share the tiling TU
+  # and launch_common, which are the same production objects either way.
+  #
+  # DSV4_TILING_TEST_OVERRIDE=1 is passed to the device objects AND to the host
+  # driver below, for the reason the single-tile gate records: without it on
+  # both sides the host and the kernel disagree about which geometries
+  # MOE_DSV4_PREFILL_CUBE_ADMISSIBLE accepts, and the collapsed shape is
+  # rejected on one side only.
+  set(_dsv4_prefill_cube_prod_sources
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube.cpp"
+  )
+  set(_dsv4_prefill_cube_prod_objects)
+  foreach(_source IN LISTS _dsv4_prefill_cube_prod_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_prod/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_prod"
+      # ASCEND_HOME_PATH IS PASSED EXPLICITLY and is not redundant -- BiSheng's
+      # ASC plugin loader reads it from the ENVIRONMENT and aborts with
+      # "PlugIn Err: can not find ASCEND_HOME_PATH" if it is unset, and a CMake
+      # custom command does not inherit the shell that configured the build.
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_legacy_matmul.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_cube_tiling.h"
+      VERBATIM
+      COMMENT "Compiling PRODUCTION ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_prefill_cube_prod_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_prefill_cube_prod_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_prefill_cube_prod_kernel_objects
+                    DEPENDS ${_dsv4_prefill_cube_prod_objects})
+
+  # The tiling builder and launch_common, taken from the list the inductive
+  # gate already compiles rather than built a second time. Indices 2 and 3 of
+  # _dsv4_prefill_cube_sim_objects; both are production TUs.
+  list(GET _dsv4_prefill_cube_sim_objects 2 _dsv4_prod_tiling_object)
+  list(GET _dsv4_prefill_cube_sim_objects 3 _dsv4_prod_launch_common_object)
+
+  add_executable(test_dsv4_moe_prefill_cube_sim
+    test_dsv4_moe_prefill_cube_sim.cpp
+    ${_dsv4_prefill_cube_prod_objects}
+    "${_dsv4_prod_tiling_object}"
+    "${_dsv4_prod_launch_common_object}"
+  )
+  add_dependencies(test_dsv4_moe_prefill_cube_sim
+                   dsv4_moe_prefill_cube_prod_kernel_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_sim PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_prefill_cube_sim PRIVATE -Werror)
+  endif()
+  target_compile_definitions(test_dsv4_moe_prefill_cube_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_moe_prefill_cube_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_prefill_cube_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  # -rpath-link ONLY, never -rpath: §4.4, same reasoning as the gates above --
+  # the libascend_hal.so stub must be invisible at RUN time so it can never
+  # stand in for the CAModel's own copy.
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # TIMEOUT IS A HOLDING VALUE, NOT A MEASUREMENT. No run of this entry point
+  # existed when the gate was registered, so there is no per-step cost of its
+  # own to extrapolate from; the nearest figures are the STEP 2 probe's 337.6 s
+  # for one 4-step contraction of the same schedule and the STEP 1 probe's
+  # 14.5-16.0 s for a single Fixpipe step. 10800 s is chosen to be clearly
+  # longer than the driver's own 7200 s watchdog, so a budget overrun is
+  # reported BY THE DRIVER -- with its name and its trip point -- rather than
+  # as an opaque ctest expiry. Replace both with measurements once this shape
+  # has run; the driver takes `hidden inter budget` on argv so the same binary
+  # can measure a cheaper shape first.
+  add_test(NAME Dsv4MoePrefillCubeSim
+           COMMAND test_dsv4_moe_prefill_cube_sim)
+  set_tests_properties(Dsv4MoePrefillCubeSim PROPERTIES
+    LABELS "sim;arch35;camodel;boundary;functional;cube;mix;production"
+    TIMEOUT 10800
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # ---------------------------------------------------------------------
+  # BISECTION PROBE: the same schedule with the AIV V_MTE2 priming removed
+  # ---------------------------------------------------------------------
+  # Answers one question about the gate above, which does not retire: are the
+  # four `pem_ccu.cc:2277 execute_set_flag already has same set_flag!` reports
+  # coming from the entry point's per-slot priming pair? Its kernel differs
+  # from production in exactly one place -- the priming SetFlag/WaitFlag is
+  # replaced by a PipeBarrier<PIPE_ALL> -- and its launch wrapper is a
+  # byte-for-byte near-copy of the production one, so any difference in the two
+  # runs is attributable to that delta and nothing else.
+  #
+  # It reuses the SAME host driver source as the gate, compiled with
+  # DSV4_BOUNDARY_NOPRIME_SIM, so the golden, tolerances, canary bands and
+  # censuses are identical and only the launch symbol moves. Two executables
+  # are unavoidable: the probe's TU textually includes the production kernel
+  # and therefore also defines `dsv4_moe_prefill_cube`.
+  set(_dsv4_prefill_cube_noprime_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_noprime_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_noprime_launch.cpp"
+  )
+  set(_dsv4_prefill_cube_noprime_objects)
+  foreach(_source IN LISTS _dsv4_prefill_cube_noprime_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_noprime/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_noprime"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_legacy_matmul.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_cube_tiling.h"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_prefill_cube_noprime_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_prefill_cube_noprime_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_prefill_cube_noprime_objects
+                    DEPENDS ${_dsv4_prefill_cube_noprime_objects})
+
+  add_executable(test_dsv4_moe_prefill_cube_noprime_sim
+    test_dsv4_moe_prefill_cube_sim.cpp
+    ${_dsv4_prefill_cube_noprime_objects}
+    "${_dsv4_prod_tiling_object}"
+    "${_dsv4_prod_launch_common_object}"
+  )
+  add_dependencies(test_dsv4_moe_prefill_cube_noprime_sim
+                   dsv4_moe_prefill_cube_noprime_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE
+                         -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE -Werror)
+  endif()
+  target_compile_definitions(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+    DSV4_BOUNDARY_NOPRIME_SIM=1
+  )
+  target_link_libraries(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_prefill_cube_noprime_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  # -rpath-link ONLY, never -rpath: §4.4.
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_noprime_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # REGISTERED AS A PROBE, NOT A GATE. It does not test the shipping kernel --
+  # its whole purpose is to differ from it -- so a pass here licenses nothing
+  # about the operator. It is registered only so the bisection is reproducible
+  # by name. Driven at the cheap 4-step shape (hidden 128, inter 256), which is
+  # where the four double-sets were measured.
+  add_test(NAME Dsv4MoePrefillCubeNoPrimeProbe
+           COMMAND test_dsv4_moe_prefill_cube_noprime_sim 128 256 5400)
+  set_tests_properties(Dsv4MoePrefillCubeNoPrimeProbe PROPERTIES
+    LABELS "sim;arch35;camodel;bisection;probe;cube;mix"
+    TIMEOUT 7200
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # ---------------------------------------------------------------------
+  # PROGRESS TRACE PROBE: the same schedule, printing where each core is
+  # ---------------------------------------------------------------------
+  # The non-retirement has survived three rounds of inference from four log
+  # lines, and PC attribution is impossible here (the device code is a nested
+  # elf64-hiipu ELF that the toolkit's llvm-objdump cannot disassemble). This
+  # probe interleaves __asc_aicore::printf at every stage boundary in
+  # transcribed copies of RunVectorCore and RunCubeCore, so the stall is
+  # NAMED -- "the AIV posted StepReady and the AIC never returned from its
+  # StepReady wait" -- instead of guessed.
+  #
+  # It keeps the production priming pair: the only delta against the shipping
+  # schedule is what it PRINTS. The two probe deltas are deliberately not
+  # combined, so neither can explain the other's result.
+  #
+  # The device objects need the ASC include root on the path for
+  # utils/debug/asc_printf.h, which the other probes do not use.
+  set(_dsv4_prefill_cube_trace_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_trace_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_moe_prefill_cube_trace_launch.cpp"
+  )
+  set(_dsv4_prefill_cube_trace_objects)
+  foreach(_source IN LISTS _dsv4_prefill_cube_trace_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_trace/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_prefill_cube_trace"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              "-I${ASCEND_HOME_PATH}/x86_64-linux/asc/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_kernel.cpp"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_legacy_matmul.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.h"
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_cube_tiling.h"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_prefill_cube_trace_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_prefill_cube_trace_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_moe_prefill_cube_trace_objects
+                    DEPENDS ${_dsv4_prefill_cube_trace_objects})
+
+  add_executable(test_dsv4_moe_prefill_cube_trace_sim
+    test_dsv4_moe_prefill_cube_sim.cpp
+    ${_dsv4_prefill_cube_trace_objects}
+    "${_dsv4_prod_tiling_object}"
+    "${_dsv4_prod_launch_common_object}"
+  )
+  add_dependencies(test_dsv4_moe_prefill_cube_trace_sim
+                   dsv4_moe_prefill_cube_trace_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_moe_prefill_cube_trace_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_moe_prefill_cube_trace_sim PRIVATE
+                         -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_moe_prefill_cube_trace_sim PRIVATE -Werror)
+  endif()
+  target_compile_definitions(test_dsv4_moe_prefill_cube_trace_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+    DSV4_BOUNDARY_TRACE_SIM=1
+  )
+  target_link_libraries(test_dsv4_moe_prefill_cube_trace_sim PRIVATE
+    dsv4_prefill_cube_cube_tiling
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_moe_prefill_cube_trace_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_moe_prefill_cube_trace_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  # A DIAGNOSTIC, NOT A GATE, and not even a correctness probe: the trace
+  # perturbs timing (a GM write plus a dcci between pipeline stages), so a
+  # retirement here would NOT license the schedule -- it would say the stall is
+  # timing-sensitive, which is itself the finding. Registered for
+  # reproducibility only.
+  add_test(NAME Dsv4MoePrefillCubeTraceProbe
+           COMMAND test_dsv4_moe_prefill_cube_trace_sim 128 256 5400)
+  set_tests_properties(Dsv4MoePrefillCubeTraceProbe PROPERTIES
+    LABELS "sim;arch35;camodel;bisection;probe;trace;cube;mix"
+    TIMEOUT 7200
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # ---------------------------------------------------------------------
+  # CROSS-CORE WAIT PROBE: does a mode-2 wait block with no matching set?
+  # ---------------------------------------------------------------------
+  # The smallest kernel in this directory, and the only one that asks a
+  # question about a PRIMITIVE rather than about the operator. The
+  # cycle-stamped trace measured the Cube's first mode-2 wait on
+  # kCubeFlagStepReady clearing ~9,000 cycles before either AIV had entered the
+  # phase 1 block, with zero matching sets. This probe issues four consecutive
+  # such waits with nothing setting the flag and counts how many clear: one
+  # means residual state, four means the wait does not block, zero means it
+  # blocks correctly and the trace needs another explanation.
+  #
+  # It uses the OPERATOR'S OWN id and mode (kCubeFlagStepReady, kCubeSyncMode,
+  # scoped PIPE_MTE1) rather than a spare id, because if the behaviour is
+  # per-id residue only the id the operator waits on can show it.
+  #
+  # A HANG IS A VALID RESULT, so the driver has no pass criterion and the
+  # reading comes from the trace. The timeout is small because the kernel does
+  # nothing but wait: all its cost is simulator bring-up.
+  set(_dsv4_xcore_probe_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_crosscore_wait_probe_kernel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dsv4_crosscore_wait_probe_launch.cpp"
+  )
+  set(_dsv4_xcore_probe_objects)
+  foreach(_source IN LISTS _dsv4_xcore_probe_sources)
+    get_filename_component(_source_name "${_source}" NAME_WE)
+    set(_object
+        "${CMAKE_CURRENT_BINARY_DIR}/dsv4_xcore_probe/${_source_name}.dav-3510.o")
+    add_custom_command(
+      OUTPUT "${_object}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "${CMAKE_CURRENT_BINARY_DIR}/dsv4_xcore_probe"
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+              "ASCEND_TOOLKIT_HOME=${ASCEND_HOME_PATH}"
+              "${ASCEND_HOME_PATH}/bin/bisheng"
+              -O2 --npu-arch=dav-3510 --asc-aicore-lang
+              -DDSV4_TILING_TEST_OVERRIDE=1
+              "-I${CMAKE_SOURCE_DIR}/include"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+              "-I${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel"
+              "-I${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/kernel"
+              "-I${ASCEND_HOME_PATH}/include"
+              "-I${ASCEND_HOME_PATH}/x86_64-linux/asc/include"
+              -c "${_source}" -o "${_object}"
+      DEPENDS "${_source}" ${_dsv4_asc_headers}
+              "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_arch35.h"
+      VERBATIM
+      COMMENT "Compiling SIM-ONLY ${_source_name} for dav-3510 with BiSheng")
+    list(APPEND _dsv4_xcore_probe_objects "${_object}")
+  endforeach()
+  set_source_files_properties(${_dsv4_xcore_probe_objects}
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_custom_target(dsv4_xcore_probe_objects
+                    DEPENDS ${_dsv4_xcore_probe_objects})
+
+  add_executable(test_dsv4_crosscore_wait_probe_sim
+    test_dsv4_crosscore_wait_probe_sim.cpp
+    ${_dsv4_xcore_probe_objects}
+    "${_dsv4_prod_launch_common_object}"
+  )
+  add_dependencies(test_dsv4_crosscore_wait_probe_sim
+                   dsv4_xcore_probe_objects
+                   dsv4_moe_prefill_cube_sim_kernel_objects)
+  target_include_directories(test_dsv4_crosscore_wait_probe_sim PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
+    "${ASCEND_HOME_PATH}/include"
+  )
+  target_compile_options(test_dsv4_crosscore_wait_probe_sim PRIVATE -Wall -Wextra)
+  if(DSV4_WERROR)
+    target_compile_options(test_dsv4_crosscore_wait_probe_sim PRIVATE -Werror)
+  endif()
+  target_compile_definitions(test_dsv4_crosscore_wait_probe_sim PRIVATE
+    DSV4_TILING_TEST_OVERRIDE=1
+  )
+  target_link_libraries(test_dsv4_crosscore_wait_probe_sim PRIVATE
+    moe_emu
+    Threads::Threads
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libascendc_runtime.a"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libruntime.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libprofapi.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libunified_dlog.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libmmpa.so"
+    "${ASCEND_HOME_PATH}/x86_64-linux/lib64/libc_sec.so"
+    ${MOE_CANN_LIBRARIES}
+  )
+  set_target_properties(test_dsv4_crosscore_wait_probe_sim PROPERTIES
+    BUILD_RPATH "${MOE_CANN_LIB_DIR}"
+  )
+  foreach(_dir IN LISTS MOE_CANN_LIB_DIRS _dsv4_devlib_dirs)
+    target_link_options(test_dsv4_crosscore_wait_probe_sim PRIVATE
+                        "LINKER:-rpath-link,${_dir}")
+  endforeach()
+
+  add_test(NAME Dsv4CrossCoreWaitProbe
+           COMMAND test_dsv4_crosscore_wait_probe_sim)
+  set_tests_properties(Dsv4CrossCoreWaitProbe PROPERTIES
+    LABELS "sim;arch35;camodel;bisection;probe;primitive;mix"
+    TIMEOUT 600
+    ENVIRONMENT
+      "ASCEND_SIMULATOR_MODE=1;LD_LIBRARY_PATH=${_dsv4_sim_root}/camodel:${_dsv4_sim_root}/lib:${MOE_CANN_LIB_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  # ---------------------------------------------------------------------
   # VARIANT (a) OF THE BISECTION: the Matmul/KFC lifecycle, with no compute
   # ---------------------------------------------------------------------
   # Same device objects would not do here -- this needs its OWN kernel TU,
