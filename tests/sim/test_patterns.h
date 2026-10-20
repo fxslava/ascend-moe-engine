@@ -5,21 +5,18 @@
 #include <cstdint>
 
 namespace dsv4::sim {
-
-void GenerateSequential(float* buffer, std::size_t count, float start_val,
-                        float step);
-void GenerateAllOnes(float* buffer, std::size_t count);
-void GenerateIdentityMatrix(float* buffer, std::size_t rows,
+void GenerateSequential(uint16_t* ptr, std::size_t count,
+                        float start_val = 1.0F, float step = 1.0F);
+void GenerateAllOnes(uint16_t* ptr, std::size_t count);
+void GenerateIdentityMatrix(uint16_t* ptr, std::size_t rows,
                             std::size_t cols);
-
-// Encode a value using the nearest finite E2M1 code, packed low nibble first.
-std::uint8_t EncodeMxfp4E2M1(float value);
-void EncodeMxfp4E2M1(const float* input, std::size_t count,
-                      std::uint8_t* packed);
-
-// Encode a positive scale as the nearest E8M0 power of two (biased exponent).
-std::uint8_t EncodeE8M0Scale(float scale);
-
+void PackWeightsFp4(const float* src, uint8_t* dst_packed,
+                    uint8_t* dst_scales, std::size_t k, std::size_t n,
+                    std::size_t group_size = 32);
+float Bf16ToFloat(uint16_t value);
+float DecodePackedWeight(const uint8_t* packed, const uint8_t* scales,
+                         std::size_t element_index,
+                         std::size_t group_size = 32);
 }  // namespace dsv4::sim
 
 #endif

@@ -243,27 +243,28 @@ if(COMMAND ascendc_library)
 
   target_compile_definitions(${_pipeline_device} PUBLIC DSV4_TILING_TEST_OVERRIDE=1)
 
-  # The benchmark is a separate production build of this isolated operator:
-  # no tiling override, so the 4096 x 2048 production geometry is admitted.
-  set(_bench_device dsv4_moe_prefill_cube_bench_device)
+  # Separate, readable MXFP4 prefill kernel and host runner.
+  option(ENABLE_HUMAN_KERNEL_PRINTF
+         "Emit the educational kernel's stage-by-stage device printf trace" OFF)
+  set(_bench_device dsv4_moe_human_npu_device)
   ascendc_library(${_bench_device} STATIC
-    "${_dsv4_op_dir}/op_kernel/dsv4_moe_prefill_cube_pipeline_kernel.cpp"
-    "${_dsv4_op_dir}/op_host/dsv4_moe_prefill_cube_pipeline.cpp"
-    "${_dsv4_op_dir}/op_host/dsv4_moe_prefill_cube_tiling.cpp"
-    "${CMAKE_SOURCE_DIR}/src/ops/common/launch_common.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_human_writed_kernel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_human_writed.cpp"
   )
   ascendc_include_directories(${_bench_device} PRIVATE
     "${CMAKE_SOURCE_DIR}/include"
     "${_dsv4_op_dir}/op_kernel"
     "${_dsv4_op_dir}/op_host"
     "${CMAKE_SOURCE_DIR}/src/ops/common"
+    "${_dsv4_cann_arch}/include"
   )
   target_include_directories(${_bench_device} PUBLIC
-    "${CMAKE_SOURCE_DIR}/include"
     "${_dsv4_op_dir}/op_host"
     "${_dsv4_cann_arch}/include"
   )
-
+  if(ENABLE_HUMAN_KERNEL_PRINTF)
+    target_compile_definitions(${_bench_device} PRIVATE ENABLE_KERNEL_PRINTF=1)
+  endif()
 
   # -Werror on the device TUs, and deliberately WITHOUT -Wall -Wextra.
   #
@@ -389,11 +390,15 @@ if(COMMAND ascendc_library)
     BUILD_RPATH "$ORIGIN/../.."
   )
 
-  add_executable(npu_moe_prefill_bench npu_dsv4_moe_prefill_cube_standalone.cpp)
-  target_link_libraries(npu_moe_prefill_bench PRIVATE
-    ${_bench_device} moe_emu GTest::gtest Threads::Threads dl)
-  target_include_directories(npu_moe_prefill_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-  target_compile_options(npu_moe_prefill_bench PRIVATE -Wall -Wextra -ffp-contract=off)
+  add_executable(npu_moe_prefill_bench
+    main_npu.cpp
+    "${CMAKE_SOURCE_DIR}/tests/sim/test_patterns.cpp")
+  target_link_libraries(npu_moe_prefill_bench PRIVATE ${_bench_device})
+  target_include_directories(npu_moe_prefill_bench PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/tests/sim")
+  target_compile_options(npu_moe_prefill_bench PRIVATE -O3 -Wall -Wextra
+                         -ffp-contract=off)
   if(DSV4_WERROR)
     target_compile_options(npu_moe_prefill_bench PRIVATE -Werror)
   endif()
