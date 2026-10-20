@@ -2,29 +2,95 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "CANN: Clean",
+            "label": "MoE SIMD: Configure Debug",
             "type": "shell",
-            "command": "wsl rm -rf build_cann",
-            "problemMatcher": []
+            "command": "cmake",
+            "args": [
+                "-S",
+                "${workspaceFolder}",
+                "-B",
+                "${workspaceFolder}/build_moe_sim_debug",
+                "-DENABLE_ARCH35_DEVICE_LAUNCH=ON",
+                "-DARCH35_NPU_ARCH=dav-3510",
+                "-DENABLE_HUMAN_KERNEL_PRINTF=ON",
+                "-DCMAKE_BUILD_TYPE=Debug"
+            ],
+            "options": {
+                "env": {
+                    "ASCEND_HOME_PATH": "/opt/Ascend92/cann-9.2.0-beta.2"
+                }
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
         },
         {
-            "label": "CANN: Configure",
+            "label": "MoE SIMD: Build Simulator",
             "type": "shell",
-            "command": "wsl cmake -S . -B build_cann -DENABLE_ARCH35_DEVICE_LAUNCH=ON -DCMAKE_BUILD_TYPE=Release",
-            "problemMatcher": [],
-            "dependsOn": ["CANN: Clean"]
-        },
-        {
-            "label": "CANN: Build (Ctrl+Shift+B)",
-            "type": "shell",
-            "command": "wsl cmake --build build_cann -j$(nproc)",
-            "problemMatcher": ["$gcc"],
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_moe_sim_debug",
+                "--target",
+                "sim_moe_test",
+                "-j2"
+            ],
+            "options": {
+                "env": {
+                    "ASCEND_HOME_PATH": "/opt/Ascend92/cann-9.2.0-beta.2"
+                }
+            },
+            "dependsOn": "MoE SIMD: Configure Debug",
             "dependsOrder": "sequence",
-            "dependsOn": ["CANN: Configure"],
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             }
+        },
+        {
+            "label": "MoE SIMD: Run CAModel",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build_moe_sim_debug",
+                "--output-on-failure",
+                "-R",
+                "^sim_moe_test$"
+            ],
+            "options": {
+                "env": {
+                    "ASCEND_HOME_PATH": "/opt/Ascend92/cann-9.2.0-beta.2"
+                }
+            },
+            "dependsOn": "MoE SIMD: Build Simulator",
+            "dependsOrder": "sequence",
+            "problemMatcher": []
+        },
+        {
+            "label": "MoE SIMD: Build NPU Runner",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_moe_sim_debug",
+                "--target",
+                "npu_moe_prefill_bench",
+                "-j2"
+            ],
+            "options": {
+                "env": {
+                    "ASCEND_HOME_PATH": "/opt/Ascend92/cann-9.2.0-beta.2"
+                }
+            },
+            "dependsOn": "MoE SIMD: Configure Debug",
+            "dependsOrder": "sequence",
+            "problemMatcher": [
+                "$gcc"
+            ]
         }
     ]
 }

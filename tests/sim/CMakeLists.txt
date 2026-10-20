@@ -27,7 +27,8 @@ if(COMMAND ascendc_library)
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
     "${CMAKE_SOURCE_DIR}/src/ops/common"
     "${_human_arch}/include")
-  target_compile_definitions(${_human_device} PRIVATE ENABLE_KERNEL_PRINTF=1)
+  target_compile_definitions(${_human_device} PRIVATE ENABLE_KERNEL_PRINTF=1 ASCENDC_DUMP=1)
+  target_compile_options(${_human_device} PRIVATE --cce-enable-print -UNDEBUG)
   target_compile_definitions(sim_moe_test PRIVATE DSV4_CAMODEL=1)
   target_include_directories(sim_moe_test PRIVATE
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"

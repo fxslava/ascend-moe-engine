@@ -263,7 +263,8 @@ if(COMMAND ascendc_library)
     "${_dsv4_cann_arch}/include"
   )
   if(ENABLE_HUMAN_KERNEL_PRINTF)
-    target_compile_definitions(${_bench_device} PRIVATE ENABLE_KERNEL_PRINTF=1)
+    target_compile_definitions(${_bench_device} PRIVATE ENABLE_KERNEL_PRINTF=1 ASCENDC_DUMP=1)
+    target_compile_options(${_bench_device} PRIVATE --cce-enable-print -UNDEBUG)
   endif()
 
   # -Werror on the device TUs, and deliberately WITHOUT -Wall -Wextra.
