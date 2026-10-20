@@ -6,8 +6,8 @@
  * is limited to exact SwiGLU Exp/Div because CANN 9.2 does not accept BF16 there.
  * The first UB allocation is inter_activations_bf16 at offset zero. Phase three
  * reuses the earlier weight and scratch allocations; LocalMemAllocator has no
- * reset API. Mode 2 ready flags from both AIVs rendezvous at the AIC before
- * paired Mode 4 release flags allow down projection to begin.
+ * reset API. Both AIVs rendezvous on Mode 2 flag 0 before the AIC releases
+ * them together with Mode 2 flag 1 for down projection.
  */
 #include "kernel_operator.h"
 #include "basic_api/kernel_operator_block_sync_intf.h"
@@ -34,8 +34,7 @@ constexpr uint32_t kWeightCastHalfElementCount = kWeightTileElementCount / 2;
 constexpr uint32_t kWeightCastRepeatCount = kWeightCastHalfElementCount / 128;
 constexpr uint32_t kScaleGroupsPerProjectionTile = kProjectionTileWidth / kScaleGroupSize;
 constexpr uint32_t kScaleTileElementCount = kReductionTile * kScaleGroupsPerProjectionTile;
-constexpr uint16_t kAivReadyFlag = 0;
-constexpr uint16_t kAicReleaseFlag = 2;
+constexpr uint32_t kScaleIndexElementCount = kProjectionTileWidth;
 
 __aicore__ inline void TraceBf16(const __gm__ char* label, const LocalTensor<bfloat16_t>& values, const LocalTensor<float>& trace_values_fp32) {
     Cast<float, bfloat16_t>(trace_values_fp32, values, RoundMode::CAST_NONE, 16);
@@ -52,6 +51,8 @@ __aicore__ inline void AccumulateProjectionTile(
     const LocalTensor<bfloat16_t>& scaled_weight_product_bf16,
     const LocalTensor<uint8_t>& weight_scale_codes_ub,
     const LocalTensor<uint16_t>& scale_codes_bf16_bits,
+    const LocalTensor<uint32_t>& scale_group_indices_ub,
+    const LocalTensor<bfloat16_t>& expanded_scales_bf16,
     const GlobalTensor<uint8_t>& packed_weights_gm,
     const GlobalTensor<uint8_t>& weight_scales_gm,
     uint32_t projection_output_dimension,
@@ -76,27 +77,25 @@ __aicore__ inline void AccumulateProjectionTile(
     DataCopy(weight_scale_codes_ub, weight_scales_gm[scale_offset], scale_params);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    LocalTensor<fp4x2_e2m1_t> packed_weights_fp4 = packed_weights_bytes_ub.ReinterpretCast<fp4x2_e2m1_t>();
+    LocalTensor<fp4x2_e2m1_t> packed_weights_fp4         = packed_weights_bytes_ub.ReinterpretCast<fp4x2_e2m1_t>();
     UnaryRepeatParams fp4_cast_repeat_params(1, 1, 8, 2);
     Cast<bfloat16_t, fp4x2_e2m1_t>(dequant_weights_bf16, packed_weights_fp4, RoundMode::CAST_NONE, 128ull, static_cast<uint8_t>(kWeightCastRepeatCount), fp4_cast_repeat_params);
     Cast<bfloat16_t, fp4x2_e2m1_t>(dequant_weights_bf16[kWeightCastHalfElementCount], packed_weights_fp4[kWeightCastHalfElementCount / 2], RoundMode::CAST_NONE, 128ull, static_cast<uint8_t>(kWeightCastRepeatCount), fp4_cast_repeat_params);
     Cast<uint16_t, uint8_t>(scale_codes_bf16_bits, weight_scale_codes_ub, RoundMode::CAST_NONE, kScaleTileElementCount);
     ShiftLeft(scale_codes_bf16_bits, scale_codes_bf16_bits, static_cast<uint16_t>(7), kScaleTileElementCount);
-    LocalTensor<bfloat16_t> scale_bf16 = scale_codes_bf16_bits.ReinterpretCast<bfloat16_t>();
+    LocalTensor<bfloat16_t>   scale_bf16                 = scale_codes_bf16_bits.ReinterpretCast<bfloat16_t>();
     PipeBarrier<PIPE_V>();
     for (uint32_t reduction = 0; reduction < kReductionTile; ++reduction) {
+        const uint32_t weight_offset = reduction * kProjectionTileWidth;
+        const uint32_t scale_base_offset = reduction * kScaleGroupsPerProjectionTile;
         const bfloat16_t activation_scalar = activation_tokens_bf16.GetValue(reduction_tile_start + reduction);
-        for (uint32_t group = 0; group < kScaleGroupsPerProjectionTile; ++group) {
-            const uint32_t weight_index = reduction * kProjectionTileWidth + group * kScaleGroupSize;
-            const uint32_t scale_index = reduction * kScaleGroupsPerProjectionTile + group;
-            const bfloat16_t scale_scalar = scale_bf16.GetValue(scale_index);
-            Muls(scaled_weight_product_bf16[group * kScaleGroupSize], dequant_weights_bf16[weight_index], scale_scalar, kScaleGroupSize);
-            if (trace_weight_strip && reduction == 0 && group == 0) {
-                TraceBf16("[dsv4] dequantized weights", scaled_weight_product_bf16, trace_values_fp32);
-            }
-            Muls(scaled_weight_product_bf16[group * kScaleGroupSize], scaled_weight_product_bf16[group * kScaleGroupSize], activation_scalar, kScaleGroupSize);
-            Add(projection_accumulator_bf16[group * kScaleGroupSize], projection_accumulator_bf16[group * kScaleGroupSize], scaled_weight_product_bf16[group * kScaleGroupSize], kScaleGroupSize);
+        Gather(expanded_scales_bf16, scale_bf16, scale_group_indices_ub, scale_base_offset, kProjectionTileWidth);
+        Mul(scaled_weight_product_bf16, dequant_weights_bf16[weight_offset], expanded_scales_bf16, kProjectionTileWidth);
+        if (trace_weight_strip && reduction == 0) {
+            TraceBf16("[dsv4] dequantized weights", scaled_weight_product_bf16, trace_values_fp32);
         }
+        Muls(scaled_weight_product_bf16, scaled_weight_product_bf16, activation_scalar, kProjectionTileWidth);
+        Add(projection_accumulator_bf16, projection_accumulator_bf16, scaled_weight_product_bf16, kProjectionTileWidth);
     }
     PipeBarrier<PIPE_V>();
 }
@@ -116,40 +115,40 @@ __aicore__ inline void RunVectorCore(
     const GlobalTensor<bfloat16_t>& inter_gm,
     const GlobalTensor<bfloat16_t>& final_output_gm) {
     LocalMemAllocator<Hardware::UB> allocator;
-    LocalTensor<bfloat16_t> inter_activations_bf16 = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
-    LocalTensor<bfloat16_t> tokens_tile_ub = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kHiddenDimension);
-    LocalTensor<uint8_t> packed_weights_ub = allocator.Alloc<TPosition::VECIN, uint8_t>(kWeightTileElementCount / 2);
-    LocalTensor<bfloat16_t> dequant_weights_bf16 = allocator.Alloc<TPosition::VECCALC, bfloat16_t>(kWeightTileElementCount);
-    LocalTensor<bfloat16_t> scaled_weight_product_bf16 = allocator.Alloc<TPosition::VECCALC, bfloat16_t>(kProjectionTileWidth);
-    LocalTensor<uint8_t> scale_codes_ub = allocator.Alloc<TPosition::VECIN, uint8_t>(kScaleTileElementCount);
-    LocalTensor<uint16_t> scale_bits_ub = allocator.Alloc<TPosition::VECCALC, uint16_t>(kScaleTileElementCount);
-    LocalTensor<bfloat16_t> gate_acc_bf16 = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
-    LocalTensor<bfloat16_t> up_acc_bf16 = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
-    LocalTensor<bfloat16_t> down_acc_bf16 = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
-    LocalTensor<bfloat16_t> gate_bf16 = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
-    LocalTensor<bfloat16_t> up_bf16 = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
-    LocalTensor<float> gate_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> up_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> negative_gate_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> exp_negative_gate_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> denominator_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> sigmoid_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> silu_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
-    LocalTensor<float> inter_fp32 = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
+    LocalTensor<bfloat16_t>   inter_activations_bf16     = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
+    LocalTensor<bfloat16_t>   tokens_tile_ub             = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kHiddenDimension);
+    LocalTensor<uint8_t>      packed_weights_ub          = allocator.Alloc<TPosition::VECIN, uint8_t>(kWeightTileElementCount / 2);
+    LocalTensor<bfloat16_t>   dequant_weights_bf16       = allocator.Alloc<TPosition::VECCALC, bfloat16_t>(kWeightTileElementCount);
+    LocalTensor<bfloat16_t>   scaled_weight_product_bf16 = allocator.Alloc<TPosition::VECCALC, bfloat16_t>(kProjectionTileWidth);
+    LocalTensor<uint8_t>      scale_codes_ub             = allocator.Alloc<TPosition::VECIN, uint8_t>(kScaleTileElementCount);
+    LocalTensor<uint16_t>     scale_bits_ub              = allocator.Alloc<TPosition::VECCALC, uint16_t>(kScaleTileElementCount);
+    LocalTensor<uint32_t>     scale_group_indices_ub     = allocator.Alloc<TPosition::VECCALC, uint32_t>(kScaleIndexElementCount);
+    LocalTensor<bfloat16_t>   expanded_scales_bf16       = allocator.Alloc<TPosition::VECCALC, bfloat16_t>(kProjectionTileWidth);
+    LocalTensor<bfloat16_t>   gate_acc_bf16              = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
+    LocalTensor<bfloat16_t>   up_acc_bf16                = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
+    LocalTensor<bfloat16_t>   down_acc_bf16              = allocator.Alloc<TPosition::VECOUT, bfloat16_t>(kProjectionTileWidth);
+    LocalTensor<bfloat16_t>   gate_bf16                  = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
+    LocalTensor<bfloat16_t>   up_bf16                    = allocator.Alloc<TPosition::VECIN, bfloat16_t>(kIntermediateBandWidth);
+    LocalTensor<float>        scratch_acc_fp32           = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
+    LocalTensor<float>        scratch_math_fp32          = allocator.Alloc<TPosition::VECCALC, float>(kIntermediateBandWidth);
+
+    for (uint32_t group = 0; group < kScaleGroupsPerProjectionTile; ++group) {
+        Duplicate(scale_group_indices_ub[group * kScaleGroupSize], static_cast<uint32_t>(group), kScaleGroupSize);
+    }
 
     DataCopy(tokens_tile_ub, input_tokens_gm[token_row * kHiddenDimension], kHiddenDimension);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
     if (token_row == 0 && sub_block_idx == 0) {
-        TraceBf16("[dsv4] input tokens", tokens_tile_ub, gate_fp32);
+        TraceBf16("[dsv4] input tokens", tokens_tile_ub, scratch_acc_fp32);
     }
 
     const uint32_t inter_start = sub_block_idx * kIntermediateBandWidth;
     Duplicate(gate_acc_bf16, bfloat16_t(0.0f), kProjectionTileWidth);
     Duplicate(up_acc_bf16, bfloat16_t(0.0f), kProjectionTileWidth);
     for (uint32_t reduction_tile_start = 0; reduction_tile_start < kHiddenDimension; reduction_tile_start += kReductionTile) {
-        AccumulateProjectionTile(gate_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, gate_weights_gm, gate_scales_gm, kIntermediateDimension, kIntermediateDimension / kScaleGroupSize, reduction_tile_start, inter_start, gate_fp32, token_row == 0 && sub_block_idx == 0);
-        AccumulateProjectionTile(up_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, up_weights_gm, up_scales_gm, kIntermediateDimension, kIntermediateDimension / kScaleGroupSize, reduction_tile_start, inter_start, gate_fp32, false);
+        AccumulateProjectionTile(gate_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, scale_group_indices_ub, expanded_scales_bf16, gate_weights_gm, gate_scales_gm, kIntermediateDimension, kIntermediateDimension / kScaleGroupSize, reduction_tile_start, inter_start, scratch_acc_fp32, token_row == 0 && sub_block_idx == 0);
+        AccumulateProjectionTile(up_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, scale_group_indices_ub, expanded_scales_bf16, up_weights_gm, up_scales_gm, kIntermediateDimension, kIntermediateDimension / kScaleGroupSize, reduction_tile_start, inter_start, scratch_acc_fp32, false);
     }
     PipeBarrier<PIPE_V>();
     SetFlag<HardEvent::V_MTE3>(EVENT_ID2);
@@ -162,30 +161,32 @@ __aicore__ inline void RunVectorCore(
     DataCopy(up_bf16, up_gm[token_row * kIntermediateDimension + inter_start], kIntermediateBandWidth);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    Cast<float, bfloat16_t>(gate_fp32, gate_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
-    Cast<float, bfloat16_t>(up_fp32, up_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
+    Cast<float, bfloat16_t>(scratch_acc_fp32, gate_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
+    Cast<float, bfloat16_t>(scratch_math_fp32, up_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
     if (token_row == 0 && sub_block_idx == 0) {
-        TraceBf16("[dsv4] gate GEMM", gate_bf16, gate_fp32);
+        TraceBf16("[dsv4] gate GEMM", gate_bf16, scratch_math_fp32);
     }
-    Muls(negative_gate_fp32, gate_fp32, -1.0f, kIntermediateBandWidth);
-    Exp(exp_negative_gate_fp32, negative_gate_fp32, kIntermediateBandWidth);
-    Adds(denominator_fp32, exp_negative_gate_fp32, 1.0f, kIntermediateBandWidth);
-    Duplicate(sigmoid_fp32, 1.0f, kIntermediateBandWidth);
-    Div(sigmoid_fp32, sigmoid_fp32, denominator_fp32, kIntermediateBandWidth);
-    Mul(silu_fp32, gate_fp32, sigmoid_fp32, kIntermediateBandWidth);
-    Mul(inter_fp32, silu_fp32, up_fp32, kIntermediateBandWidth);
-    Cast<bfloat16_t, float>(inter_activations_bf16, inter_fp32, RoundMode::CAST_RINT, kIntermediateBandWidth);
+    Muls(scratch_acc_fp32, scratch_acc_fp32, -1.0f, kIntermediateBandWidth);
+    Exp(scratch_acc_fp32, scratch_acc_fp32, kIntermediateBandWidth);
+    Adds(scratch_acc_fp32, scratch_acc_fp32, 1.0f, kIntermediateBandWidth);
+    Duplicate(scratch_math_fp32, 1.0f, kIntermediateBandWidth);
+    Div(scratch_math_fp32, scratch_math_fp32, scratch_acc_fp32, kIntermediateBandWidth);
+    Cast<float, bfloat16_t>(scratch_acc_fp32, gate_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
+    Mul(scratch_acc_fp32, scratch_acc_fp32, scratch_math_fp32, kIntermediateBandWidth);
+    Cast<float, bfloat16_t>(scratch_math_fp32, up_bf16, RoundMode::CAST_NONE, kIntermediateBandWidth);
+    Mul(scratch_acc_fp32, scratch_acc_fp32, scratch_math_fp32, kIntermediateBandWidth);
+    Cast<bfloat16_t, float>(inter_activations_bf16, scratch_acc_fp32, RoundMode::CAST_RINT, kIntermediateBandWidth);
     PipeBarrier<PIPE_V>();
     if (token_row == 0 && sub_block_idx == 0) {
-        TraceBf16("[dsv4] SwiGLU", inter_activations_bf16, gate_fp32);
+        TraceBf16("[dsv4] SwiGLU", inter_activations_bf16, scratch_acc_fp32);
     }
     SetFlag<HardEvent::V_MTE3>(EVENT_ID2);
     WaitFlag<HardEvent::V_MTE3>(EVENT_ID2);
     DataCopy(inter_gm[token_row * kIntermediateDimension + inter_start], inter_activations_bf16, kIntermediateBandWidth);
     PipeBarrier<PIPE_ALL>();
 
-    CrossCoreSetFlag<2, PIPE_V>(static_cast<uint16_t>(kAivReadyFlag + sub_block_idx));
-    CrossCoreWaitFlag<4, PIPE_FIX>(static_cast<uint16_t>(kAicReleaseFlag + sub_block_idx));
+    CrossCoreSetFlag<2, PIPE_V>(0);
+    CrossCoreWaitFlag<2, PIPE_FIX>(1);
     DataCopy(tokens_tile_ub, inter_gm[token_row * kIntermediateDimension], kIntermediateDimension);
     SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -193,14 +194,14 @@ __aicore__ inline void RunVectorCore(
     for (uint32_t projection_output_start = hidden_start; projection_output_start < hidden_start + kHiddenBandWidth; projection_output_start += kProjectionTileWidth) {
         Duplicate(down_acc_bf16, bfloat16_t(0.0f), kProjectionTileWidth);
         for (uint32_t reduction_tile_start = 0; reduction_tile_start < kIntermediateDimension; reduction_tile_start += kReductionTile) {
-            AccumulateProjectionTile(down_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, down_weights_gm, down_scales_gm, kHiddenDimension, kHiddenDimension / kScaleGroupSize, reduction_tile_start, projection_output_start, gate_fp32, false);
+            AccumulateProjectionTile(down_acc_bf16, tokens_tile_ub, packed_weights_ub, dequant_weights_bf16, scaled_weight_product_bf16, scale_codes_ub, scale_bits_ub, scale_group_indices_ub, expanded_scales_bf16, down_weights_gm, down_scales_gm, kHiddenDimension, kHiddenDimension / kScaleGroupSize, reduction_tile_start, projection_output_start, scratch_acc_fp32, false);
         }
         PipeBarrier<PIPE_V>();
         SetFlag<HardEvent::V_MTE3>(EVENT_ID2);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID2);
         DataCopy(final_output_gm[token_row * kHiddenDimension + projection_output_start], down_acc_bf16, kProjectionTileWidth);
         if (token_row == 0 && sub_block_idx == 0 && projection_output_start == hidden_start) {
-            TraceBf16("[dsv4] down projection", down_acc_bf16, gate_fp32);
+            TraceBf16("[dsv4] down projection", down_acc_bf16, scratch_acc_fp32);
         }
     }
 }
@@ -217,10 +218,8 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_human_writed(
     if ASCEND_IS_AIC {
         const uint32_t token_row = GetBlockIdx();
         if (token_row < kTokenCount) {
-            CrossCoreWaitFlag<2, PIPE_V>(kAivReadyFlag);
-            CrossCoreWaitFlag<2, PIPE_V>(kAivReadyFlag + kSubBlockCount - 1);
-            CrossCoreSetFlag<4, PIPE_FIX>(kAicReleaseFlag);
-            CrossCoreSetFlag<4, PIPE_FIX>(kAicReleaseFlag + kSubBlockCount - 1);
+            CrossCoreWaitFlag<2, PIPE_V>(0);
+            CrossCoreSetFlag<2, PIPE_FIX>(1);
         }
     }
     if ASCEND_IS_AIV {
