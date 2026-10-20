@@ -12,8 +12,8 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube_human_writed(
 void LaunchDsv4MoePrefillCubeHumanWrited(
     const uint16_t* x, const uint8_t* gate_packed, const uint8_t* gate_scales,
     const uint8_t* up_packed, const uint8_t* up_scales,
-    const uint8_t* down_packed, const uint8_t* down_scales, float* gate,
-    float* up, float* inter, float* y, aclrtStream stream) {
+    const uint8_t* down_packed, const uint8_t* down_scales, uint16_t* gate,
+    uint16_t* up, uint16_t* inter, uint16_t* y, aclrtStream stream) {
   using detail::Gm;
   dsv4_moe_prefill_cube_human_writed<<<16, 0u, stream>>>(
       Gm(x), Gm(gate_packed), Gm(gate_scales), Gm(up_packed), Gm(up_scales),

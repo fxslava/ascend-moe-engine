@@ -12,8 +12,8 @@ inline constexpr uint32_t kHumanMoeInter = 2048;
 void LaunchDsv4MoePrefillCubeHumanWrited(
     const uint16_t* x, const uint8_t* gate_packed, const uint8_t* gate_scales,
     const uint8_t* up_packed, const uint8_t* up_scales,
-    const uint8_t* down_packed, const uint8_t* down_scales, float* gate,
-    float* up, float* inter, float* y, aclrtStream stream);
+    const uint8_t* down_packed, const uint8_t* down_scales, uint16_t* gate,
+    uint16_t* up, uint16_t* inter, uint16_t* y, aclrtStream stream);
 }  // namespace moe::kernels::arch35
 
 #endif

@@ -50,6 +50,12 @@ void CpuGolden(const std::vector<uint16_t>& x,
                const std::vector<uint8_t>& down_packed,
                const std::vector<uint8_t>& down_scales,
                std::vector<float>& y) {
+  auto round_bf16 = [](float value) {
+    union Bits { float f; uint32_t u; } bits{};
+    bits.f = value;
+    const uint32_t increment = 0x7fffU + ((bits.u >> 16) & 1U);
+    return dsv4::sim::Bf16ToFloat(static_cast<uint16_t>((bits.u + increment) >> 16));
+  };
   std::vector<float> gate_weights(kWeightCount);
   std::vector<float> up_weights(kWeightCount);
   std::vector<float> down_weights(kWeightCount);
@@ -69,20 +75,20 @@ void CpuGolden(const std::vector<uint16_t>& x,
       for (std::size_t k = 0; k < 4096; ++k) {
         const float xv = dsv4::sim::Bf16ToFloat(x[row * 4096 + k]);
         const std::size_t wi = k * 2048 + n;
-        gate_sum += xv * gate_weights[wi];
-        up_sum += xv * up_weights[wi];
+        gate_sum = round_bf16(gate_sum + round_bf16(xv * round_bf16(gate_weights[wi])));
+        up_sum = round_bf16(up_sum + round_bf16(xv * round_bf16(up_weights[wi])));
       }
       const std::size_t oi = row * 2048 + n;
-      gate[oi] = gate_sum;
-      up[oi] = up_sum;
-      inter[oi] = (gate_sum / (1.0F + std::exp(-gate_sum))) * up_sum;
+      gate[oi] = round_bf16(gate_sum);
+      up[oi] = round_bf16(up_sum);
+      inter[oi] = round_bf16((gate[oi] / (1.0F + std::exp(-gate[oi]))) * up[oi]);
     }
   }
   for (std::size_t row = 0; row < 16; ++row) {
     for (std::size_t n = 0; n < 4096; ++n) {
       float sum = 0.0F;
       for (std::size_t k = 0; k < 2048; ++k)
-        sum += inter[row * 2048 + k] * down_weights[k * 4096 + n];
+        sum = round_bf16(sum + round_bf16(inter[row * 2048 + k] * round_bf16(down_weights[k * 4096 + n])));
       y[row * 4096 + n] = sum;
     }
   }
@@ -124,6 +130,7 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> up_packed(kPackedBytes), up_scales(kScaleCount);
   std::vector<uint8_t> down_packed(kPackedBytes), down_scales(kScaleCount);
   std::vector<float> y(kDownCount);
+  std::vector<uint16_t> y_bf16(kDownCount);
   dsv4::sim::GenerateIdentityMatrix(x.data(), 16, 4096);
   dsv4::sim::PackWeightsFp4(gate_source.data(), gate_packed.data(),
                             gate_scales.data(), 4096, 2048);
@@ -142,7 +149,7 @@ int main(int argc, char** argv) {
   uint16_t *dx = nullptr;
   uint8_t *dgp = nullptr, *dgs = nullptr, *dup = nullptr, *dus = nullptr;
   uint8_t *ddp = nullptr, *dds = nullptr;
-  float *dgate = nullptr, *dup_out = nullptr, *dinter = nullptr, *dy = nullptr;
+  uint16_t *dgate = nullptr, *dup_out = nullptr, *dinter = nullptr, *dy = nullptr;
   if (!DeviceAlloc(&dx, kXCount) ||
       !DeviceAlloc(&dgp, kPackedBytes) || !DeviceAlloc(&dgs, kScaleCount) ||
       !DeviceAlloc(&dup, kPackedBytes) || !DeviceAlloc(&dus, kScaleCount) ||
@@ -179,11 +186,13 @@ int main(int argc, char** argv) {
     std::printf("100 launches, average latency %.3f us\n", total_us / kIterations);
   } else {
     if (!launch() ||
-        !Check(aclrtMemcpy(y.data(), kDownCount * sizeof(float), dy,
-                           kDownCount * sizeof(float),
+        !Check(aclrtMemcpy(y_bf16.data(), kDownCount * sizeof(uint16_t), dy,
+                           kDownCount * sizeof(uint16_t),
                            ACL_MEMCPY_DEVICE_TO_HOST),
                "aclrtMemcpy D2H"))
       return EXIT_FAILURE;
+    for (std::size_t i = 0; i < y.size(); ++i)
+      y[i] = dsv4::sim::Bf16ToFloat(y_bf16[i]);
     std::vector<float> expected(kDownCount);
     CpuGolden(x, gate_packed, gate_scales, up_packed, up_scales, down_packed,
               down_scales, expected);

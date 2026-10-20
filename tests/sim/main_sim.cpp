@@ -23,25 +23,31 @@ void CpuGolden(const std::vector<uint16_t>& x,
                const std::vector<float>& up_w,
                const std::vector<float>& down_w,
                std::vector<float>& y) {
+  auto round_bf16 = [](float value) {
+    union Bits { float f; uint32_t u; } bits{};
+    bits.f = value;
+    const uint32_t increment = 0x7fffU + ((bits.u >> 16) & 1U);
+    return dsv4::sim::Bf16ToFloat(static_cast<uint16_t>((bits.u + increment) >> 16));
+  };
   std::vector<float> gate(kGateCount), up(kGateCount), inter(kGateCount);
   for (std::size_t row = 0; row < 16; ++row)
     for (std::size_t n = 0; n < 2048; ++n) {
       float g = 0.0F, u = 0.0F;
       for (std::size_t k = 0; k < 4096; ++k) {
         const float xv = dsv4::sim::Bf16ToFloat(x[row * 4096 + k]);
-        g += xv * gate_w[k * 2048 + n];
-        u += xv * up_w[k * 2048 + n];
+        g = round_bf16(g + round_bf16(xv * round_bf16(gate_w[k * 2048 + n])));
+        u = round_bf16(u + round_bf16(xv * round_bf16(up_w[k * 2048 + n])));
       }
       const std::size_t i = row * 2048 + n;
-      gate[i] = g;
-      up[i] = u;
-      inter[i] = (g / (1.0F + std::exp(-g))) * u;
+      gate[i] = round_bf16(g);
+      up[i] = round_bf16(u);
+      inter[i] = round_bf16((gate[i] / (1.0F + std::exp(-gate[i]))) * up[i]);
     }
   for (std::size_t row = 0; row < 16; ++row)
     for (std::size_t n = 0; n < 4096; ++n) {
       float sum = 0.0F;
       for (std::size_t k = 0; k < 2048; ++k)
-        sum += inter[row * 2048 + k] * down_w[k * 4096 + n];
+        sum = round_bf16(sum + round_bf16(inter[row * 2048 + k] * round_bf16(down_w[k * 4096 + n])));
       y[row * 4096 + n] = sum;
     }
 }
@@ -67,6 +73,7 @@ int main() {
   std::vector<uint8_t> up_packed(kWeightCount / 2), up_scales(kWeightCount / 32);
   std::vector<uint8_t> down_packed(kWeightCount / 2), down_scales(kWeightCount / 32);
   std::vector<float> y(kYCount, 0.0F), golden(kYCount, 0.0F);
+  std::vector<uint16_t> y_bf16(kYCount, 0);
   std::vector<float> gate_w(kWeightCount), up_w(kWeightCount), down_w(kWeightCount);
   dsv4::sim::GenerateIdentityMatrix(x.data(), 16, 4096);
   dsv4::sim::PackWeightsFp4(gate_source.data(), gate_packed.data(),
@@ -92,7 +99,7 @@ int main() {
   uint16_t *dx = nullptr;
   uint8_t *dgp = nullptr, *dgs = nullptr, *dup = nullptr, *dus = nullptr;
   uint8_t *ddp = nullptr, *dds = nullptr;
-  float *dg = nullptr, *du = nullptr, *di = nullptr, *dy = nullptr;
+  uint16_t *dg = nullptr, *du = nullptr, *di = nullptr, *dy = nullptr;
   if (!Alloc(&dx, kXCount) || !Alloc(&dgp, gate_packed.size()) ||
       !Alloc(&dgs, gate_scales.size()) || !Alloc(&dup, up_packed.size()) ||
       !Alloc(&dus, up_scales.size()) || !Alloc(&ddp, down_packed.size()) ||
@@ -110,8 +117,8 @@ int main() {
   moe::kernels::arch35::LaunchDsv4MoePrefillCubeHumanWrited(
       dx, dgp, dgs, dup, dus, ddp, dds, dg, du, di, dy, stream);
   if (aclrtSynchronizeStream(stream) != ACL_SUCCESS ||
-      aclrtMemcpy(y.data(), y.size() * sizeof(float), dy,
-                  y.size() * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+      aclrtMemcpy(y_bf16.data(), y_bf16.size() * sizeof(uint16_t), dy,
+                  y_bf16.size() * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
     std::fprintf(stderr, "CAModel launch or output copy failed\n");
     return EXIT_FAILURE;
   }
@@ -119,6 +126,10 @@ int main() {
   // Hardware-free fallback used when CANN is not configured. It keeps the
   // standalone contract test available; CANN builds run the entry point above.
   y = golden;
+#endif
+#if defined(DSV4_CAMODEL)
+  for (std::size_t i = 0; i < y.size(); ++i)
+    y[i] = dsv4::sim::Bf16ToFloat(y_bf16[i]);
 #endif
 
   double squared = 0.0;
