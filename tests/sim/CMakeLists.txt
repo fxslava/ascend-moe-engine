@@ -1,6 +1,7 @@
 # Flat MoE simulator test: one host runner, one procedural data source.
 add_executable(sim_moe_test main_sim.cpp test_patterns.cpp)
 target_compile_features(sim_moe_test PRIVATE cxx_std_17)
+target_compile_definitions(sim_moe_test PRIVATE DSV4_SIM_STEPS=2)
 target_compile_options(sim_moe_test PRIVATE -O3 -Wall -Wextra)
 target_include_directories(sim_moe_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 set_target_properties(sim_moe_test PROPERTIES
@@ -27,9 +28,9 @@ if(COMMAND ascendc_library)
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
     "${CMAKE_SOURCE_DIR}/src/ops/common"
     "${_human_arch}/include")
-  target_compile_definitions(${_human_device} PRIVATE ENABLE_KERNEL_PRINTF=1 ASCENDC_DUMP=1)
+  target_compile_definitions(${_human_device} PRIVATE ENABLE_KERNEL_PRINTF=1 ASCENDC_DUMP=1 DSV4_SIM_MICROTILE=1 DSV4_SIM_STEPS=2)
   target_compile_options(${_human_device} PRIVATE --cce-enable-print -UNDEBUG)
-  target_compile_definitions(sim_moe_test PRIVATE DSV4_CAMODEL=1)
+  target_compile_definitions(sim_moe_test PRIVATE DSV4_CAMODEL=1 DSV4_SIM_MICROTILE=1 DSV4_SIM_STEPS=2)
   target_include_directories(sim_moe_test PRIVATE
     "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host"
     "${_human_arch}/include")

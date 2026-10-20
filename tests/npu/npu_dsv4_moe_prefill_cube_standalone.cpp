@@ -113,7 +113,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -143,8 +142,6 @@ constexpr double        kCosineFloor = 0.999;
 
 aclrtStream   g_stream = nullptr;
 std::uint64_t g_seed   = 0;
-bool          g_benchmark_mode = false;
-bool          g_production_shape = false;
 
 std::string AclTail() {
     const char* msg = aclGetRecentErrMsg();
@@ -431,7 +428,6 @@ Spread MeasureSpread(const std::vector<float>& values) {
 
 struct Mismatch {
     double        max_abs   = 0.0;
-    double        rmse      = 0.0;
     double        max_rel   = 0.0;
     double        cosine    = 1.0;
     std::uint32_t worst_row = 0;
@@ -445,7 +441,7 @@ struct Mismatch {
 Mismatch Compare(const std::vector<float>& actual, const std::vector<float>& expected,
                  std::uint32_t rows, std::uint32_t cols) {
     Mismatch diff;
-    double   dot = 0.0, norm_actual = 0.0, norm_expected = 0.0, squared_error = 0.0;
+    double   dot = 0.0, norm_actual = 0.0, norm_expected = 0.0;
     for (std::uint32_t row = 0; row < rows; ++row) {
         for (std::uint32_t col = 0; col < cols; ++col) {
             const std::size_t index = static_cast<std::size_t>(row) * cols + col;
@@ -457,7 +453,6 @@ Mismatch Compare(const std::vector<float>& actual, const std::vector<float>& exp
                 continue;
             }
             const double delta = std::fabs(got - want);
-            squared_error += delta * delta;
             if (delta > diff.max_abs) {
                 diff.max_abs   = delta;
                 diff.worst_row = row;
@@ -476,7 +471,6 @@ Mismatch Compare(const std::vector<float>& actual, const std::vector<float>& exp
             norm_expected += want * want;
         }
     }
-    diff.rmse = std::sqrt(squared_error / static_cast<double>(actual.size()));
     if (norm_actual == 0.0 && norm_expected == 0.0) {
         diff.cosine = 1.0;
     } else if (norm_actual == 0.0 || norm_expected == 0.0) {
@@ -617,7 +611,7 @@ void AssertGoldenIsNonDegenerate(const Fixture& fixture) {
 void VerifyAgainstGolden(const Fixture& fixture, const std::vector<float>& y) {
     const Mismatch diff = Compare(y, fixture.golden, fixture.shape.tokens, fixture.shape.hidden);
 
-    std::printf("    diff: RMSE %.6e  max abs %.6e  max rel %.6e  cosine %.8f\n", diff.rmse, diff.max_abs, diff.max_rel,
+    std::printf("    diff: max abs %.6e  max rel %.6e  cosine %.8f\n", diff.max_abs, diff.max_rel,
                 diff.cosine);
     std::printf("    worst element: row %u col %u  device %+.8f  golden %+.8f\n", diff.worst_row,
                 diff.worst_col, diff.worst_got, diff.worst_exp);
@@ -651,29 +645,10 @@ protected:
         std::vector<float>           y;
         Dsv4MoePrefillCubeTilingData tiling{};
         double                       seconds = 0.0;
-        if (g_benchmark_mode) {
-            constexpr int warmups = 5, iterations = 100;
-            std::vector<double> samples;
-            samples.reserve(iterations);
-            for (int i = 0; i < warmups + iterations; ++i) {
-                ASSERT_NO_FATAL_FAILURE(RunOnDevice(fixture, y, tiling, seconds));
-                if (i >= warmups) samples.push_back(seconds);
-            }
-            const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
-            double variance = 0.0;
-            for (double sample : samples) variance += (sample - mean) * (sample - mean);
-            const double stdev = std::sqrt(variance / samples.size());
-            const double bytes = static_cast<double>(fixture.x.size() * sizeof(float) * 2U +
-                fixture.gate_weights.packed.size() + fixture.gate_weights.scales.size() +
-                fixture.up_weights.packed.size() + fixture.up_weights.scales.size() +
-                fixture.down_weights.packed.size() + fixture.down_weights.scales.size());
-            std::printf("    benchmark: %d launches, mean %.6f ms, stddev %.6f ms, effective %.2f GB/s\n",
-                        iterations, mean * 1.0e3, stdev * 1.0e3, bytes / mean / 1.0e9);
-        } else {
-            ASSERT_NO_FATAL_FAILURE(RunOnDevice(fixture, y, tiling, seconds));
-        }
+        ASSERT_NO_FATAL_FAILURE(RunOnDevice(fixture, y, tiling, seconds));
+
         DumpTiling(tiling);
-        if (!g_benchmark_mode) std::printf("    launch + sync: %.6f s\n", seconds);
+        std::printf("    launch + sync: %.6f s\n", seconds);
         if (verbose) {
             DumpPerRowError(y, fixture.golden, shape.tokens, shape.hidden);
         }
@@ -702,8 +677,7 @@ TEST_F(Dsv4MoePrefillCubePipeline, Tile4SteadyStateAndDrain) {
 
 // Every token over every expert, with a ragged tail tile, compared element by element.
 TEST_F(Dsv4MoePrefillCubePipeline, FullReferenceParity) {
-    if (g_production_shape) RunCase(Shape{4096, 2048, 2, 16, 2, Fill::kRandom}, false);
-    else RunCase(Shape{512, 512, 4, 100, 4, Fill::kRandom}, false);
+    RunCase(Shape{512, 512, 4, 100, 4, Fill::kRandom}, /*verbose=*/false);
 }
 
 class Runtime {
@@ -770,16 +744,6 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool mode_requested = false;
-    int kept = 1;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg(argv[i]);
-        if (arg == "--benchmark") { g_benchmark_mode = true; mode_requested = true; }
-        else if (arg == "--validate") { g_benchmark_mode = false; mode_requested = true; }
-        else argv[kept++] = argv[i];
-    }
-    argc = kept;
-    g_production_shape = mode_requested;
     // Scanned before InitGoogleTest consumes it, so the case names stay discoverable on a host
     // with no NPU. argv is scanned directly rather than read back through a gtest flag accessor,
     // whose spelling moved between gtest 1.12 and 1.13.
@@ -791,7 +755,6 @@ int main(int argc, char** argv) {
     }
 
     ::testing::InitGoogleTest(&argc, argv);
-    if (mode_requested) ::testing::GTEST_FLAG(filter) = "*FullReferenceParity";
 
     if (list_only) {
         return RUN_ALL_TESTS();
