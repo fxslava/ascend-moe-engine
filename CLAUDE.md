@@ -31,7 +31,7 @@ Rules:
 1. **No operator source outside its own directory.** A flat
    `src/ops/<op_name>.cpp` is not acceptable. If a file is shared by two
    operators it belongs in `include/moe/kernels/arch35/` or
-   `src/kernels/arch35/`, not in one operator's directory.
+   `src/ops/common/`, not in one operator's directory.
 2. **`op_kernel/` is private.** UB layouts, thread geometry and register
    budgets are implementation detail and live in `op_kernel/<op>_arch35.h`.
    Do not promote them to `include/` — nothing outside the operator may depend

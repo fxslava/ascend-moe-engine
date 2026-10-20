@@ -71,7 +71,7 @@ inline constexpr std::uint32_t kMoeBlockMaxTopK = 8u;
 // The previous constant here was 32, which is the CUBE count of the 9589
 // part, not its Vector count: a pure-AIV grid of 32 therefore ran at HALF
 // occupancy on a 64-vector part and 44% on a 72-vector one. See
-// detail::QueryAivCoreCount() in src/kernels/arch35/launch_common.hpp.
+// detail::QueryAivCoreCount() in src/ops/common/launch_common.hpp.
 //
 // The fallback is used only when the capability query fails. It is the
 // smallest production part's Vector count, so it never over-subscribes a real

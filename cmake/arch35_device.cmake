@@ -8,7 +8,7 @@
 # independent of device availability.
 #
 # WHY THE ASC LANGUAGE IS USED FOR THE LAUNCH LAYER TOO
-# src/kernels/arch35/launch.cpp dispatches with the triple-chevron syntax
+# src/ops/common/launch_common.cpp dispatches with the triple-chevron syntax
 # (`kernel<<<blockDim, l2ctrl, stream>>>`), which only BiSheng can lower. The
 # alternative -- ACLRT_LAUNCH_KERNEL / `aclrtlaunch_<kernel>` host stubs -- is
 # NOT available in CANN 9.2.0-beta.2: the ASC flow passes -DGEN_ACLRT=<dir>

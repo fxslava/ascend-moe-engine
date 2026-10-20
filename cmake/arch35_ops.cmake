@@ -126,8 +126,8 @@ endforeach()
 # to no single operator but is an ASC TU for the same reason the op_host
 # wrappers are.
 list(APPEND MOE_ARCH35_OP_ASC_SOURCES
-  "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+  "${CMAKE_SOURCE_DIR}/src/ops/common/launch_common.cpp"
 )
 list(APPEND MOE_ARCH35_OP_INCLUDE_DIRS
-  "${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+  "${CMAKE_SOURCE_DIR}/src/ops/common"
 )

@@ -78,7 +78,7 @@ if ! command -v bisheng >/dev/null 2>&1; then
   exit 3
 fi
 
-INC="-Iinclude -Isrc/kernels/arch35"
+INC="-Iinclude -Isrc/ops/common"
 for d in \
   "$ROOT/x86_64-linux/asc/include" \
   "$ROOT/x86_64-linux/asc/include/simt_api" \
@@ -184,8 +184,8 @@ for e in $EXTRA_HOST; do
 done
 
 # The shared launch-layer TU: the failure record and Status::ToString.
-compile_one "kernels/arch35/launch_common.cpp" \
-            "src/kernels/arch35/launch_common.cpp" ""
+compile_one "ops/common/launch_common.cpp" \
+            "src/ops/common/launch_common.cpp" ""
 
 echo
 echo "dav-3510 device compilation: pass=$pass fail=$fail"

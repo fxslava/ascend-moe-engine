@@ -2,7 +2,7 @@
 // fused_mhc_pre_norm_sinkhorn.cpp -- host-side launch wrapper.
 //
 // Compiled by BiSheng as an ASC TU: it dispatches with the triple-chevron
-// direct-launch syntax. See src/kernels/arch35/launch_common.hpp for why that
+// direct-launch syntax. See src/ops/common/launch_common.hpp for why that
 // form and not ACLRT_LAUNCH_KERNEL, and CLAUDE.md §3 for the binding rule.
 // -----------------------------------------------------------------------------
 
