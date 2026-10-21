@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug MoE kernel in CAModel",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_moe_sim_debug/tests/sim/sim_moe_test",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "ASCEND_HOME_PATH",
+                    "value": "/opt/Ascend92/cann-9.2.0-beta.2"
+                },
+                {
+                    "name": "ASCEND_SIMULATOR_MODE",
+                    "value": "1"
+                },
+                {
+                    "name": "LD_LIBRARY_PATH",
+                    "value": "/opt/Ascend92/cann-9.2.0-beta.2/x86_64-linux/simulator/dav_3510/camodel:/opt/Ascend92/cann-9.2.0-beta.2/x86_64-linux/simulator/dav_3510/lib:/opt/Ascend92/cann-9.2.0-beta.2/x86_64-linux/lib64:/opt/Ascend92/cann-9.2.0-beta.2/lib64:${env:LD_LIBRARY_PATH}"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "preLaunchTask": "MoE SIMD: Build Simulator"
+        }
+    ]
+}

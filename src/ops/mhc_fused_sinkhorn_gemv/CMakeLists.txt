@@ -4,7 +4,7 @@
 # mhc_fused_sinkhorn_gemv predates the arch35 / dav-3510 operator contracts:
 #   * its kernel is not one of the five arch35 operators and is NOT covered by
 #     scripts/device_compile_kernels.sh, so it has no device compile gate;
-#   * its launch path is not the chevron-dispatch layer in src/kernels/arch35;
+#   * its launch path is not the chevron-dispatch layer in src/ops/common;
 #   * the target below was originally named plain `cpu_ref`, which is a
 #     global-namespace collision as soon as a second operator follows the same
 #     layout -- exactly what CLAUDE.md section 1.4 now forbids.

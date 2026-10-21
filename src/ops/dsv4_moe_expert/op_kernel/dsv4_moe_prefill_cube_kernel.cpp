@@ -75,17 +75,6 @@
 
 #include "kernel_operator.h"
 #include "tensor_api/tensor.h"
-// THE FRAMEWORK, AND IT IS NOT USED BY ANYTHING BELOW THE QUARANTINE LINE.
-//
-// `lib/matmul_intf.h` has to be included HERE, at file scope, rather than from
-// dsv4_moe_prefill_cube_legacy_matmul.h which is what actually needs it: that header is included
-// inside this file's namespace, and matmul_intf's own sources name `AscendC::` explicitly, so
-// including it from there resolves `AscendC` to a nested namespace that does not exist. No Matmul
-// object is instantiated and REGIST_MATMUL_OBJ is never called, so no KfcServer is stood up --
-// deleting the quarantined header and this line together is all it takes to remove the framework
-// from the operator.
-#include "lib/matmul_intf.h"
-
 #include "dsv4_moe_prefill_cube_arch35.h"
 #include "dsv4_moe_prefill_cube_tiling.h"
 
@@ -122,12 +111,6 @@ struct Geometry {
     std::uint32_t num_experts;
     std::uint32_t total_tokens;
     std::uint32_t token_tile;
-    // Read only by the quarantined legacy routines; the live path takes every sub-tile extent
-    // from the compile-time constants, which TilingRejected has already checked these against.
-    std::uint32_t inter_sub_fwd;
-    std::uint32_t hidden_sub_fwd;
-    std::uint32_t hidden_sub_down;
-    std::uint32_t inter_sub_down;
     std::uint32_t gate_up_packed_stride;
     std::uint32_t gate_up_scale_stride;
     std::uint32_t down_packed_stride;
@@ -143,10 +126,6 @@ __aicore__ inline Geometry LoadGeometry(const __gm__ Dsv4MoePrefillCubeTilingDat
     geom.num_experts            = tiling_data->num_experts;
     geom.total_tokens           = tiling_data->total_tokens;
     geom.token_tile             = tiling_data->m_tile;
-    geom.inter_sub_fwd          = tiling_data->r_sub;
-    geom.hidden_sub_fwd         = tiling_data->k_sub;
-    geom.hidden_sub_down        = tiling_data->h_sub;
-    geom.inter_sub_down         = tiling_data->r_sub2;
     geom.gate_up_packed_stride  = tiling_data->w13_packed_expert_stride;
     geom.gate_up_scale_stride   = tiling_data->w13_scale_expert_stride;
     geom.down_packed_stride     = tiling_data->w2_packed_expert_stride;
@@ -191,11 +170,7 @@ __aicore__ inline bool TileAdmitted(GM_ADDR token_to_expert_lut, std::uint32_t t
 // Per-weight-stream, per-ring-slot dequantization staging: everything
 // AsyncLoadWeightsSubTile writes and DequantSubTileVector reads, and nothing else.
 //
-// THE MEMBER NAMES ARE LOAD-BEARING. Five sim probes textually include this file and populate
-// exactly these fields to reuse the two routines below verbatim, and
-// tests/sim/kernel/test_dualdst_pipeline_kernel.cpp does so through a `Buffers`, which the
-// quarantined legacy header derives from this struct. A `Buffers` therefore still converts to a
-// `const WeightStage&` and both callers compile against one definition of the dequantizer.
+// Per-stream staging shared by asynchronous loads and vector dequantization.
 struct WeightStage {
     LocalTensor<fp4x2_e2m1_t> weight_nibbles;
     LocalTensor<bfloat16_t>   weight_expanded;
@@ -1304,15 +1279,5 @@ extern "C" __global__ __aicore__ void dsv4_moe_prefill_cube(
         q_landing.FreeTensor(buf.landing);
     }
 }
-
-// =================================================================================================
-// QUARANTINED: the framework path, unreachable from the entry point above.
-//
-// Retained only so the five sim bisection probes that textually include this file keep compiling
-// and their registered gates keep running. See the header of
-// dsv4_moe_prefill_cube_legacy_matmul.h for the full list and for what deleting it would retire.
-// Nothing above this line calls anything below it.
-// =================================================================================================
-#include "dsv4_moe_prefill_cube_legacy_matmul.h"
 
 }  // namespace moe::kernels::arch35::dsv4_moe_prefill_cube

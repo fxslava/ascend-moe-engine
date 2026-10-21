@@ -153,7 +153,7 @@ endif()
 #   src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_pipeline_kernel.cpp
 #   src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_pipeline.cpp
 #   src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_tiling.cpp
-#   src/kernels/arch35/launch_common.cpp
+#   src/ops/common/launch_common.cpp
 #
 # All four are ASC (BiSheng) TUs for the reason in CLAUDE.md section 3.3: the
 # chevron dispatch is the only launch form this toolkit supports and only
@@ -164,10 +164,8 @@ endif()
 # (CLAUDE.md section 4), not because the engine is needed. It links nothing but
 # libstdc++/libm.
 #
-# DSV4_TILING_TEST_OVERRIDE=1 is PUBLIC on the device library so the kernel,
-# the tiling builder and the gtest driver agree on kPrefillCubeInterCap and on
-# the admissibility predicate. Without it the only admissible shape is
-# hidden 4096 / inter 2048, which no bring-up case wants to carry.
+# The standalone verification target uses small cases, while the benchmark
+# target also exercises the production hidden=4096/inter=2048 geometry.
 #
 # Filterable: --gtest_filter=*Tile1* / *Tile2* / *Tile4* / *Full*
 # Device printf under Release: -DENABLE_KERNEL_PRINTF=ON
@@ -224,7 +222,7 @@ if(COMMAND ascendc_library)
     "${_dsv4_op_dir}/op_kernel/dsv4_moe_prefill_cube_pipeline_kernel.cpp"
     "${_dsv4_op_dir}/op_host/dsv4_moe_prefill_cube_pipeline.cpp"
     "${_dsv4_op_dir}/op_host/dsv4_moe_prefill_cube_tiling.cpp"
-    "${CMAKE_SOURCE_DIR}/src/kernels/arch35/launch_common.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/common/launch_common.cpp"
   )
 
   # Bare-filename includes, resolved by the per-op include directories
@@ -233,7 +231,7 @@ if(COMMAND ascendc_library)
     "${CMAKE_SOURCE_DIR}/include"
     "${_dsv4_op_dir}/op_kernel"
     "${_dsv4_op_dir}/op_host"
-    "${CMAKE_SOURCE_DIR}/src/kernels/arch35"
+    "${CMAKE_SOURCE_DIR}/src/ops/common"
   )
   # PUBLIC: the gtest driver includes op_host/dsv4_moe_prefill_cube_pipeline.h
   # and must see the same geometry constants the device TUs were built with.
@@ -242,7 +240,32 @@ if(COMMAND ascendc_library)
     "${_dsv4_op_dir}/op_host"
     "${_dsv4_cann_arch}/include"
   )
+
   target_compile_definitions(${_pipeline_device} PUBLIC DSV4_TILING_TEST_OVERRIDE=1)
+
+  # Separate, readable MXFP4 prefill kernel and host runner.
+  option(ENABLE_HUMAN_KERNEL_PRINTF
+         "Emit the educational kernel's stage-by-stage device printf trace" OFF)
+  set(_bench_device dsv4_moe_human_npu_device)
+  ascendc_library(${_bench_device} STATIC
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_kernel/dsv4_moe_prefill_cube_human_writed_kernel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/ops/dsv4_moe_expert/op_host/dsv4_moe_prefill_cube_human_writed.cpp"
+  )
+  ascendc_include_directories(${_bench_device} PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${_dsv4_op_dir}/op_kernel"
+    "${_dsv4_op_dir}/op_host"
+    "${CMAKE_SOURCE_DIR}/src/ops/common"
+    "${_dsv4_cann_arch}/include"
+  )
+  target_include_directories(${_bench_device} PUBLIC
+    "${_dsv4_op_dir}/op_host"
+    "${_dsv4_cann_arch}/include"
+  )
+  if(ENABLE_HUMAN_KERNEL_PRINTF)
+    target_compile_definitions(${_bench_device} PRIVATE ENABLE_KERNEL_PRINTF=1 ASCENDC_DUMP=1)
+    target_compile_options(${_bench_device} PRIVATE --cce-enable-print -UNDEBUG)
+  endif()
 
   # -Werror on the device TUs, and deliberately WITHOUT -Wall -Wextra.
   #
@@ -364,6 +387,39 @@ if(COMMAND ascendc_library)
   endforeach()
 
   set_target_properties(${_standalone_target} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/npu"
+    BUILD_RPATH "$ORIGIN/../.."
+  )
+
+  add_executable(npu_moe_prefill_bench
+    main_npu.cpp
+    "${CMAKE_SOURCE_DIR}/tests/sim/test_patterns.cpp")
+  target_link_libraries(npu_moe_prefill_bench PRIVATE ${_bench_device})
+  target_include_directories(npu_moe_prefill_bench PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/tests/sim")
+  target_compile_options(npu_moe_prefill_bench PRIVATE -O3 -Wall -Wextra
+                         -ffp-contract=off)
+  if(DSV4_WERROR)
+    target_compile_options(npu_moe_prefill_bench PRIVATE -Werror)
+  endif()
+  foreach(_candidate
+      "${_dsv4_cann_arch}/devlib/linux/x86_64"
+      "${_dsv4_cann_arch}/devlib"
+      "${_dsv4_cann}/devlib/linux/x86_64"
+      "${_dsv4_cann}/devlib")
+    if(EXISTS "${_candidate}/libascend_hal.so")
+      target_link_options(npu_moe_prefill_bench PRIVATE
+                          "LINKER:-rpath-link,${_candidate}")
+    endif()
+  endforeach()
+  foreach(_candidate "${_dsv4_cann_arch}/lib64" "${_dsv4_cann}/lib64")
+    if(IS_DIRECTORY "${_candidate}")
+      target_link_options(npu_moe_prefill_bench PRIVATE
+                          "LINKER:-rpath-link,${_candidate}")
+    endif()
+  endforeach()
+  set_target_properties(npu_moe_prefill_bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/npu"
     BUILD_RPATH "$ORIGIN/../.."
   )
