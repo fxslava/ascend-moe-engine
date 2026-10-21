@@ -1832,6 +1832,16 @@ int main(int argc, char** argv) {
     void* r_scores = arena.Take(kNumRoutedExperts * 4, "router.scores");
     void* r_weights = arena.Take(kNumExpertsPerTok * 4, "router.weights");
     void* r_experts = arena.Take(kNumExpertsPerTok * 4, "router.experts");
+    // aclnnMoeGatingTopKV2's third output. outFlag is false below, so the
+    // kernel writes nothing here -- but the output is not optional and must
+    // still be a real tensor: the wrapper's parameter check is
+    // CheckNotNull(x, yOut, expertIdxOut, outOut), which runs before the flag
+    // is read and rejects a null one with 161001 (EZ1001, "Expected a proper
+    // Tensor but got null for argument outOut"). MoeGatingTopK's ops-info
+    // declares output2 "out" required and FLOAT32 for every x dtype, and the
+    // tiling checks "out dim[0]" and "out dim[1]", so this is the normalized
+    // full-score row: [1, 256] FP32, x's shape and not the top-k width.
+    void* r_norm_scores = arena.Take(kNumRoutedExperts * 4, "router.norm_scores");
 
     aclTensor* t_gate_w =
         bag.Tensor({kHiddenSize, kNumRoutedExperts}, kAclBf16, gate_weight_t, "ffn.gate.weight^T");
@@ -1841,6 +1851,8 @@ int main(int argc, char** argv) {
     aclTensor* t_scores = bag.Tensor({1, kNumRoutedExperts}, kAclFloat32, r_scores, "router.scores");
     aclTensor* t_weights_out = bag.Tensor({1, kNumExpertsPerTok}, kAclFloat32, r_weights, "router.weights");
     aclTensor* t_experts_out = bag.Tensor({1, kNumExpertsPerTok}, kAclInt32, r_experts, "router.experts");
+    aclTensor* t_norm_scores_out =
+        bag.Tensor({1, kNumRoutedExperts}, kAclFloat32, r_norm_scores, "router.norm_scores");
     aclTensor* t_tid2eid =
         bag.Tensor({tid2eid_shape[0], kNumExpertsPerTok}, kAclInt32, d_tid2eid, "router.tid2eid");
     aclTensor* t_input_ids = bag.Tensor({1}, kAclInt32, d_input_ids, "router.input_ids");
@@ -1865,7 +1877,7 @@ int main(int argc, char** argv) {
         "router: MoeGatingTopKV2 (hash)", OpId::kMoeGatingTopKV2, t_scores, nullptr, t_input_ids, t_tid2eid,
         static_cast<std::int64_t>(kNumExpertsPerTok), kGatingKGroup, kGatingGroupCount, kGatingGroupSelectMode,
         kGatingRenormL1, kGatingNormTypePreNormalized, false, static_cast<double>(kRoutedScalingFactor),
-        kGatingEps, t_weights_out, t_experts_out, nullptr);
+        kGatingEps, t_weights_out, t_experts_out, t_norm_scores_out);
 
     // Expert scratch. One [4096] buffer holds [gate | up] back to back so
     // aclnnSwiGlu's split along the last axis is exactly the gate/up split.

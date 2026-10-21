@@ -639,12 +639,18 @@ using SoftplusPlanFn = int (*)(const aclTensor* self, const aclScalar* beta, con
  * @param[in] group_select_mode Group-score selection algorithm.
  * @param[in] renorm Selected-weight renormalization policy; engine requests L1.
  * @param[in] norm_type Score normalization selector; engine supplies pre-normalized scores.
- * @param[in] out_flag Whether to write the auxiliary full-score output.
+ * @param[in] out_flag Whether the normalized full-score output is actually written.
  * @param[in] routed_scaling_factor Multiplier applied to selected expert probabilities.
  * @param[in] eps Stability constant used by routing normalization.
  * @param[out] y_out Output values in the selected operation's output dtype/shape.
  * @param[out] expert_idx_out Output expert IDs for each token's top-k selection.
- * @param[out] out_out Optional auxiliary score output, controlled by out_flag.
+ * @param[out] out_out Normalized full-score output: FP32, x's shape, NOT optional. out_flag
+ * only decides whether the kernel writes it; the wrapper's check is
+ * CheckNotNull(x, yOut, expertIdxOut, outOut), so a null one fails the plan with 161001
+ * (EZ1001 "Expected a proper Tensor but got null for argument outOut") either way.
+ * MoeGatingTopK's ops-info declares output2 "out" required and FLOAT32 whatever x's dtype
+ * is, and its tiling checks "out dim[0]" and "out dim[1]" -- so it is [rows, expert_count],
+ * not [rows, k].
  * @param[out] workspace_size Returned required device workspace bytes; allocate before launch.
  * @param[out] executor Returned opaque execution plan; transfer to StaticOpSlot before launch.
  * @return 0 (ACLNN_SUCCESS); 161001 (ACLNN_ERR_PARAM_NULLPTR);
