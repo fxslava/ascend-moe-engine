@@ -274,19 +274,20 @@ void TestMhcChain(Report& report, AclDeviceOps& device, DeviceStream stream, con
   DeviceTensor phi(device, {kRows, kFlat}, ACL_FLOAT, inputs.phi.data());
   DeviceTensor alpha(device, {3}, ACL_FLOAT, inputs.alpha);
   DeviceTensor bias(device, {kRows}, ACL_FLOAT, inputs.bias);
-  // gamma is OPTIONAL in MhcPre's op definition, but the vendored aclnn
-  // wrapper hands it to INFER_SHAPE unconditionally and a null one is rejected
-  // with 161001 (EZ1001, "Expected a proper Tensor but got null"). So it has to
-  // be bound -- and bound the way the wrapper's own checks demand, which is
-  // 2-D [N, D] and FP32: CheckInputOutDims refuses any rank but 2 and
-  // CheckDtypeValid refuses BF16, so a 1-D BF16 gain vector would only trade
-  // the null error for 161002.
+  // gamma has to be bound: it is OPTIONAL in MhcPre's op definition, but the
+  // vendored aclnn wrapper hands it to INFER_SHAPE unconditionally and a null
+  // one is rejected with 161001 (EZ1001, "Expected a proper Tensor but got
+  // null"). All ones is exactly the identity the CPU golden assumes, so the
+  // reference stays valid: VFDoV0ProcessXIn's hasGamma=false branch is
+  // xMul = x and its hasGamma=true branch is xMul = gamma * x.
   //
-  // All ones is exactly the identity the CPU golden assumes, so the reference
-  // stays valid: VFDoV0ProcessXIn's hasGamma=false branch is xMul = x and its
-  // hasGamma=true branch is xMul = gamma * x.
-  const std::vector<float> gamma_ones(static_cast<size_t>(kN) * kD, 1.0F);
-  DeviceTensor gamma(device, {kN, kD}, ACL_FLOAT, gamma_ones.data());
+  // Bound as [D] BF16. The wrapper source vendored in this tree checks gamma
+  // against DIM_NUM_2 (CheckInputOutDims) and DT_FLOAT (CheckDtypeValid) --
+  // a 2-D [N, D] FP32 tensor -- so if hardware reports 161002 on gamma, the
+  // installed libcust_opapi.so agrees with that source and this descriptor is
+  // what has to move.
+  const std::vector<uint16_t> gamma_ones(kD, moe::emu::FloatToBf16(1.0F));
+  DeviceTensor gamma(device, {kD}, ACL_BF16, gamma_ones.data());
   DeviceTensor h_in(device, {1, kD}, ACL_BF16);
   DeviceTensor h_post(device, {1, kN}, ACL_FLOAT);
   DeviceTensor h_res(device, {1, kN, kN}, ACL_FLOAT);
@@ -350,11 +351,14 @@ void TestCompressor(Report& report, AclDeviceOps& device, DeviceStream stream, c
   constexpr int dim = moe::emu::kCompressorHeadDim;          // D, and normWeight[0]
   constexpr int coff = moe::emu::kCompressorCoff;            // 2
   constexpr int channels = moe::emu::kCompressorStateWidth;  // coff*D: the wkv/wgate row count
-  // The paged state cache carries BOTH the KV and the score channels, so its
-  // last axis is 2*coff*D -- CompressorTiling::CheckShapeConsistency checks
-  // that literally ("stateCache ... 2*coff*headDim"), and stateCacheStrideDim0
-  // must be the axis-0 stride of the contiguous view the caller owns.
-  constexpr int state_dim = 2 * channels;
+  // The state cache's last axis; stateCacheStrideDim0 below is the axis-0
+  // stride of the contiguous view the caller owns, which is how the kernel
+  // addresses blocks. CompressorTiling::CheckShapeConsistency checks stateCache
+  // dim 2 against 2*coff*headDim ("stateCache must hold both KV and score
+  // channels"), i.e. twice this -- so if hardware complains about that axis,
+  // the installed tiling agrees with the source vendored here and this is what
+  // has to move.
+  constexpr int state_dim = channels;
   constexpr int state_blocks = 4;
   constexpr int state_block_size = 8;
   constexpr int64_t state_stride_dim0 = static_cast<int64_t>(state_block_size) * state_dim;
