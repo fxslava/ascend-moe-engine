@@ -203,14 +203,28 @@ if(ENABLE_HOST_EMU)
 
   enable_testing()
   add_subdirectory(tests/emu)
-  add_subdirectory(tests/sim)
 
   # The device launch layer is optional even here: it needs BiSheng, not an
   # NPU, so it can be built alongside the host emulation for a build check.
   # When it is on, tests/npu contributes test_custom_kernels_npu_device, which
   # builds without hardware and skips at runtime without it.
+  #
+  # ORDER IS LOAD-BEARING. This include is what runs enable_language(ASC), and
+  # so what brings ascendc_library() into scope. tests/sim keys its CAModel
+  # target on `if(COMMAND ascendc_library)`, so adding tests/sim BEFORE the
+  # include left that branch dead even with ENABLE_ARCH35_DEVICE_LAUNCH=ON --
+  # sim_moe_test was configured as the host stub while printing a message
+  # telling the reader to enable the option they had already enabled, and the
+  # CAModel gate silently measured the stub. The CANN branch below has always
+  # had this right (include first, add_subdirectory(tests) last); this branch
+  # now matches it.
   if(ENABLE_ARCH35_DEVICE_LAUNCH)
     include("${CMAKE_SOURCE_DIR}/cmake/arch35_device.cmake")
+  endif()
+
+  add_subdirectory(tests/sim)
+
+  if(ENABLE_ARCH35_DEVICE_LAUNCH)
     add_subdirectory(tests/npu)
   endif()
 

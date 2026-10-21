@@ -25,10 +25,27 @@ if(TARGET dsv4_prefill_cube_cube_tiling)
   return()
 endif()
 
+# ASCEND_HOME_PATH comes from one of two places, and which one depends on the
+# configuration rather than on the environment. The CANN branch of the root
+# CMakeLists sets it as a cache variable -- but the ENABLE_HOST_EMU branch
+# return()s BEFORE that, and it is exactly that branch which
+# scripts/verify_npu_build.sh configures (-DENABLE_HOST_EMU=ON
+# -DENABLE_ARCH35_DEVICE_LAUNCH=ON). In the host-emu + device-launch gate the
+# variable is therefore never set and only the environment carries the toolkit
+# root, so testing the variable alone failed the gate at configure time. Both
+# sources are consulted here, the same way cmake/arch35_device.cmake and
+# tests/sim/CMakeLists.txt already do.
+if(NOT ASCEND_HOME_PATH)
+  set(ASCEND_HOME_PATH "$ENV{ASCEND_HOME_PATH}")
+endif()
+if(NOT ASCEND_HOME_PATH)
+  set(ASCEND_HOME_PATH "$ENV{ASCEND_TOOLKIT_HOME}")
+endif()
 if(NOT ASCEND_HOME_PATH)
   message(FATAL_ERROR
     "dsv4_prefill_cube_cube_tiling needs ASCEND_HOME_PATH: it links the "
-    "toolkit's matmul tiling API.")
+    "toolkit's matmul tiling API. Source the toolkit's set_env.sh or pass "
+    "-DASCEND_HOME_PATH=<toolkit root>.")
 endif()
 
 # The include roots are SEARCHED, not assumed. On 9.2.0-beta.2 the matmul

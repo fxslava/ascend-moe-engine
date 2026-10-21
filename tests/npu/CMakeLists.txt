@@ -218,6 +218,17 @@ if(COMMAND ascendc_library)
     FetchContent_MakeAvailable(googletest)
   endif()
 
+  # find_package(Threads) EXPLICITLY, because ${_standalone_target} below links
+  # Threads::Threads. That target used to appear by accident: CMake's FindGTest
+  # module calls find_package(Threads) itself, so on a host with GTest
+  # INSTALLED the imported target was already defined. In the thin
+  # ascend-c-dev container there is no installed GTest, the FetchContent path
+  # above is taken instead, and Threads::Threads was then undefined -- which
+  # failed scripts/verify_npu_build.sh at generate time with "links to target
+  # Threads::Threads but the target was not found". Declaring the dependency
+  # here makes it independent of which GTest path was taken.
+  find_package(Threads REQUIRED)
+
   ascendc_library(${_pipeline_device} STATIC
     "${_dsv4_op_dir}/op_kernel/dsv4_moe_prefill_cube_pipeline_kernel.cpp"
     "${_dsv4_op_dir}/op_host/dsv4_moe_prefill_cube_pipeline.cpp"

@@ -52,6 +52,16 @@ docker run --rm -i \
 set -uo pipefail
 
 rm -rf "$BUILD_DIR"
+
+# tests/npu's standalone target pulls googletest in with FetchContent, which
+# clones into $BUILD_DIR/_deps and then runs git inside that clone. The repo is
+# bind-mounted from the Docker host, so its files are owned by a uid this
+# container's root is not, and git aborts with "detected dubious ownership" --
+# which surfaces as a FetchContent configure failure, not as a git error.
+# Scoped to this --rm container's own root HOME; the host's git config is
+# untouched.
+git config --global --add safe.directory '*' 2>/dev/null || true
+
 echo "=== configure ==="
 if ! cmake -S . -B "$BUILD_DIR" \
       -DENABLE_HOST_EMU=ON \
